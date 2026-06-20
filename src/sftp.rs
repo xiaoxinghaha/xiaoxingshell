@@ -9,9 +9,9 @@
 //! via the shared `UnboundedSender<SessionEvent>` that already exists for the
 //! terminal tab.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use uuid::Uuid;
@@ -85,6 +85,7 @@ pub enum SftpCommand {
 /// Handle retained by the UI to drive a running SFTP worker.
 pub struct SftpHandle {
     pub commands: UnboundedSender<SftpCommand>,
+    cancelled_transfers: Arc<Mutex<HashSet<String>>>,
     #[allow(dead_code)]
     pub join: JoinHandle<()>,
 }
@@ -97,6 +98,11 @@ impl SftpHandle {
         let _ = self
             .commands
             .send(SftpCommand::Download { remote, local_dir });
+    }
+    pub fn cancel_transfer(&self, id: &str) {
+        if let Ok(mut cancelled) = self.cancelled_transfers.lock() {
+            cancelled.insert(id.to_string());
+        }
     }
     pub fn upload(&self, local: String, remote_dir: String) {
         let _ = self
@@ -153,14 +159,19 @@ impl SftpHandle {
 /// terminal's shell session.
 pub fn spawn_sftp(
     runtime: &tokio::runtime::Handle,
+    ui_tab_id: String,
     session: Session,
     events: UnboundedSender<SessionEvent>,
 ) -> SftpHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let self_tx = cmd_tx.clone();
     let events_err = events.clone();
+    let cancelled_transfers = Arc::new(Mutex::new(HashSet::new()));
+    let cancelled_for_task = cancelled_transfers.clone();
     let join = runtime.spawn(async move {
-        if let Err(err) = run_sftp(session, cmd_rx, self_tx, events).await {
+        if let Err(err) =
+            run_sftp(ui_tab_id, session, cmd_rx, self_tx, events, cancelled_for_task).await
+        {
             let _ = events_err.send(SessionEvent::SftpStatus(format!(
                 "{}: {err:#}",
                 t("SFTP 错误", "SFTP error")
@@ -169,6 +180,7 @@ pub fn spawn_sftp(
     });
     SftpHandle {
         commands: cmd_tx,
+        cancelled_transfers,
         join,
     }
 }
@@ -218,10 +230,12 @@ fn build_tree_nodes(
 // ---------------------------------------------------------------------------
 
 async fn run_sftp(
+    ui_tab_id: String,
     session: Session,
     mut commands: UnboundedReceiver<SftpCommand>,
     self_tx: UnboundedSender<SftpCommand>,
     events: UnboundedSender<SessionEvent>,
+    cancelled_transfers: Arc<Mutex<HashSet<String>>>,
 ) -> Result<()> {
     let _ = events.send(SessionEvent::SftpStatus(
         t("SFTP 连接中...", "SFTP connecting...").into(),
@@ -272,7 +286,11 @@ async fn run_sftp(
                 .strip_suffix(".pub")
                 .map(str::to_string)
                 .unwrap_or(normalised);
-            let keypair = load_secret_key(Path::new(&key_path), None)
+            let pass = session.key_passphrase.as_str();
+            let keypair = load_secret_key(
+                Path::new(&key_path),
+                if pass.is_empty() { None } else { Some(pass) },
+            )
                 .with_context(|| format!("failed to load key {key_path}"))?;
             // RSA keys need an explicit SHA-2 hash; other key types don't.
             let hash = keypair.algorithm().is_rsa().then_some(HashAlg::Sha256);
@@ -429,7 +447,16 @@ async fn run_sftp(
                         t("下载文件夹", "Downloading folder"),
                         dirname
                     )));
-                    match download_dir(&sftp, &remote, &local_dir, &events).await {
+                    match download_dir(
+                        &sftp,
+                        &ui_tab_id,
+                        &remote,
+                        &local_dir,
+                        &events,
+                        &cancelled_transfers,
+                    )
+                    .await
+                    {
                         Ok(_) => {
                             let _ = events.send(SessionEvent::SftpStatus(format!(
                                 "{}: {}",
@@ -459,12 +486,13 @@ async fn run_sftp(
                     )));
                     match download_impl(
                         &sftp,
-                        &session.id,
+                        &ui_tab_id,
                         &remote,
                         &local_path,
                         &filename,
                         &id,
                         &events,
+                        &cancelled_transfers,
                     )
                     .await
                     {
@@ -511,7 +539,16 @@ async fn run_sftp(
                         t("上传文件夹", "Uploading folder"),
                         dirname
                     )));
-                    let res = upload_dir(&handle, &sftp, &local, &remote_dir, &events).await;
+                    let res = upload_dir(
+                        &handle,
+                        &sftp,
+                        &ui_tab_id,
+                        &local,
+                        &remote_dir,
+                        &events,
+                        &cancelled_transfers,
+                    )
+                    .await;
                     if let Ok(entries) = list_dir_impl(&sftp, &remote_dir, &owner_maps).await {
                         let _ = events.send(SessionEvent::SftpEntries {
                             path: remote_dir.clone(),
@@ -544,12 +581,13 @@ async fn run_sftp(
                     )));
                     match upload_pipelined(
                         &handle,
-                        &session.id,
+                        &ui_tab_id,
                         &local,
                         &remote_path,
                         &filename,
                         &id,
                         &events,
+                        &cancelled_transfers,
                     )
                     .await
                     {
@@ -572,7 +610,7 @@ async fn run_sftp(
                             emit_transfer(
                                 &events,
                                 &id,
-                                &session.id,
+                                &ui_tab_id,
                                 &filename,
                                 &local,
                                 "",
@@ -602,12 +640,13 @@ async fn run_sftp(
                 let id = Uuid::new_v4().to_string();
                 match upload_pipelined(
                     &handle,
-                    &session.id,
+                    &ui_tab_id,
                     &local,
                     &remote_path,
                     &filename,
                     &id,
                     &events,
+                    &cancelled_transfers,
                 )
                 .await
                 {
@@ -621,7 +660,7 @@ async fn run_sftp(
                         emit_transfer(
                             &events,
                             &id,
-                            &session.id,
+                            &ui_tab_id,
                             &filename,
                             &local,
                             &remote_path,
@@ -647,7 +686,7 @@ async fn run_sftp(
                         emit_transfer(
                             &events,
                             &id,
-                            &session.id,
+                            &ui_tab_id,
                             &filename,
                             &local,
                             &remote_path,
@@ -848,12 +887,13 @@ async fn run_sftp(
                 let xid = Uuid::new_v4().to_string();
                 match download_impl(
                     &sftp,
-                    &session.id,
+                    &ui_tab_id,
                     &remote,
                     &local_str,
                     &filename,
                     &xid,
                     &events,
+                    &cancelled_transfers,
                 )
                 .await
                 {
@@ -1480,6 +1520,19 @@ fn emit_transfer(
 
 const XFER_CHUNK: usize = 64 * 1024;
 
+fn transfer_cancelled(cancelled_transfers: &Arc<Mutex<HashSet<String>>>, id: &str) -> bool {
+    cancelled_transfers
+        .lock()
+        .map(|set| set.contains(id))
+        .unwrap_or(false)
+}
+
+fn clear_cancelled_transfer(cancelled_transfers: &Arc<Mutex<HashSet<String>>>, id: &str) {
+    if let Ok(mut set) = cancelled_transfers.lock() {
+        set.remove(id);
+    }
+}
+
 async fn download_impl(
     sftp: &SftpSession,
     tab_id: &str,
@@ -1488,6 +1541,7 @@ async fn download_impl(
     name: &str,
     id: &str,
     events: &UnboundedSender<SessionEvent>,
+    cancelled_transfers: &Arc<Mutex<HashSet<String>>>,
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let total = sftp
@@ -1511,6 +1565,23 @@ async fn download_impl(
     let mut done: u64 = 0;
     let mut last = Instant::now();
     loop {
+        if transfer_cancelled(cancelled_transfers, id) {
+            clear_cancelled_transfer(cancelled_transfers, id);
+            emit_transfer(
+                events,
+                id,
+                tab_id,
+                name,
+                local,
+                remote,
+                false,
+                done,
+                total,
+                2,
+                &t("已取消下载", "Download cancelled"),
+            );
+            return Err(anyhow!(t("已取消下载", "download cancelled")));
+        }
         let n = remote_file
             .read(&mut buf)
             .await
@@ -1544,6 +1615,7 @@ async fn download_impl(
         1,
         "",
     );
+    clear_cancelled_transfer(cancelled_transfers, id);
     Ok(())
 }
 
@@ -1555,28 +1627,41 @@ async fn download_impl(
 /// so a hostile server can't escape the chosen folder.
 async fn download_dir(
     sftp: &SftpSession,
+    tab_id: &str,
     remote_root: &str,
     local_parent: &str,
     events: &UnboundedSender<SessionEvent>,
+    cancelled_transfers: &Arc<Mutex<HashSet<String>>>,
 ) -> Result<()> {
     let owner_maps = OwnerMaps::default();
     let root_name = sanitize_filename(&base_name(remote_root));
-    let root_local = format!("{}/{}", local_parent.trim_end_matches('/'), root_name);
+    let root_local = std::path::PathBuf::from(local_parent).join(&root_name);
     // (remote_dir, local_dir) pairs still to mirror.
     let mut stack = vec![(remote_root.trim_end_matches('/').to_string(), root_local)];
     while let Some((rdir, ldir)) = stack.pop() {
         tokio::fs::create_dir_all(&ldir)
             .await
-            .with_context(|| format!("create local dir {ldir}"))?;
+            .with_context(|| format!("create local dir {}", ldir.display()))?;
         for entry in list_dir_impl(sftp, &rdir, &owner_maps).await? {
             if entry.is_dir {
-                let child_local = format!("{}/{}", ldir, sanitize_filename(&entry.name));
+                let child_local = ldir.join(sanitize_filename(&entry.name));
                 stack.push((entry.full_path, child_local));
             } else {
                 let fname = sanitize_filename(&entry.name);
-                let lpath = format!("{}/{}", ldir, fname);
+                let lpath = ldir.join(&fname);
+                let lpath_str = lpath.to_string_lossy().to_string();
                 let id = Uuid::new_v4().to_string();
-                download_impl(sftp, "", &entry.full_path, &lpath, &fname, &id, events).await?;
+                download_impl(
+                    sftp,
+                    tab_id,
+                    &entry.full_path,
+                    &lpath_str,
+                    &fname,
+                    &id,
+                    events,
+                    cancelled_transfers,
+                )
+                .await?;
             }
         }
     }
@@ -1622,9 +1707,11 @@ async fn remove_dir_recursive(sftp: &SftpSession, root: &str) -> Result<()> {
 async fn upload_dir(
     handle: &client::Handle<SftpClientHandler>,
     sftp: &SftpSession,
+    tab_id: &str,
     local_root: &str,
     remote_parent: &str,
     events: &UnboundedSender<SessionEvent>,
+    cancelled_transfers: &Arc<Mutex<HashSet<String>>>,
 ) -> Result<()> {
     let root_name = base_name(local_root);
     let remote_root = format!("{}/{}", remote_parent.trim_end_matches('/'), root_name);
@@ -1644,7 +1731,17 @@ async fn upload_dir(
                 stack.push((lpath, rchild));
             } else if ft.is_file() {
                 let id = Uuid::new_v4().to_string();
-                upload_pipelined(handle, "", &lpath, &rchild, &name, &id, events).await?;
+                upload_pipelined(
+                    handle,
+                    tab_id,
+                    &lpath,
+                    &rchild,
+                    &name,
+                    &id,
+                    events,
+                    cancelled_transfers,
+                )
+                .await?;
             }
         }
     }
@@ -1668,6 +1765,7 @@ async fn upload_pipelined(
     name: &str,
     id: &str,
     events: &UnboundedSender<SessionEvent>,
+    cancelled_transfers: &Arc<Mutex<HashSet<String>>>,
 ) -> Result<()> {
     use tokio::io::AsyncReadExt;
 
@@ -1717,6 +1815,24 @@ async fn upload_pipelined(
     let mut inflight = FuturesUnordered::new();
 
     while !eof || !inflight.is_empty() {
+        if transfer_cancelled(cancelled_transfers, id) {
+            clear_cancelled_transfer(cancelled_transfers, id);
+            let _ = raw.close(fhandle.clone()).await;
+            emit_transfer(
+                events,
+                id,
+                tab_id,
+                name,
+                local,
+                remote,
+                true,
+                done,
+                total,
+                2,
+                &t("已取消上传", "Upload cancelled"),
+            );
+            return Err(anyhow!(t("已取消上传", "upload cancelled")));
+        }
         // Top up the pipeline with fresh WRITE requests.
         while !eof && inflight.len() < MAX_INFLIGHT {
             let mut buf = vec![0u8; CHUNK];
@@ -1774,6 +1890,7 @@ async fn upload_pipelined(
         1,
         "",
     );
+    clear_cancelled_transfer(cancelled_transfers, id);
     Ok(())
 }
 

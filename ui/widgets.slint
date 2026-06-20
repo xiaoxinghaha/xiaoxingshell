@@ -104,7 +104,14 @@ export component LabeledInput inherits VerticalLayout {
     in property <string> placeholder;
     in-out property <string> value;
     in property <bool> password: false;
+    property <bool> revealed: false;
     spacing: 4px;
+
+    changed value => {
+        if (root.password) {
+            root.revealed = false;
+        }
+    }
 
     Text {
         text: label;
@@ -119,10 +126,16 @@ export component LabeledInput inherits VerticalLayout {
         border-color: input.has-focus ? Theme.accent : Theme.border-subtle;
         background: Theme.bg-root;
 
+        Timer {
+            running: root.password && root.revealed;
+            interval: 3s;
+            triggered => { root.revealed = false; }
+        }
+
         input := TextInput {
             x: 10px;
             y: 0px;
-            width: parent.width - 20px;
+            width: parent.width - (root.password ? 44px : 20px);
             height: parent.height;
             text <=> root.value;
             color: Theme.text-primary;
@@ -133,7 +146,7 @@ export component LabeledInput inherits VerticalLayout {
             font-size: Theme.fs-md;
             vertical-alignment: center;
             single-line: true;
-            input-type: root.password ? InputType.password : InputType.text;
+            input-type: (root.password && !root.revealed) ? InputType.password : InputType.text;
         }
 
         // Lightweight placeholder — shown when value is empty.
@@ -145,6 +158,30 @@ export component LabeledInput inherits VerticalLayout {
             color: Theme.text-muted;
             font-size: Theme.fs-md;
             vertical-alignment: center;
+        }
+
+        if root.password : Rectangle {
+            x: parent.width - 30px;
+            y: 0px;
+            width: 24px;
+            height: parent.height;
+            background: transparent;
+
+            Text {
+                text: root.revealed ? "\u{E8F5}" : "\u{E8F4}";
+                font-family: "Material Icons";
+                color: eye-ta.has-hover ? Theme.text-primary : Theme.text-secondary;
+                font-size: Theme.fs-md;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+
+            eye-ta := TouchArea {
+                mouse-cursor: pointer;
+                clicked => {
+                    root.revealed = !root.revealed;
+                }
+            }
         }
     }
 }

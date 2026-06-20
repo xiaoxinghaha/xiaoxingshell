@@ -7,7 +7,7 @@
 //!   * Route Slint callbacks to the right domain module.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -594,6 +594,7 @@ pub fn run() -> Result<()> {
     let tab_statuses: TabStatuses = Arc::new(Mutex::new(HashMap::new()));
     let local_snap: LocalSnap = Arc::new(Mutex::new(SystemSnapshot::default()));
     let local_net_hist: NetHist = Arc::new(Mutex::new(vec![0.0; NET_HISTORY_LEN]));
+    let hidden_transfer_ids: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
     // --- Wire callbacks --------------------------------------------------
     wire_session_callbacks(
@@ -610,6 +611,7 @@ pub fn run() -> Result<()> {
         sftp_last_cwd.clone(),
         sftp_entry_cache.clone(),
         sftp_sort_states.clone(),
+        hidden_transfer_ids.clone(),
         tab_statuses.clone(),
         local_snap.clone(),
         local_net_hist.clone(),
@@ -930,13 +932,43 @@ pub fn run() -> Result<()> {
     let transfers_model: Rc<VecModel<TransferInfo>> = Rc::new(VecModel::default());
     window.set_transfers(ModelRc::from(transfers_model.clone()));
     {
+        let hidden_transfer_ids = hidden_transfer_ids.clone();
+        let sftp_handles = sftp_handles.clone();
         let tm = transfers_model.clone();
-        window.on_clear_transfers(move || tm.set_vec(Vec::<TransferInfo>::new()));
+        window.on_clear_transfers(move || {
+            for row in tm.iter() {
+                if row.state == 0 {
+                    if let Ok(handles) = sftp_handles.lock() {
+                        if let Some(h) = handles.get(row.tab_id.as_str()) {
+                            h.cancel_transfer(row.id.as_str());
+                        }
+                    }
+                }
+                if let Ok(mut ids) = hidden_transfer_ids.lock() {
+                    ids.insert(row.id.to_string());
+                }
+            }
+            tm.set_vec(Vec::<TransferInfo>::new());
+        });
     }
     {
+        let hidden_transfer_ids = hidden_transfer_ids.clone();
+        let sftp_handles = sftp_handles.clone();
         let tm = transfers_model.clone();
         window.on_remove_transfer(move |id: SharedString| {
             let mut rows = tm.iter().collect::<Vec<_>>();
+            if let Some(row) = rows.iter().find(|row| row.id.as_str() == id.as_str()) {
+                if row.state == 0 {
+                    if let Ok(handles) = sftp_handles.lock() {
+                        if let Some(h) = handles.get(row.tab_id.as_str()) {
+                            h.cancel_transfer(row.id.as_str());
+                        }
+                    }
+                }
+            }
+            if let Ok(mut ids) = hidden_transfer_ids.lock() {
+                ids.insert(id.to_string());
+            }
             rows.retain(|row| row.id.as_str() != id.as_str());
             tm.set_vec(rows);
         });
@@ -985,28 +1017,42 @@ pub fn run() -> Result<()> {
         });
     }
     {
+        let tm = transfers_model.clone();
         window.on_open_transfer_location(move |path: SharedString| {
-            let path = path.to_string();
-            if path.trim().is_empty() {
+            let transfer_id = path.to_string();
+            if transfer_id.trim().is_empty() {
                 return;
             }
+            let local_path = tm
+                .iter()
+                .find(|row| row.id.as_str() == transfer_id.as_str())
+                .map(|row| row.local_path.to_string())
+                .unwrap_or(transfer_id);
             #[cfg(windows)]
             {
-                let p = std::path::PathBuf::from(&path);
-                let target = if p.is_dir() {
-                    Some(p)
-                } else if let Some(parent) = p.parent() {
-                    Some(parent.to_path_buf())
+                let p = std::path::PathBuf::from(&local_path);
+                if p.is_file() {
+                    let target = p.canonicalize().unwrap_or(p);
+                    let _ = std::process::Command::new("explorer")
+                        .arg(format!("/select,{}", target.display()))
+                        .spawn();
                 } else {
-                    None
-                };
-                if let Some(dir) = target.filter(|d| d.exists()) {
-                    let _ = std::process::Command::new("explorer").arg(dir).spawn();
+                    let target = if p.is_dir() {
+                        Some(p)
+                    } else if let Some(parent) = p.parent().filter(|parent| parent.exists()) {
+                        Some(parent.to_path_buf())
+                    } else {
+                        None
+                    };
+                    if let Some(dir) = target.filter(|d| d.exists()) {
+                        let dir = dir.canonicalize().unwrap_or(dir);
+                        let _ = std::process::Command::new("explorer").arg(dir).spawn();
+                    }
                 }
             }
             #[cfg(not(windows))]
             {
-                let p = std::path::PathBuf::from(&path);
+                let p = std::path::PathBuf::from(&local_path);
                 let Some(parent) = p.parent() else {
                     return;
                 };
@@ -1109,6 +1155,7 @@ pub fn run() -> Result<()> {
             sftp_last_cwd: sftp_last_cwd.clone(),
             sftp_entry_cache: sftp_entry_cache.clone(),
             sftp_sort_states: sftp_sort_states.clone(),
+            hidden_transfer_ids: hidden_transfer_ids.clone(),
             bufs: bufs.clone(),
             tab_statuses: tab_statuses.clone(),
             local_snap: local_snap.clone(),
@@ -1541,11 +1588,21 @@ fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
     model.set_vec(rows);
 }
 
-fn transfer_display_name(store: &ConfigStore, tab_id: &str, name: &str) -> String {
+fn transfer_display_name(
+    store: &ConfigStore,
+    statuses: &TabStatuses,
+    tab_id: &str,
+    name: &str,
+) -> String {
     if tab_id.is_empty() {
         return name.to_string();
     }
-    if let Some(sess) = store.get(tab_id) {
+    let session_id = statuses
+        .lock()
+        .ok()
+        .and_then(|m| m.get(tab_id).map(|st| st.session_id.clone()))
+        .unwrap_or_default();
+    if let Some(sess) = store.get(&session_id) {
         let label = sess.name.trim();
         if !label.is_empty() {
             let short: String = label.chars().take(5).collect();
@@ -1573,6 +1630,7 @@ fn wire_session_callbacks(
     sftp_last_cwd: SftpLastCwd,
     sftp_entry_cache: SftpEntryCache,
     sftp_sort_states: SftpSortStates,
+    hidden_transfer_ids: Arc<Mutex<HashSet<String>>>,
     tab_statuses: TabStatuses,
     local_snap: LocalSnap,
     local_net_hist: NetHist,
@@ -1613,6 +1671,7 @@ fn wire_session_callbacks(
             w.set_dialog_user("".into());
             w.set_dialog_auth("password".into());
             w.set_dialog_password("".into());
+            w.set_dialog_key_passphrase("".into());
             w.set_dialog_key_path("".into());
             w.set_dialog_proxy_type("none".into());
             w.set_dialog_proxy_hostport("".into());
@@ -1769,9 +1828,8 @@ fn wire_session_callbacks(
                 w.set_dialog_port(session.port.to_string().into());
                 w.set_dialog_user(session.user.clone().into());
                 w.set_dialog_auth(session.auth.as_str().into());
-                // Never echo the stored password back into the UI (issue #10) —
-                // leave it blank; a blank field on save keeps the existing one.
-                w.set_dialog_password("".into());
+                w.set_dialog_password(session.password.as_str().into());
+                w.set_dialog_key_passphrase(session.key_passphrase.as_str().into());
                 w.set_dialog_key_path(session.private_key_path.clone().into());
                 let (proxy_type, proxy_hostport) = split_proxy(&session.proxy);
                 w.set_dialog_proxy_type(proxy_type.into());
@@ -1952,17 +2010,8 @@ fn wire_session_callbacks(
         window.on_session_dialog_submit(move |draft: SessionDraft| {
             let id = draft.id.to_string();
             let existing = store.borrow().get(&id).cloned();
-            // The edit dialog never echoes the real password (issue #10): a blank
-            // field while editing means "keep the existing password" rather than
-            // "clear it".  Only overwrite when the user actually typed something.
-            let password = if draft.password.is_empty() {
-                existing
-                    .as_ref()
-                    .map(|s| s.password.clone())
-                    .unwrap_or_default()
-            } else {
-                Secret::new(draft.password.to_string())
-            };
+            let password = Secret::new(draft.password.to_string());
+            let key_passphrase = Secret::new(draft.key_passphrase.to_string());
             let kind = crate::config::SessionKind::from_str(&draft.kind.to_string());
             // Auto-name: serial → port label; otherwise user@host, or just the
             // host when no username was given (#110).
@@ -1995,6 +2044,7 @@ fn wire_session_callbacks(
                 user: draft.user.to_string(),
                 auth: AuthMethod::from_str(&draft.auth.to_string()),
                 password,
+                key_passphrase,
                 // Store the key path with forward slashes uniformly.
                 private_key_path: draft.private_key_path.to_string().replace('\\', "/"),
                 proxy: draft.proxy.to_string(),
@@ -2027,6 +2077,8 @@ fn wire_session_callbacks(
             sync_sessions_to_model(&store.borrow(), &sessions_model);
             if let Some(w) = weak.upgrade() {
                 w.set_group_options(group_options_model(&store.borrow()));
+                w.set_dialog_password("".into());
+                w.set_dialog_key_passphrase("".into());
                 w.set_dialog_open(false);
             }
         });
@@ -2037,6 +2089,8 @@ fn wire_session_callbacks(
         let weak = window.as_weak();
         window.on_session_dialog_cancel(move || {
             if let Some(w) = weak.upgrade() {
+                w.set_dialog_password("".into());
+                w.set_dialog_key_passphrase("".into());
                 w.set_dialog_open(false);
             }
         });
@@ -2136,6 +2190,7 @@ fn wire_session_callbacks(
         let bufs = bufs.clone();
         let runtime = runtime.clone();
         let last_term_size = last_term_size.clone();
+        let hidden_transfer_ids = hidden_transfer_ids.clone();
         let sftp_handles = sftp_handles.clone();
         let sftp_last_cwd = sftp_last_cwd.clone();
         let cache_for_connect = sftp_entry_cache.clone();
@@ -2256,6 +2311,7 @@ fn wire_session_callbacks(
                 sftp_last_cwd: sftp_last_cwd.clone(),
                 sftp_entry_cache: cache_for_connect.clone(),
                 sftp_sort_states: sort_for_connect.clone(),
+                hidden_transfer_ids: hidden_transfer_ids.clone(),
                 bufs: bufs.clone(),
                 tab_statuses: tab_statuses.clone(),
                 local_snap: local_snap.clone(),
@@ -2281,6 +2337,7 @@ struct ConnectCtx {
     sftp_last_cwd: SftpLastCwd,
     sftp_entry_cache: SftpEntryCache,
     sftp_sort_states: SftpSortStates,
+    hidden_transfer_ids: Arc<Mutex<HashSet<String>>>,
     bufs: TermBuffers,
     tab_statuses: TabStatuses,
     local_snap: LocalSnap,
@@ -2322,7 +2379,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
     // Separate SFTP connection for the same session (SSH only).
     let sftp_evt_tx = if has_sftp {
         let (sftp_tx, sftp_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
-        let sftp_handle = spawn_sftp(ctx.runtime.handle(), session, sftp_tx);
+        let sftp_handle = spawn_sftp(ctx.runtime.handle(), tab_id.to_string(), session, sftp_tx);
         ctx.sftp_handles
             .lock()
             .unwrap()
@@ -2346,6 +2403,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
         let follow_cd_pump = ctx.sftp_follow_cd.clone();
         let sftp_cache_pump = ctx.sftp_entry_cache.clone();
         let sftp_sort_pump = ctx.sftp_sort_states.clone();
+        let hidden_transfer_ids_pump = ctx.hidden_transfer_ids.clone();
         std::thread::spawn(move || {
             let mut shell_rx = rx;
             let mut cwd_debounce: Option<tokio::task::JoinHandle<()>> = None;
@@ -2402,6 +2460,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                         let nh_evt = net_pump.clone();
                         let sftp_cache_evt = sftp_cache_pump.clone();
                         let sftp_sort_evt = sftp_sort_pump.clone();
+                        let hidden_transfer_ids_evt = hidden_transfer_ids_pump.clone();
                         let _ = slint::invoke_from_event_loop(move || {
                             if let Some(win) = weak_evt.upgrade() {
                                 apply_session_event_to_window(
@@ -2414,6 +2473,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                                     &nh_evt,
                                     &sftp_cache_evt,
                                     &sftp_sort_evt,
+                                    &hidden_transfer_ids_evt,
                                 );
                             }
                         });
@@ -2433,6 +2493,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
         let net_sftp = ctx.local_net_hist.clone();
         let sftp_cache_sftp = ctx.sftp_entry_cache.clone();
         let sftp_sort_sftp = ctx.sftp_sort_states.clone();
+        let hidden_transfer_ids_sftp = ctx.hidden_transfer_ids.clone();
         std::thread::spawn(move || {
             let mut sftp_rx = sftp_evt_tx;
             loop {
@@ -2447,6 +2508,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                         let nh_s = net_sftp.clone();
                         let sftp_cache_s = sftp_cache_sftp.clone();
                         let sftp_sort_s = sftp_sort_sftp.clone();
+                        let hidden_transfer_ids_s = hidden_transfer_ids_sftp.clone();
                         let _ = slint::invoke_from_event_loop(move || {
                             if let Some(win) = weak_s.upgrade() {
                                 apply_session_event_to_window(
@@ -2459,6 +2521,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                                     &nh_s,
                                     &sftp_cache_s,
                                     &sftp_sort_s,
+                                    &hidden_transfer_ids_s,
                                 );
                             }
                         });
@@ -2807,6 +2870,7 @@ fn apply_session_event_to_window(
     local_net_hist: &NetHist,
     sftp_entry_cache: &SftpEntryCache,
     sftp_sort_states: &SftpSortStates,
+    hidden_transfer_ids: &Arc<Mutex<HashSet<String>>>,
 ) {
     let tabs_rc = win.get_tabs();
     let terminals_rc = win.get_terminals();
@@ -2921,6 +2985,7 @@ fn apply_session_event_to_window(
                 local_net_hist,
                 sftp_entry_cache,
                 sftp_sort_states,
+                hidden_transfer_ids,
             );
             update_tab(&|t| t.connected = false);
             update_terminal(&|t| {
@@ -3036,6 +3101,7 @@ fn apply_session_event_to_window(
                     local_net_hist,
                     sftp_entry_cache,
                     sftp_sort_states,
+                    hidden_transfer_ids,
                 );
                 update_terminal(&|t| t.sftp_status = error.clone().into());
             }
@@ -3067,6 +3133,13 @@ fn apply_session_event_to_window(
             msg,
             completed_at,
         } => {
+            if hidden_transfer_ids
+                .lock()
+                .map(|ids| ids.contains(&id))
+                .unwrap_or(false)
+            {
+                return;
+            }
             let detail = match state {
                 // On error, show the actual message when we have one.
                 2 => {
@@ -3108,7 +3181,9 @@ fn apply_session_event_to_window(
                 HISTORY_STORE.with(|s| {
                     s.borrow()
                         .as_ref()
-                        .map(|store| transfer_display_name(&store.borrow(), &tab_id, &name))
+                        .map(|store| {
+                            transfer_display_name(&store.borrow(), statuses, &tab_id, &name)
+                        })
                         .unwrap_or_else(|| name.clone())
                 })
             };
@@ -3142,6 +3217,11 @@ fn apply_session_event_to_window(
                 match found {
                     Some(i) => model.set_row_data(i, rec),
                     None => model.insert(0, rec), // newest at top
+                }
+            }
+            if state != 0 {
+                if let Ok(mut ids) = hidden_transfer_ids.lock() {
+                    ids.remove(&id);
                 }
             }
             if is_upload && state == 1 {
@@ -3791,6 +3871,83 @@ fn wire_sftp_callbacks(
                     if let Ok(handles) = sftp_handles.lock() {
                         if let Some(h) = handles.get(&tab_id) {
                             h.download(remote_path, local_dir);
+                        }
+                    }
+                    let _ = weak.upgrade_in_event_loop(|w| w.set_download_open(true));
+                }
+            });
+        });
+    }
+    {
+        let sftp_handles = sftp_handles.clone();
+        let weak = window.as_weak();
+        window.on_sftp_download_range(move |tab_id: SharedString, start: i32, end: i32| {
+            let tab_id = tab_id.to_string();
+            let remote_paths: Vec<String> = weak
+                .upgrade()
+                .map(|w| {
+                    let terminals_rc = w.get_terminals();
+                    let terminals = terminals_rc
+                        .as_any()
+                        .downcast_ref::<VecModel<TerminalState>>();
+                    let Some(terminals) = terminals else { return Vec::new(); };
+                    for i in 0..terminals.row_count() {
+                        if let Some(row) = terminals.row_data(i) {
+                            if row.id.as_str() == tab_id {
+                                let entries = row
+                                    .sftp_entries
+                                    .iter()
+                                    .map(|e| e.full_path.to_string())
+                                    .collect::<Vec<_>>();
+                                let lo = start.min(end).max(0) as usize;
+                                let hi = start.max(end).max(0) as usize;
+                                return entries
+                                    .into_iter()
+                                    .enumerate()
+                                    .filter(|(idx, _)| *idx >= lo && *idx <= hi)
+                                    .map(|(_, path)| path)
+                                    .collect();
+                            }
+                        }
+                    }
+                    Vec::new()
+                })
+                .unwrap_or_default();
+            if remote_paths.is_empty() {
+                return;
+            }
+            let (preset, always_ask) = weak
+                .upgrade()
+                .map(|w| {
+                    (
+                        w.get_download_dir().to_string(),
+                        w.get_download_always_ask(),
+                    )
+                })
+                .unwrap_or_default();
+            if !always_ask && !preset.is_empty() {
+                if let Ok(handles) = sftp_handles.lock() {
+                    if let Some(h) = handles.get(&tab_id) {
+                        for remote_path in &remote_paths {
+                            h.download(remote_path.clone(), preset.clone());
+                        }
+                        if let Some(w) = weak.upgrade() {
+                            w.set_download_open(true);
+                        }
+                    }
+                }
+                return;
+            }
+            let sftp_handles = sftp_handles.clone();
+            let weak = weak.clone();
+            std::thread::spawn(move || {
+                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                    let local_dir = dir.to_string_lossy().to_string();
+                    if let Ok(handles) = sftp_handles.lock() {
+                        if let Some(h) = handles.get(&tab_id) {
+                            for remote_path in &remote_paths {
+                                h.download(remote_path.clone(), local_dir.clone());
+                            }
                         }
                     }
                     let _ = weak.upgrade_in_event_loop(|w| w.set_download_open(true));

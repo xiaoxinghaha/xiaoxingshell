@@ -72,6 +72,7 @@ xattr -dr com.apple.quarantine xiaoxingshell # 去掉「未签名应用」的 Ga
 - [x] 串口 / Telnet 会话
 - [x] 出站代理（SOCKS5 / HTTP）
 - [x] 会话密码加密存储（ChaCha20-Poly1305）
+- [x] 点击眼睛可显示会话密码
 
 
 

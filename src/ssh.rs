@@ -548,9 +548,7 @@ async fn run_session(
                 .strip_suffix(".pub")
                 .map(str::to_string)
                 .unwrap_or(normalised);
-            // An encrypted private key needs its passphrase; we reuse the
-            // session's password field for it (empty = unencrypted key) (#90).
-            let pass = password.as_str();
+            let pass = session.key_passphrase.as_str();
             let keypair = load_secret_key(
                 Path::new(&key_path),
                 if pass.is_empty() { None } else { Some(pass) },

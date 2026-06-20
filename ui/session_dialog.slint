@@ -18,6 +18,7 @@ export struct SessionDraft {
     user: string,
     auth: string,      // "password" | "key"
     password: string,
+    key-passphrase: string,
     private-key-path: string,
     proxy: string,     // "" | "socks5://host:port" | "http://host:port"
     group: string,     // folder/group name ("" = ungrouped)
@@ -101,6 +102,7 @@ export component SessionDialog inherits Rectangle {
     in-out property <bool> host-missing: false;
     in-out property <string> draft-auth: "password";
     in-out property <string> draft-password;
+    in-out property <string> draft-key-passphrase;
     in-out property <string> draft-key-path;
     in-out property <string> draft-proxy-type: "none";  // "none" | "socks5" | "http"
     in-out property <string> draft-proxy-hostport;
@@ -140,6 +142,8 @@ export component SessionDialog inherits Rectangle {
             self.host-missing = false;
         } else {
             self.group-menu-open = false;
+            self.draft-password = "";
+            self.draft-key-passphrase = "";
         }
     }
 
@@ -393,7 +397,7 @@ export component SessionDialog inherits Rectangle {
 
             if root.draft-kind == "ssh" && root.draft-auth == "password" : LabeledInput {
                 label: @tr("Password");
-                placeholder: root.is-editing ? @tr("Leave blank to keep the current password") : "••••••••";
+                placeholder: "••••••••";
                 password: true;
                 value <=> root.draft-password;
             }
@@ -465,11 +469,9 @@ export component SessionDialog inherits Rectangle {
             // editing, keep the saved passphrase).
             if root.draft-kind == "ssh" && root.draft-auth == "key" : LabeledInput {
                 label: @tr("Key passphrase");
-                placeholder: root.is-editing
-                    ? @tr("Leave blank to keep the current passphrase")
-                    : @tr("Leave blank if the key isn't encrypted");
+                placeholder: @tr("Leave blank if the key isn't encrypted");
                 password: true;
-                value <=> root.draft-password;
+                value <=> root.draft-key-passphrase;
             }
 
             // ── Serial-only fields ──────────────────────────────────────────
@@ -683,6 +685,7 @@ export component SessionDialog inherits Rectangle {
                             user: root.draft-user,
                             auth: root.draft-auth,
                             password: root.draft-password,
+                            key-passphrase: root.draft-key-passphrase,
                             private-key-path: root.draft-key-path,
                             proxy: (root.draft-proxy-type == "none" || root.draft-proxy-hostport == "") ? ""
                                  : root.draft-proxy-type == "http" ? "http://" + root.draft-proxy-hostport

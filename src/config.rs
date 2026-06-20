@@ -165,6 +165,8 @@ pub struct Session {
     #[serde(default)]
     pub password: Secret,
     #[serde(default)]
+    pub key_passphrase: Secret,
+    #[serde(default)]
     pub private_key_path: String,
     /// Optional outbound proxy, e.g. "socks5://127.0.0.1:1080" or
     /// "http://user:pass@host:8080". Empty = use $ALL_PROXY, else direct.
@@ -258,6 +260,7 @@ impl Session {
             user: "root".into(),
             auth: AuthMethod::Password,
             password: Secret::default(),
+            key_passphrase: Secret::default(),
             private_key_path: String::new(),
             proxy: String::new(),
             last_used: None,
@@ -491,6 +494,21 @@ impl ConfigStore {
                     for session in &mut cfg.sessions {
                         if let Some(plain) = Self::try_decrypt(&key, session.password.as_str()) {
                             session.password = Secret::new(plain);
+                        }
+                        if let Some(plain) =
+                            Self::try_decrypt(&key, session.key_passphrase.as_str())
+                        {
+                            session.key_passphrase = Secret::new(plain);
+                        }
+                        // Older builds stored the private-key passphrase in the
+                        // shared `password` field for key-based auth. Migrate it
+                        // into the dedicated field on load.
+                        if session.auth == AuthMethod::Key
+                            && session.key_passphrase.is_empty()
+                            && !session.password.is_empty()
+                        {
+                            session.key_passphrase = session.password.clone();
+                            session.password = Secret::default();
                         }
                     }
                     // Clean up any duplicate history accumulated before #113,
@@ -794,6 +812,12 @@ impl ConfigStore {
                 let enc = Self::encrypt(&self.key, session.password.as_str())?;
                 session.password = Secret::new(enc);
             }
+            if !session.key_passphrase.is_empty()
+                && !session.key_passphrase.as_str().starts_with(Self::ENC_PREFIX)
+            {
+                let enc = Self::encrypt(&self.key, session.key_passphrase.as_str())?;
+                session.key_passphrase = Secret::new(enc);
+            }
         }
         let raw = serde_json::to_string_pretty(&disk)?;
         // Write to a sibling temp file then rename — cheap atomicity.
@@ -860,6 +884,10 @@ impl ConfigStore {
                 let enc = Self::encrypt_export(s.password.as_str())?;
                 s.password = Secret::new(enc);
             }
+            if !s.key_passphrase.is_empty() {
+                let enc = Self::encrypt_export(s.key_passphrase.as_str())?;
+                s.key_passphrase = Secret::new(enc);
+            }
             // `last_used` is machine-local noise — don't carry it across.
             s.last_used = None;
         }
@@ -886,6 +914,15 @@ impl ConfigStore {
                 s.password = Secret::new(plain);
             } else if let Some(plain) = Self::try_decrypt(&self.key, s.password.as_str()) {
                 s.password = Secret::new(plain);
+            }
+            if let Some(plain) = Self::decrypt_export(s.key_passphrase.as_str()) {
+                s.key_passphrase = Secret::new(plain);
+            } else if let Some(plain) = Self::try_decrypt(&self.key, s.key_passphrase.as_str()) {
+                s.key_passphrase = Secret::new(plain);
+            }
+            if s.auth == AuthMethod::Key && s.key_passphrase.is_empty() && !s.password.is_empty() {
+                s.key_passphrase = s.password.clone();
+                s.password = Secret::default();
             }
             let dup = self.cache.sessions.iter().any(|x| {
                 x.host == s.host && x.user == s.user && x.port == s.port && x.kind == s.kind
@@ -961,5 +998,39 @@ mod tests {
         let _ = std::fs::remove_file(&export_path);
         let _ = std::fs::remove_file(&a.path);
         let _ = std::fs::remove_file(&b.path);
+    }
+
+    #[test]
+    fn load_migrates_legacy_key_passphrase_from_password() {
+        let key = [9u8; 32];
+        let enc = ConfigStore::encrypt(&key, "legacy-pass").unwrap();
+        let mut cfg = ConfigFile::default();
+        cfg.sessions.push(Session {
+            name: "legacy-key".into(),
+            host: "10.0.0.8".into(),
+            user: "root".into(),
+            auth: AuthMethod::Key,
+            password: Secret::new(enc),
+            ..Session::new_empty()
+        });
+        for session in &mut cfg.sessions {
+            if let Some(plain) = ConfigStore::try_decrypt(&key, session.password.as_str()) {
+                session.password = Secret::new(plain);
+            }
+            if let Some(plain) = ConfigStore::try_decrypt(&key, session.key_passphrase.as_str()) {
+                session.key_passphrase = Secret::new(plain);
+            }
+            if session.auth == AuthMethod::Key
+                && session.key_passphrase.is_empty()
+                && !session.password.is_empty()
+            {
+                session.key_passphrase = session.password.clone();
+                session.password = Secret::default();
+            }
+        }
+
+        assert_eq!(cfg.sessions.len(), 1);
+        assert_eq!(cfg.sessions[0].password.as_str(), "");
+        assert_eq!(cfg.sessions[0].key_passphrase.as_str(), "legacy-pass");
     }
 }

@@ -61,6 +61,9 @@ export component SftpPanel inherits Rectangle {
     in property <[SftpTreeNode]> tree-nodes: [];
     in property <bool> collapsed: false;   // when true only the toolbar shows
     property <int> selected-row: -1;       // clicked/highlighted file-list row (#70)
+    property <int> selection-anchor-row: -1;
+    property <int> selection-start-row: -1;
+    property <int> selection-end-row: -1;
     // Panel-level right-click context menu (#84). One menu for the whole list:
     // an empty `menu-target` means the click landed on whitespace, which greys
     // out the item-specific actions (download/rename/…) but keeps new/refresh.
@@ -70,6 +73,8 @@ export component SftpPanel inherits Rectangle {
     property <string> menu-target-name;
     property <bool>   menu-target-is-dir;
     property <int>    menu-target-mode;     // permission bits for the chmod dialog
+    property <int> menu-selection-start: -1;
+    property <int> menu-selection-end: -1;
     in-out property <length> tree-width: 160px;
     in-out property <length> col-name-width: 180px;
     in-out property <length> col-size-width: 72px;
@@ -94,6 +99,7 @@ export component SftpPanel inherits Rectangle {
     callback toggle-collapsed();    // minimise / restore the panel
     callback navigate(string);
     callback download(string);
+    callback download-range(int, int);
     callback upload-clicked(string /* remote dir */, bool /* folder */);
     callback refresh(string);
     callback tree-expand(string);   // toggle expand/collapse + navigate
@@ -121,6 +127,9 @@ export component SftpPanel inherits Rectangle {
     changed current-path => {
         path-input.text = root.current-path;
         root.selected-row = root.entries.length > 0 ? 0 : -1;
+        root.selection-anchor-row = root.selected-row;
+        root.selection-start-row = root.selected-row;
+        root.selection-end-row = root.selected-row;
         if (root.file-list-focused) {
             file-list-focus.focus();
         }
@@ -130,9 +139,15 @@ export component SftpPanel inherits Rectangle {
         if (root.entries.length > 0) {
             if (root.selected-row < 0 || root.selected-row >= root.entries.length) {
                 root.selected-row = 0;
+                root.selection-anchor-row = 0;
+                root.selection-start-row = 0;
+                root.selection-end-row = 0;
             }
         } else {
             root.selected-row = -1;
+            root.selection-anchor-row = -1;
+            root.selection-start-row = -1;
+            root.selection-end-row = -1;
         }
     }
 
@@ -820,8 +835,12 @@ export component SftpPanel inherits Rectangle {
                             }
 
                             for entry[i] in root.entries : row := Rectangle {
+                                property <bool> row-selected:
+                                    root.selection-start-row >= 0
+                                    && i >= min(root.selection-start-row, root.selection-end-row)
+                                    && i <= max(root.selection-start-row, root.selection-end-row);
                                 height: 24px;
-                                background: i == root.selected-row
+                                background: row-selected
                                     ? #4a90e240
                                     : (row-ta.has-hover
                                         ? #4a90e225
@@ -829,29 +848,48 @@ export component SftpPanel inherits Rectangle {
 
                                 row-ta := TouchArea {
                                     mouse-cursor: default;
-                                    clicked => {
-                                        root.selected-row = i;
-                                        file-list-focus.focus();
+                                    clicked => { }
+                                    pointer-event(ev) => {
+                                        if (ev.kind == PointerEventKind.down
+                                                && ev.button == PointerEventButton.left) {
+                                            if (ev.modifiers.shift && root.selection-anchor-row >= 0) {
+                                                root.selected-row = i;
+                                                root.selection-start-row = root.selection-anchor-row;
+                                                root.selection-end-row = i;
+                                            } else {
+                                                root.selected-row = i;
+                                                root.selection-anchor-row = i;
+                                                root.selection-start-row = i;
+                                                root.selection-end-row = i;
+                                            }
+                                            file-list-focus.focus();
+                                        } else if (ev.kind == PointerEventKind.down
+                                                && ev.button == PointerEventButton.right) {
+                                            if (!(root.selection-start-row >= 0
+                                                    && i >= min(root.selection-start-row, root.selection-end-row)
+                                                    && i <= max(root.selection-start-row, root.selection-end-row))) {
+                                                root.selected-row = i;
+                                                root.selection-anchor-row = i;
+                                                root.selection-start-row = i;
+                                                root.selection-end-row = i;
+                                            }
+                                            file-list-focus.focus();
+                                            root.menu-target = entry.full-path;
+                                            root.menu-target-name = entry.name;
+                                            root.menu-target-is-dir = entry.is-dir;
+                                            root.menu-target-mode = entry.mode;
+                                            root.menu-selection-start = root.selection-start-row;
+                                            root.menu-selection-end = root.selection-end-row;
+                                            root.menu-x = self.absolute-position.x + self.mouse-x - file-area.absolute-position.x;
+                                            root.menu-y = self.absolute-position.y + self.mouse-y - file-area.absolute-position.y;
+                                            file-menu.show();
+                                        }
                                     }
                                     double-clicked => {
                                         if (entry.is-dir) {
                                             root.navigate(entry.full-path);
                                         } else {
                                             root.edit-external(entry.full-path);
-                                        }
-                                    }
-                                    pointer-event(ev) => {
-                                        if (ev.kind == PointerEventKind.down
-                                                && ev.button == PointerEventButton.right) {
-                                            root.selected-row = i;
-                                            file-list-focus.focus();
-                                            root.menu-target = entry.full-path;
-                                            root.menu-target-name = entry.name;
-                                            root.menu-target-is-dir = entry.is-dir;
-                                            root.menu-target-mode = entry.mode;
-                                            root.menu-x = self.absolute-position.x + self.mouse-x - file-area.absolute-position.x;
-                                            root.menu-y = self.absolute-position.y + self.mouse-y - file-area.absolute-position.y;
-                                            file-menu.show();
                                         }
                                     }
                                 }
@@ -911,7 +949,12 @@ export component SftpPanel inherits Rectangle {
                                                 && ev.button == PointerEventButton.right) {
                                             file-list-focus.focus();
                                             root.selected-row = -1;
+                                            root.selection-anchor-row = -1;
+                                            root.selection-start-row = -1;
+                                            root.selection-end-row = -1;
                                             root.menu-target = "";
+                                            root.menu-selection-start = -1;
+                                            root.menu-selection-end = -1;
                                             root.menu-x = self.absolute-position.x + self.mouse-x - file-area.absolute-position.x;
                                             root.menu-y = self.absolute-position.y + self.mouse-y - file-area.absolute-position.y;
                                             file-menu.show();
@@ -936,6 +979,9 @@ export component SftpPanel inherits Rectangle {
                                 } else {
                                     root.selected-row -= 1;
                                 }
+                                root.selection-anchor-row = root.selected-row;
+                                root.selection-start-row = root.selected-row;
+                                root.selection-end-row = root.selected-row;
                                 return accept;
                             }
                             if (e.text == Key.DownArrow) {
@@ -944,14 +990,23 @@ export component SftpPanel inherits Rectangle {
                                 } else if (root.selected-row < root.entries.length - 1) {
                                     root.selected-row += 1;
                                 }
+                                root.selection-anchor-row = root.selected-row;
+                                root.selection-start-row = root.selected-row;
+                                root.selection-end-row = root.selected-row;
                                 return accept;
                             }
                             if (e.text == Key.Home) {
                                 root.selected-row = 0;
+                                root.selection-anchor-row = 0;
+                                root.selection-start-row = 0;
+                                root.selection-end-row = 0;
                                 return accept;
                             }
                             if (e.text == Key.End) {
                                 root.selected-row = root.entries.length - 1;
+                                root.selection-anchor-row = root.selected-row;
+                                root.selection-start-row = root.selected-row;
+                                root.selection-end-row = root.selected-row;
                                 return accept;
                             }
                             if (e.text == Key.Backspace) {
@@ -999,7 +1054,15 @@ export component SftpPanel inherits Rectangle {
                                 SftpMenuItem {
                                     label: @tr("Download");
                                     enabled: root.menu-target != "";
-                                    clicked => { root.download(root.menu-target); }
+                                    clicked => {
+                                        if (root.menu-selection-start >= 0
+                                                && root.menu-selection-end >= 0
+                                                && root.menu-selection-start != root.menu-selection-end) {
+                                            root.download-range(root.menu-selection-start, root.menu-selection-end);
+                                        } else {
+                                            root.download(root.menu-target);
+                                        }
+                                    }
                                 }
                                 SftpMenuItem {
                                     label: @tr("View");

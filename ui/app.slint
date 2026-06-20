@@ -368,6 +368,7 @@ export component AppWindow inherits Window {
     in-out property <string> dialog-user;
     in-out property <string> dialog-auth: "password";
     in-out property <string> dialog-password;
+    in-out property <string> dialog-key-passphrase;
     in-out property <string> dialog-key-path;
     in-out property <string> dialog-proxy-type: "none";  // "none" | "socks5" | "http"
     in-out property <string> dialog-proxy-hostport;
@@ -425,6 +426,7 @@ export component AppWindow inherits Window {
     callback sftp-navigate(string /* tab-id */, string /* path */);
     // Trigger a download: Rust opens a save-folder dialog then transfers.
     callback sftp-download(string /* tab-id */, string /* remote-path */);
+    callback sftp-download-range(string /* tab-id */, int /* start */, int /* end */);
     // Trigger an upload: Rust opens a file-picker dialog then transfers.
     callback sftp-upload-clicked(string /* tab-id */, string /* remote-dir */, bool /* folder */);
     // Refresh the current directory listing.
@@ -728,6 +730,7 @@ export component AppWindow inherits Window {
                     terminal-resize(w, h) => { root.terminal-resize(term.id, w, h) }
                     sftp-navigate(path) => { root.sftp-navigate(term.id, path); }
                     sftp-download(path) => { root.sftp-download(term.id, path); }
+                    sftp-download-range(start, end) => { root.sftp-download-range(term.id, start, end); }
                     sftp-upload-clicked(dir, folder) => { root.sftp-upload-clicked(term.id, dir, folder); }
                     sftp-refresh(path) => { root.sftp-refresh(term.id, path); }
                     sftp-tree-expand(path) => { root.sftp-tree-expand(term.id, path); }
@@ -1291,7 +1294,7 @@ export component AppWindow inherits Window {
                                                 enabled: has-local-file;
                                                 mouse-cursor: has-local-file ? pointer : default;
                                                 clicked => {
-                                                    root.open-transfer-location(t.local-path);
+                                                    root.open-transfer-location(t.id);
                                                     rec-menu.close();
                                                 }
                                             }
@@ -2405,6 +2408,7 @@ export component AppWindow inherits Window {
         draft-user <=> root.dialog-user;
         draft-auth <=> root.dialog-auth;
         draft-password <=> root.dialog-password;
+        draft-key-passphrase <=> root.dialog-key-passphrase;
         draft-key-path <=> root.dialog-key-path;
         draft-proxy-type <=> root.dialog-proxy-type;
         draft-proxy-hostport <=> root.dialog-proxy-hostport;
