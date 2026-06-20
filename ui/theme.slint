@@ -1,0 +1,75 @@
+// Central design tokens for meatshell.
+//
+// All colour values are reactive: change `dark` and every widget repaints
+// automatically via Slint's property-binding system.
+//
+// Dark palette  — high-contrast charcoal (original meatshell look).
+// Light palette — Apple macOS-inspired:
+//   • Backgrounds use #f5f5f7 (Apple page gray) instead of pure white to
+//     avoid eye-strain.
+//   • Primary text is #1d1d1f (Apple near-black) not #000000.
+//   • Accent is #0071e3 (Apple blue), consistent across both themes.
+
+export global Theme {
+    // Set by Rust on startup (system detection) and on user toggle.
+    in-out property <bool> dark: true;
+
+    // --- Palette -----------------------------------------------------------
+    out property <brush> bg-root:      dark ? #1b1d23 : #f5f5f7;
+    out property <brush> bg-panel:     dark ? #23262d : #ffffff;
+    out property <brush> bg-panel-alt: dark ? #2a2d35 : #f2f2f7;
+    out property <brush> bg-elevated:  dark ? #30333c : #e8e8ed;
+    out property <brush> bg-hover:     dark ? #373a44 : #e0e0e6;
+    out property <brush> bg-active:    dark ? #3f4350 : #d8d8de;
+
+    out property <brush> border-subtle: dark ? #3a3d46 : #e2e2e8;
+    out property <brush> border-strong: dark ? #4a4e59 : #c7c7cc;
+
+    out property <brush> text-primary:   dark ? #e6e8ee : #1d1d1f;
+    out property <brush> text-secondary: dark ? #b4b9c4 : #6e6e73;
+    out property <brush> text-muted:     dark ? #9196a3 : #aeaeb2;
+
+    out property <brush> accent:         dark ? #4a90e2 : #0071e3;
+    out property <brush> accent-hover:   dark ? #5aa0f2 : #0077ed;
+    out property <brush> accent-pressed: dark ? #3a80d2 : #006adb;
+
+    out property <brush> success: dark ? #4ec9b0 : #34c759;
+    out property <brush> warning: dark ? #e2a84a : #ff9f0a;
+    out property <brush> danger:  dark ? #e25c5c : #ff3b30;
+
+    // Terminal uses its own background so it stays readable regardless of
+    // what the shell / remote app outputs via ANSI colour codes.
+    out property <brush> term-bg: dark ? #0e0f13 : #fafafa;
+    out property <brush> term-fg: dark ? #d4d4d4 : #2d2d2f;
+
+    // --- Typography --------------------------------------------------------
+    out property <length> fs-xs: 11px;
+    out property <length> fs-sm: 12px;
+    out property <length> fs-md: 13px;
+    out property <length> fs-lg: 15px;
+    out property <length> fs-xl: 18px;
+
+    // Embedded glyph-complete monospace (Cascadia Mono under a unique name, #114).
+    out property <string> font-mono: "Meatshell Mono";
+
+    // UI (sans) font for editable inputs. The embedded mono font has no CJK
+    // glyphs and native TextInput doesn't glyph-fallback like Text does, so
+    // typing Chinese into a bare TextInput renders tofu. Rust sets this to a
+    // CJK-capable system font on startup (empty = platform default).
+    in-out property <string> ui-font-family: "";
+
+    // Terminal font — user-configurable via Interface settings, set by Rust
+    // from the config on startup. cell size in terminal_view derives from these.
+    in-out property <string> term-font-family: "Meatshell Mono";
+    in-out property <length> term-font-size: 13px;
+
+    // --- Geometry ----------------------------------------------------------
+    out property <length> radius-sm: 4px;
+    out property <length> radius-md: 6px;
+    out property <length> radius-lg: 10px;
+
+    out property <length> gap-xs: 4px;
+    out property <length> gap-sm: 8px;
+    out property <length> gap-md: 12px;
+    out property <length> gap-lg: 16px;
+}

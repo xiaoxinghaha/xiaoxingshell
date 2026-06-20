@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="windows-1252"?>
+<!--
+  WiX (v3) installer definition for xiaoxingshell, driven by `cargo wix`.
+
+  cargo-wix injects these preprocessor variables:
+    $(var.Version)            crate version from Cargo.toml
+    $(var.CargoTargetBinDir)  e.g. target\x86_64-pc-windows-msvc\release
+
+  The `WixUI_InstallDir` UI (bottom) gives the user a "Browse..." page so the
+  install directory can be changed, which is the whole point of shipping an MSI.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+    <Product
+        Id="*"
+        Name="xiaoxingshell"
+        UpgradeCode="6E8F2A1B-3C4D-4E5F-9A0B-1C2D3E4F5A6B"
+        Manufacturer="xiaoxingshell contributors"
+        Language="1033"
+        Codepage="1252"
+        Version="$(var.Version)">
+
+        <Package Id="*"
+            Keywords="Installer"
+            Description="xiaoxingshell - lightweight Rust + Slint SSH/terminal client"
+            Manufacturer="xiaoxingshell contributors"
+            InstallerVersion="450"
+            Languages="1033"
+            Compressed="yes"
+            InstallScope="perMachine"
+            SummaryCodepage="1252"/>
+
+        <!-- Replace an older install in place instead of erroring out. -->
+        <MajorUpgrade
+            Schedule="afterInstallInitialize"
+            DowngradeErrorMessage="A newer version of xiaoxingshell is already installed. Setup will now exit."/>
+
+        <Media Id="1" Cabinet="media1.cab" EmbedCab="yes" DiskPrompt="CD-ROM #1"/>
+        <Property Id="DiskPrompt" Value="xiaoxingshell Installation"/>
+
+        <Icon Id="ProductICO" SourceFile="assets\xiaoxingshell.ico"/>
+        <Property Id="ARPPRODUCTICON" Value="ProductICO"/>
+
+        <Directory Id="TARGETDIR" Name="SourceDir">
+            <Directory Id="ProgramFiles64Folder">
+                <!-- Default path; the InstallDir UI lets the user change it. -->
+                <Directory Id="APPLICATIONFOLDER" Name="xiaoxingshell">
+                    <Component Id="MainExecutable" Guid="*">
+                        <File Id="xiaoxingshellEXE"
+                              Name="xiaoxingshell.exe"
+                              Source="$(var.CargoTargetBinDir)\xiaoxingshell.exe"
+                              KeyPath="yes"/>
+                    </Component>
+                </Directory>
+            </Directory>
+            <Directory Id="ProgramMenuFolder">
+                <Component Id="ApplicationShortcut" Guid="*">
+                    <Shortcut Id="StartMenuShortcut"
+                        Name="xiaoxingshell"
+                        Description="Lightweight SSH/terminal client"
+                        Target="[APPLICATIONFOLDER]xiaoxingshell.exe"
+                        WorkingDirectory="APPLICATIONFOLDER"
+                        Icon="ProductICO"/>
+                    <RemoveFolder Id="CleanUpShortCut" On="uninstall"/>
+                    <RegistryValue Root="HKCU"
+                        Key="Software\xiaoxingshell"
+                        Name="installed"
+                        Type="integer"
+                        Value="1"
+                        KeyPath="yes"/>
+                </Component>
+            </Directory>
+        </Directory>
+
+        <Feature Id="MainProgram" Title="xiaoxingshell" Level="1">
+            <ComponentRef Id="MainExecutable"/>
+            <ComponentRef Id="ApplicationShortcut"/>
+        </Feature>
+
+        <!-- "Choose install location" wizard page (needs WixUIExtension). -->
+        <Property Id="WIXUI_INSTALLDIR" Value="APPLICATIONFOLDER"/>
+        <UIRef Id="WixUI_InstallDir"/>
+        <UIRef Id="WixUI_ErrorProgressText"/>
+    </Product>
+</Wix>

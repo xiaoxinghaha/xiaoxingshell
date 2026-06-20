@@ -1,0 +1,409 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: xiaoxingshell\n"
+"Language: en\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+msgid "Not connected"
+msgstr "Not connected"
+
+msgid "Local resources"
+msgstr "Local resources"
+
+msgid "Server resources"
+msgstr "Server resources"
+
+msgid "Download settings"
+msgstr "Download settings"
+
+msgid "Save downloads to:"
+msgstr "Save downloads to:"
+
+msgid "(ask every time)"
+msgstr "(ask every time)"
+
+msgid "Choose folder"
+msgstr "Choose folder"
+
+msgid "Choose save path"
+msgstr "Choose save path"
+
+msgid "Upload file"
+msgstr "Upload file"
+
+msgid "Upload folder"
+msgstr "Upload folder"
+
+msgid "Open folder"
+msgstr "Open folder"
+
+msgid "Transfers"
+msgstr "Transfers"
+
+msgid "Clear"
+msgstr "Clear"
+
+msgid "No transfers yet"
+msgstr "No transfers yet"
+
+msgid "About"
+msgstr "About"
+
+msgid "About meatshell"
+msgstr "About xiaoxingshell"
+
+msgid "A lightweight Rust + Slint SSH terminal client by 'lil meatball'."
+msgstr "A lightweight Rust + Slint SSH terminal client by 'xiaoxing'."
+
+msgid "Open source · MIT / Apache-2.0"
+msgstr "Open source · MIT / Apache-2.0"
+
+msgid "Open-source libraries used"
+msgstr "Open-source libraries used"
+
+msgid "Edit session"
+msgstr "Edit session"
+
+msgid "New session"
+msgstr "New session"
+
+msgid "Name"
+msgstr "Name"
+
+msgid "e.g. production web-01"
+msgstr "e.g. production web-01"
+
+msgid "Host / IP"
+msgstr "Host / IP"
+
+msgid "Port"
+msgstr "Port"
+
+msgid "Username"
+msgstr "Username"
+
+msgid "Authentication"
+msgstr "Authentication"
+
+msgid "Password"
+msgstr "Password"
+
+msgid "Private key"
+msgstr "Private key"
+
+msgid "Leave blank to keep the current password"
+msgstr "Leave blank to keep the current password"
+
+msgid "Key passphrase"
+msgstr "Key passphrase"
+
+msgid "Leave blank if the key isn't encrypted"
+msgstr "Leave blank if the key isn't encrypted"
+
+msgid "Leave blank to keep the current passphrase"
+msgstr "Leave blank to keep the current passphrase"
+
+msgid "Private key file"
+msgstr "Private key file"
+
+msgid "Browse…"
+msgstr "Browse…"
+
+msgid "Pick the private key itself (not the .pub public key)"
+msgstr "Pick the private key itself (not the .pub public key)"
+
+msgid "Cancel"
+msgstr "Cancel"
+
+msgid "Save"
+msgstr "Save"
+
+msgid "Create"
+msgstr "Create"
+
+msgid "SFTP not connected"
+msgstr "SFTP not connected"
+
+msgid "Upload"
+msgstr "Upload"
+
+msgid "Directory tree"
+msgstr "Directory tree"
+
+msgid "Size"
+msgstr "Size"
+
+msgid "Modified"
+msgstr "Modified"
+
+msgid "Type"
+msgstr "Type"
+
+msgid "Loading..."
+msgstr "Loading..."
+
+msgid "Empty directory"
+msgstr "Empty directory"
+
+msgid "Download"
+msgstr "Download"
+
+msgid "Update available:"
+msgstr "Update available:"
+
+msgid "Open externally"
+msgstr "Open externally"
+
+msgid "Edit externally"
+msgstr "Edit externally"
+
+msgid "Configure external editor"
+msgstr "Configure external editor"
+
+msgid "Rename"
+msgstr "Rename"
+
+msgid "Permissions"
+msgstr "Permissions"
+
+msgid "User/Group"
+msgstr "User/Group"
+
+msgid "Copy path"
+msgstr "Copy path"
+
+msgid "Refresh"
+msgstr "Refresh"
+
+msgid "New folder"
+msgstr "New folder"
+
+msgid "New file"
+msgstr "New file"
+
+msgid "New name"
+msgstr "New name"
+
+msgid "Octal mode, e.g. 755"
+msgstr "Octal mode, e.g. 755"
+
+msgid "Read-only"
+msgstr "Read-only"
+
+msgid "Modified"
+msgstr "Modified"
+
+msgid "View"
+msgstr "View"
+
+msgid "Edit"
+msgstr "Edit"
+
+msgid "Delete"
+msgstr "Delete"
+
+msgid "Duplicate"
+msgstr "Duplicate"
+
+msgid "New group"
+msgstr "New group"
+
+msgid "Edit group"
+msgstr "Edit group"
+
+msgid "Delete group"
+msgstr "Delete group"
+
+msgid "Group name"
+msgstr "Group name"
+
+msgid "e.g. Production / Database"
+msgstr "e.g. Production / Database"
+
+msgid "Please enter a host / IP address."
+msgstr "Please enter a host / IP address."
+
+msgid "Prompted on connect if blank"
+msgstr "Prompted on connect if blank"
+
+msgid "e.g. /home/you/.ssh/id_ed25519"
+msgstr "e.g. /home/you/.ssh/id_ed25519"
+
+msgid "e.g. 127.0.0.1:1080"
+msgstr "e.g. 127.0.0.1:1080"
+
+msgid "Telnet"
+msgstr "Telnet"
+
+msgid "Move to"
+msgstr "Move to"
+
+msgid "Status"
+msgstr "Status"
+
+msgid "Memory"
+msgstr "Memory"
+
+msgid "Swap"
+msgstr "Swap"
+
+msgid "Local"
+msgstr "Local"
+
+msgid "Path"
+msgstr "Path"
+
+msgid "Free/Total"
+msgstr "Free/Total"
+
+msgid "Copy"
+msgstr "Copy"
+
+msgid "Paste"
+msgstr "Paste"
+
+msgid "Clear buffer"
+msgstr "Clear buffer"
+
+msgid "Find"
+msgstr "Find"
+
+msgid "Processes"
+msgstr "Processes"
+
+msgid "User"
+msgstr "User"
+
+msgid "Command"
+msgstr "Command"
+
+msgid "No processes"
+msgstr "No processes"
+
+msgid "Quick"
+msgstr "Quick"
+
+msgid "Quick commands"
+msgstr "Quick commands"
+
+msgid "Type a command, Enter to send"
+msgstr "Type a command, Enter to send"
+
+msgid "All sessions"
+msgstr "All sessions"
+
+msgid "Send"
+msgstr "Send"
+
+msgid "No quick commands yet"
+msgstr "No quick commands yet"
+
+msgid "Manage…"
+msgstr "Manage…"
+
+msgid "No history yet"
+msgstr "No history yet"
+
+msgid "e.g. tail log"
+msgstr "e.g. tail log"
+
+msgid "Port forwarding"
+msgstr "Port forwarding"
+
+msgid "Advanced (proxy, tunnels)"
+msgstr "Advanced (proxy, tunnels)"
+
+msgid "Local (-L)"
+msgstr "Local (-L)"
+
+msgid "Remote (-R)"
+msgstr "Remote (-R)"
+
+msgid "Dynamic (-D)"
+msgstr "Dynamic (-D)"
+
+msgid "Listen port"
+msgstr "Listen port"
+
+msgid "Target host"
+msgstr "Target host"
+
+msgid "Target port"
+msgstr "Target port"
+
+msgid "Add"
+msgstr "Add"
+
+msgid "-L: local port → target reached from the server"
+msgstr "-L: local port → target reached from the server"
+
+msgid "-R: server port → target reached from here"
+msgstr "-R: server port → target reached from here"
+
+msgid "-D: local SOCKS5 proxy"
+msgstr "-D: local SOCKS5 proxy"
+
+msgid "xiaoxingshell — a lightweight Rust + Slint SSH client by 'xiaoxing'"
+msgstr "xiaoxingshell — a lightweight Rust + Slint SSH client by 'xiaoxing'"
+
+msgid "Quick connect"
+msgstr "Quick connect"
+
+msgid "+ New session"
+msgstr "+ New session"
+
+msgid "No sessions yet"
+msgstr "No sessions yet"
+
+msgid "Use 'New session' (top-right) to add your first server"
+msgstr "Use 'New session' (top-right) to add your first server"
+
+msgid "Import ~/.ssh/config"
+msgstr "Import ~/.ssh/config"
+
+msgid "Proxy (optional)"
+msgstr "Proxy (optional)"
+
+msgid "Leave blank to use $ALL_PROXY or connect directly"
+msgstr "Leave blank to use $ALL_PROXY or connect directly"
+
+msgid "Connection type"
+msgstr "Connection type"
+
+msgid "Serial"
+msgstr "Serial"
+
+msgid "Serial port"
+msgstr "Serial port"
+
+msgid "Baud rate"
+msgstr "Baud rate"
+
+msgid "Data bits / Stop bits / Parity"
+msgstr "Data bits / Stop bits / Parity"
+
+msgid "Flow control"
+msgstr "Flow control"
+
+msgid "None"
+msgstr "None"
+
+msgid "Hardware"
+msgstr "Hardware"
+
+msgid "Software"
+msgstr "Software"
+
+msgid "Confirm delete"
+msgstr "Confirm delete"
+
+msgid "Delete this item? This cannot be undone."
+msgstr "Delete this item? This cannot be undone."
+
+msgid "Please confirm"
+msgstr "Please confirm"
+
+msgid "Confirm"
+msgstr "Confirm"

@@ -1,0 +1,1085 @@
+import { Theme } from "theme.slint";
+import { ScrollView } from "std-widgets.slint";
+
+// ---------------------------------------------------------------------------
+// Data types
+// ---------------------------------------------------------------------------
+
+export struct SftpEntry {
+    name: string,
+    full-path: string,
+    is-dir: bool,
+    file-type: string,
+    size: string,
+    modified: string,
+    mode-text: string,
+    owner-group: string,
+    mode: int,        // POSIX permission bits, for the chmod dialog (#84)
+}
+
+export struct SftpTreeNode {
+    path: string,
+    name: string,
+    depth: int,
+    expanded: bool,
+    has-children: bool,
+}
+
+// One row of the file-list right-click context menu.
+component SftpMenuItem inherits Rectangle {
+    in property <string> label;
+    in property <brush> tint: Theme.text-primary;
+    in property <bool> enabled: true;   // disabled items grey out + ignore clicks
+    callback clicked();
+    height: 26px;
+    border-radius: Theme.radius-sm;
+    background: (root.enabled && ta.has-hover) ? Theme.bg-hover : transparent;
+    ta := TouchArea {
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { if (root.enabled) { root.clicked(); } }
+    }
+    Text {
+        x: 10px;
+        text: root.label;
+        color: root.enabled ? root.tint : Theme.text-muted;
+        font-size: Theme.fs-sm;
+        vertical-alignment: center;
+        height: parent.height;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SftpPanel — left directory tree + right file listing
+// ---------------------------------------------------------------------------
+
+export component SftpPanel inherits Rectangle {
+    // --- Properties --------------------------------------------------------
+    in property <string>  current-path: "/";
+    in property <[SftpEntry]>    entries;
+    in property <string>  status: @tr("SFTP not connected");
+    in property <bool>    loading: false;
+    in property <[SftpTreeNode]> tree-nodes: [];
+    in property <bool> collapsed: false;   // when true only the toolbar shows
+    property <int> selected-row: -1;       // clicked/highlighted file-list row (#70)
+    // Panel-level right-click context menu (#84). One menu for the whole list:
+    // an empty `menu-target` means the click landed on whitespace, which greys
+    // out the item-specific actions (download/rename/…) but keeps new/refresh.
+    property <length> menu-x;
+    property <length> menu-y;
+    property <string> menu-target;          // "" = whitespace
+    property <string> menu-target-name;
+    property <bool>   menu-target-is-dir;
+    property <int>    menu-target-mode;     // permission bits for the chmod dialog
+    in-out property <length> tree-width: 160px;
+    in-out property <length> col-name-width: 180px;
+    in-out property <length> col-size-width: 72px;
+    in-out property <length> col-type-width: 110px;
+    in-out property <length> col-modified-width: 130px;
+    in-out property <length> col-mode-width: 90px;
+    in-out property <length> col-owner-width: 110px;
+    property <int> resize-column: -1;
+    property <length> resize-grab-x: 0px;
+    property <length> resize-base-width: 0px;
+    property <length> min-col-width: 56px;
+    property <bool> tree-resizing: false;
+    property <length> tree-resize-grab-x: 0px;
+    property <length> tree-resize-base-width: 0px;
+    property <length> min-tree-width: 120px;
+    property <length> max-tree-width: 420px;
+    in-out property <string> sort-column: "name";
+    in-out property <bool> sort-ascending: true;
+    property <bool> file-list-focused: false;
+
+    // --- Callbacks ---------------------------------------------------------
+    callback toggle-collapsed();    // minimise / restore the panel
+    callback navigate(string);
+    callback download(string);
+    callback upload-clicked(string /* remote dir */, bool /* folder */);
+    callback refresh(string);
+    callback tree-expand(string);   // toggle expand/collapse + navigate
+    callback delete(string);        // remove a remote file/dir
+    callback view(string);          // open read-only in the built-in viewer
+    callback edit(string);          // open writable in the built-in editor
+    callback open-external(string);     // open with the OS default app (#81)
+    callback edit-external(string);     // open externally + watch/re-upload (#81)
+    callback configure-external-editor();
+    callback persist-layout();
+    callback sort-request(string);
+    // Context-menu extensions (#69). The *-request callbacks open dialogs in
+    // the app shell; copy-path goes straight to the system clipboard.
+    callback rename-request(string /* path */, string /* current name */);
+    callback chmod-request(string /* path */, string /* name */, int /* mode */);
+    callback copy-path(string);
+    callback new-folder(string /* parent dir */);
+    callback new-file(string /* parent dir */);
+
+    // -----------------------------------------------------------------------
+    background: Theme.bg-panel;
+
+    // Keep the editable path bar in sync when the directory changes elsewhere
+    // (tree click, file double-click, terminal cd) (#54).
+    changed current-path => {
+        path-input.text = root.current-path;
+        root.selected-row = root.entries.length > 0 ? 0 : -1;
+        if (root.file-list-focused) {
+            file-list-focus.focus();
+        }
+    }
+
+    changed entries => {
+        if (root.entries.length > 0) {
+            if (root.selected-row < 0 || root.selected-row >= root.entries.length) {
+                root.selected-row = 0;
+            }
+        } else {
+            root.selected-row = -1;
+        }
+    }
+
+    VerticalLayout {
+        spacing: 0;
+
+        // --- Toolbar (full width) ------------------------------------------
+        Rectangle {
+            height: 30px;
+            background: Theme.bg-panel-alt;
+
+            HorizontalLayout {
+                padding-left: 6px;
+                padding-right: 6px;
+                spacing: 4px;
+
+                // Editable path bar: type or paste a path and press Enter to
+                // jump there; copy / paste-jump buttons sit right after it (#54).
+                Rectangle {
+                    horizontal-stretch: 1;
+                    height: 22px;
+                    border-radius: Theme.radius-sm;
+                    background: Theme.bg-root;
+                    border-width: 1px;
+                    border-color: path-input.has-focus ? Theme.accent : Theme.border-subtle;
+                    path-input := TextInput {
+                        x: 6px;
+                        width: parent.width - 12px;
+                        height: parent.height;
+                        text: root.current-path;
+                        color: Theme.text-primary;
+                        // CJK-capable font so typed Chinese isn't tofu (#54).
+                        font-family: Theme.ui-font-family;
+                        font-size: Theme.fs-sm;
+                        vertical-alignment: center;
+                        single-line: true;
+                        accepted => { root.navigate(self.text); }
+                    }
+                }
+
+                // Copy the current path to the clipboard.
+                Rectangle {
+                    width: 24px; height: 22px;
+                    border-radius: Theme.radius-sm;
+                    background: copy-ta.has-hover ? Theme.bg-hover : transparent;
+                    copy-ta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            path-input.select-all();
+                            path-input.copy();
+                            path-input.clear-selection();
+                        }
+                    }
+                    Text { text: "\u{E14D}"; font-family: "Material Icons";
+                           color: Theme.text-secondary; font-size: Theme.fs-sm;
+                           horizontal-alignment: center; vertical-alignment: center; }
+                }
+
+                // Paste a path from the clipboard and jump straight to it.
+                Rectangle {
+                    width: 24px; height: 22px;
+                    border-radius: Theme.radius-sm;
+                    background: pj-ta.has-hover ? Theme.bg-hover : transparent;
+                    pj-ta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            path-input.select-all();
+                            path-input.paste();
+                            root.navigate(path-input.text);
+                        }
+                    }
+                    Text { text: "\u{E14F}"; font-family: "Material Icons";
+                           color: Theme.text-secondary; font-size: Theme.fs-sm;
+                           horizontal-alignment: center; vertical-alignment: center; }
+                }
+
+                up-btn := Rectangle {
+                    width: 24px; height: 22px;
+                    border-radius: Theme.radius-sm;
+                    background: up-ta.has-hover ? Theme.bg-hover : transparent;
+                    up-ta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.navigate(".."); }
+                    }
+                    Text { text: "↑"; color: Theme.text-secondary; font-size: Theme.fs-md;
+                           horizontal-alignment: center; vertical-alignment: center; }
+                }
+
+                // Upload: a small menu offers file vs folder (#85). The remote
+                // SFTP upload handles both — only the local picker differs.
+                ul-btn := Rectangle {
+                    width: 52px; height: 22px;
+                    border-radius: Theme.radius-sm;
+                    background: ul-ta.has-hover ? Theme.accent-hover : Theme.accent;
+                    ul-ta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { ul-menu.show(); }
+                    }
+                    Text { text: @tr("Upload"); color: #ffffff; font-size: Theme.fs-sm;
+                           horizontal-alignment: center; vertical-alignment: center; }
+                    ul-menu := PopupWindow {
+                        x: 0; y: parent.height + 2px;
+                        width: 124px;
+                        height: 2 * 27px + 8px;
+                        Rectangle {
+                            background: Theme.bg-panel;
+                            border-radius: Theme.radius-sm;
+                            border-width: 1px;
+                            border-color: Theme.border-strong;
+                            drop-shadow-blur: 12px;
+                            drop-shadow-color: #00000060;
+                            VerticalLayout {
+                                padding: 4px;
+                                spacing: 1px;
+                                SftpMenuItem {
+                                    label: @tr("Upload file");
+                                    clicked => { root.upload-clicked(root.current-path, false); }
+                                }
+                                SftpMenuItem {
+                                    label: @tr("Upload folder");
+                                    clicked => { root.upload-clicked(root.current-path, true); }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    width: 24px; height: 22px;
+                    border-radius: Theme.radius-sm;
+                    background: ref-ta.has-hover ? Theme.bg-hover : transparent;
+                    ref-ta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.refresh(root.current-path); }
+                    }
+                    Text { text: "\u{E5D5}"; font-family: "Material Icons";
+                           color: Theme.text-secondary; font-size: Theme.fs-sm;
+                           horizontal-alignment: center; vertical-alignment: center; }
+                }
+
+                // Minimise / restore the SFTP panel (#41).
+                Rectangle {
+                    width: 24px; height: 22px;
+                    border-radius: Theme.radius-sm;
+                    background: min-ta.has-hover ? Theme.bg-hover : transparent;
+                    min-ta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.toggle-collapsed(); }
+                    }
+                    // expand_less (▲, restore) when collapsed, expand_more (▼) otherwise.
+                    Text { text: root.collapsed ? "\u{E5CE}" : "\u{E5CF}"; font-family: "Material Icons";
+                           color: Theme.text-secondary; font-size: Theme.fs-md;
+                           horizontal-alignment: center; vertical-alignment: center; }
+                }
+            }
+        }
+
+        // --- Main area: tree (left) + file list (right) --------------------
+        HorizontalLayout {
+            vertical-stretch: 1;
+            spacing: 0;
+
+            // ── Left: directory tree ────────────────────────────────────────
+            VerticalLayout {
+                width: root.tree-width;
+                spacing: 0;
+
+                // Tree header
+                Rectangle {
+                    height: 20px;
+                    background: Theme.bg-root;
+                    Text {
+                        x: 8px;
+                        text: @tr("Directory tree");
+                        color: Theme.text-muted;
+                        font-size: Theme.fs-xs;
+                        vertical-alignment: center;
+                        height: parent.height;
+                    }
+                }
+                Rectangle { height: 1px; background: Theme.border-subtle; }
+
+                // Tree list with scrollbar
+                ScrollView {
+                    vertical-stretch: 1;
+
+                    tree-list := VerticalLayout {
+                        spacing: 0;
+
+                        for node[i] in root.tree-nodes : Rectangle {
+                            height: 22px;
+                            background: node-ta.has-hover
+                                ? Theme.bg-hover
+                                : (node.path == root.current-path
+                                    ? #4a90e230
+                                    : (mod(i, 2) == 0 ? transparent : #ffffff08));
+
+                            node-ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.tree-expand(node.path); }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 0;
+                                padding-top: 1px;
+
+                                // Depth indent spacer
+                                Rectangle { width: node.depth * 12px; }
+
+                                // Expand/collapse arrow
+                                Text {
+                                    width: 14px;
+                                    text: node.has-children
+                                        ? (node.expanded ? "▼" : "▶")
+                                        : " ";
+                                    color: Theme.text-muted;
+                                    font-size: 9px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+
+                                // Folder name
+                                Text {
+                                    text: node.depth == 0 ? "/" : node.name;
+                                    color: node.path == root.current-path
+                                        ? Theme.accent
+                                        : Theme.text-primary;
+                                    font-size: Theme.fs-sm;
+                                    horizontal-stretch: 1;
+                                    overflow: elide;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Vertical separator + tree resize handle
+            Rectangle {
+                width: 4px;
+                background: tree-divider-ta.has-hover || root.tree-resizing
+                    ? Theme.accent
+                    : Theme.border-subtle;
+                tree-divider-ta := TouchArea {
+                    mouse-cursor: col-resize;
+                    pointer-event(ev) => {
+                        if (ev.kind == PointerEventKind.down) {
+                            root.tree-resizing = true;
+                            root.tree-resize-grab-x = self.absolute-position.x + self.mouse-x;
+                            root.tree-resize-base-width = root.tree-width;
+                        } else if (ev.kind == PointerEventKind.up) {
+                            root.tree-resizing = false;
+                            root.persist-layout();
+                        }
+                    }
+                    moved => {
+                        if (root.tree-resizing) {
+                            root.tree-width = clamp(
+                                root.tree-resize-base-width
+                                    + (self.absolute-position.x + self.mouse-x - root.tree-resize-grab-x),
+                                root.min-tree-width,
+                                root.max-tree-width
+                            );
+                        }
+                    }
+                }
+            }
+
+            // ── Right: file listing ─────────────────────────────────────────
+            VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: 0;
+
+                // Column headers
+                Rectangle {
+                    height: 20px;
+                    background: Theme.bg-root;
+                    header-content := Rectangle {
+                        width: parent.width;
+                        height: parent.height;
+
+                        HorizontalLayout {
+                            padding-left: 8px; padding-right: 8px;
+                            Rectangle {
+                                width: root.col-name-width;
+                                header-name-ta := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => {
+                                        if (root.sort-column == "name") {
+                                            root.sort-ascending = !root.sort-ascending;
+                                        } else {
+                                            root.sort-column = "name";
+                                            root.sort-ascending = true;
+                                        }
+                                        root.sort-request("name");
+                                    }
+                                }
+                                Text {
+                                    text: @tr("Name") + (root.sort-column == "name" ? (root.sort-ascending ? " ▲" : " ▼") : "");
+                                    color: root.sort-column == "name" ? Theme.text-primary : Theme.text-muted;
+                                    font-size: Theme.fs-xs;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            Rectangle {
+                                width: root.col-size-width;
+                                header-size-ta := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => {
+                                        if (root.sort-column == "size") {
+                                            root.sort-ascending = !root.sort-ascending;
+                                        } else {
+                                            root.sort-column = "size";
+                                            root.sort-ascending = true;
+                                        }
+                                        root.sort-request("size");
+                                    }
+                                }
+                                Text {
+                                    text: @tr("Size") + (root.sort-column == "size" ? (root.sort-ascending ? " ▲" : " ▼") : "");
+                                    color: root.sort-column == "size" ? Theme.text-primary : Theme.text-muted;
+                                    font-size: Theme.fs-xs;
+                                    width: parent.width;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            Rectangle {
+                                width: root.col-type-width;
+                                header-type-ta := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => {
+                                        if (root.sort-column == "type") {
+                                            root.sort-ascending = !root.sort-ascending;
+                                        } else {
+                                            root.sort-column = "type";
+                                            root.sort-ascending = true;
+                                        }
+                                        root.sort-request("type");
+                                    }
+                                }
+                                Text {
+                                    text: @tr("Type") + (root.sort-column == "type" ? (root.sort-ascending ? " ▲" : " ▼") : "");
+                                    color: root.sort-column == "type" ? Theme.text-primary : Theme.text-muted;
+                                    font-size: Theme.fs-xs;
+                                    width: parent.width;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            Rectangle {
+                                width: root.col-modified-width;
+                                header-modified-ta := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => {
+                                        if (root.sort-column == "modified") {
+                                            root.sort-ascending = !root.sort-ascending;
+                                        } else {
+                                            root.sort-column = "modified";
+                                            root.sort-ascending = true;
+                                        }
+                                        root.sort-request("modified");
+                                    }
+                                }
+                                Text {
+                                    text: @tr("Modified") + (root.sort-column == "modified" ? (root.sort-ascending ? " ▲" : " ▼") : "");
+                                    color: root.sort-column == "modified" ? Theme.text-primary : Theme.text-muted;
+                                    font-size: Theme.fs-xs;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            Rectangle {
+                                width: root.col-mode-width;
+                                header-mode-ta := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => {
+                                        if (root.sort-column == "mode") {
+                                            root.sort-ascending = !root.sort-ascending;
+                                        } else {
+                                            root.sort-column = "mode";
+                                            root.sort-ascending = true;
+                                        }
+                                        root.sort-request("mode");
+                                    }
+                                }
+                                Text {
+                                    text: @tr("Permissions") + (root.sort-column == "mode" ? (root.sort-ascending ? " ▲" : " ▼") : "");
+                                    color: root.sort-column == "mode" ? Theme.text-primary : Theme.text-muted;
+                                    font-size: Theme.fs-xs;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            Rectangle {
+                                width: root.col-owner-width;
+                                header-owner-ta := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => {
+                                        if (root.sort-column == "owner") {
+                                            root.sort-ascending = !root.sort-ascending;
+                                        } else {
+                                            root.sort-column = "owner";
+                                            root.sort-ascending = true;
+                                        }
+                                        root.sort-request("owner");
+                                    }
+                                }
+                                Text {
+                                    text: @tr("User/Group") + (root.sort-column == "owner" ? (root.sort-ascending ? " ▲" : " ▼") : "");
+                                    color: root.sort-column == "owner" ? Theme.text-primary : Theme.text-muted;
+                                    font-size: Theme.fs-xs;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
+
+                        Rectangle {
+                            x: 8px + root.col-name-width - self.width / 2;
+                            width: 6px;
+                            height: parent.height;
+                            background: (name-resize-ta.has-hover || root.resize-column == 0)
+                                ? Theme.accent
+                                : transparent;
+                            Rectangle {
+                                x: parent.width / 2;
+                                width: 1px;
+                                height: parent.height - 4px;
+                                y: 2px;
+                                background: name-resize-ta.has-hover || root.resize-column == 0
+                                    ? Theme.accent
+                                    : Theme.border-subtle;
+                            }
+                            name-resize-ta := TouchArea {
+                                mouse-cursor: col-resize;
+                                pointer-event(ev) => {
+                                    if (ev.kind == PointerEventKind.down) {
+                                        root.resize-column = 0;
+                                        root.resize-grab-x = self.absolute-position.x + self.mouse-x;
+                                        root.resize-base-width = root.col-name-width;
+                                    } else if (ev.kind == PointerEventKind.up && root.resize-column == 0) {
+                                        root.persist-layout();
+                                        root.resize-column = -1;
+                                    }
+                                }
+                                moved => {
+                                    if (root.resize-column == 0) {
+                                        root.col-name-width = max(
+                                            root.min-col-width,
+                                            root.resize-base-width
+                                                + (self.absolute-position.x + self.mouse-x - root.resize-grab-x)
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            x: 8px + root.col-name-width + root.col-size-width - self.width / 2;
+                            width: 6px;
+                            height: parent.height;
+                            background: (size-resize-ta.has-hover || root.resize-column == 1)
+                                ? Theme.accent
+                                : transparent;
+                            Rectangle {
+                                x: parent.width / 2;
+                                width: 1px;
+                                height: parent.height - 4px;
+                                y: 2px;
+                                background: size-resize-ta.has-hover || root.resize-column == 1
+                                    ? Theme.accent
+                                    : Theme.border-subtle;
+                            }
+                            size-resize-ta := TouchArea {
+                                mouse-cursor: col-resize;
+                                pointer-event(ev) => {
+                                    if (ev.kind == PointerEventKind.down) {
+                                        root.resize-column = 1;
+                                        root.resize-grab-x = self.absolute-position.x + self.mouse-x;
+                                        root.resize-base-width = root.col-size-width;
+                                    } else if (ev.kind == PointerEventKind.up && root.resize-column == 1) {
+                                        root.persist-layout();
+                                        root.resize-column = -1;
+                                    }
+                                }
+                                moved => {
+                                    if (root.resize-column == 1) {
+                                        root.col-size-width = max(
+                                            root.min-col-width,
+                                            root.resize-base-width
+                                                + (self.absolute-position.x + self.mouse-x - root.resize-grab-x)
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            x: 8px + root.col-name-width + root.col-size-width + root.col-type-width - self.width / 2;
+                            width: 6px;
+                            height: parent.height;
+                            background: (type-resize-ta.has-hover || root.resize-column == 2)
+                                ? Theme.accent
+                                : transparent;
+                            Rectangle {
+                                x: parent.width / 2;
+                                width: 1px;
+                                height: parent.height - 4px;
+                                y: 2px;
+                                background: type-resize-ta.has-hover || root.resize-column == 2
+                                    ? Theme.accent
+                                    : Theme.border-subtle;
+                            }
+                            type-resize-ta := TouchArea {
+                                mouse-cursor: col-resize;
+                                pointer-event(ev) => {
+                                    if (ev.kind == PointerEventKind.down) {
+                                        root.resize-column = 2;
+                                        root.resize-grab-x = self.absolute-position.x + self.mouse-x;
+                                        root.resize-base-width = root.col-type-width;
+                                    } else if (ev.kind == PointerEventKind.up && root.resize-column == 2) {
+                                        root.persist-layout();
+                                        root.resize-column = -1;
+                                    }
+                                }
+                                moved => {
+                                    if (root.resize-column == 2) {
+                                        root.col-type-width = max(
+                                            root.min-col-width,
+                                            root.resize-base-width
+                                                + (self.absolute-position.x + self.mouse-x - root.resize-grab-x)
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            x: 8px + root.col-name-width + root.col-size-width + root.col-type-width + root.col-modified-width - self.width / 2;
+                            width: 6px;
+                            height: parent.height;
+                            background: (modified-resize-ta.has-hover || root.resize-column == 3)
+                                ? Theme.accent
+                                : transparent;
+                            Rectangle {
+                                x: parent.width / 2;
+                                width: 1px;
+                                height: parent.height - 4px;
+                                y: 2px;
+                                background: modified-resize-ta.has-hover || root.resize-column == 3
+                                    ? Theme.accent
+                                    : Theme.border-subtle;
+                            }
+                            modified-resize-ta := TouchArea {
+                                mouse-cursor: col-resize;
+                                pointer-event(ev) => {
+                                    if (ev.kind == PointerEventKind.down) {
+                                        root.resize-column = 3;
+                                        root.resize-grab-x = self.absolute-position.x + self.mouse-x;
+                                        root.resize-base-width = root.col-modified-width;
+                                    } else if (ev.kind == PointerEventKind.up && root.resize-column == 3) {
+                                        root.persist-layout();
+                                        root.resize-column = -1;
+                                    }
+                                }
+                                moved => {
+                                    if (root.resize-column == 3) {
+                                        root.col-modified-width = max(
+                                            root.min-col-width,
+                                            root.resize-base-width
+                                                + (self.absolute-position.x + self.mouse-x - root.resize-grab-x)
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            x: 8px + root.col-name-width + root.col-size-width + root.col-type-width + root.col-modified-width + root.col-mode-width - self.width / 2;
+                            width: 6px;
+                            height: parent.height;
+                            background: (mode-resize-ta.has-hover || root.resize-column == 4)
+                                ? Theme.accent
+                                : transparent;
+                            Rectangle {
+                                x: parent.width / 2;
+                                width: 1px;
+                                height: parent.height - 4px;
+                                y: 2px;
+                                background: mode-resize-ta.has-hover || root.resize-column == 4
+                                    ? Theme.accent
+                                    : Theme.border-subtle;
+                            }
+                            mode-resize-ta := TouchArea {
+                                mouse-cursor: col-resize;
+                                pointer-event(ev) => {
+                                    if (ev.kind == PointerEventKind.down) {
+                                        root.resize-column = 4;
+                                        root.resize-grab-x = self.absolute-position.x + self.mouse-x;
+                                        root.resize-base-width = root.col-mode-width;
+                                    } else if (ev.kind == PointerEventKind.up && root.resize-column == 4) {
+                                        root.persist-layout();
+                                        root.resize-column = -1;
+                                    }
+                                }
+                                moved => {
+                                    if (root.resize-column == 4) {
+                                        root.col-mode-width = max(
+                                            root.min-col-width,
+                                            root.resize-base-width
+                                                + (self.absolute-position.x + self.mouse-x - root.resize-grab-x)
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Rectangle {
+                            x: 8px + root.col-name-width + root.col-size-width + root.col-type-width + root.col-modified-width + root.col-mode-width + root.col-owner-width - self.width / 2;
+                            width: 6px;
+                            height: parent.height;
+                            background: (owner-resize-ta.has-hover || root.resize-column == 5)
+                                ? Theme.accent
+                                : transparent;
+                            Rectangle {
+                                x: parent.width / 2;
+                                width: 1px;
+                                height: parent.height - 4px;
+                                y: 2px;
+                                background: owner-resize-ta.has-hover || root.resize-column == 5
+                                    ? Theme.accent
+                                    : Theme.border-subtle;
+                            }
+                            owner-resize-ta := TouchArea {
+                                mouse-cursor: col-resize;
+                                pointer-event(ev) => {
+                                    if (ev.kind == PointerEventKind.down) {
+                                        root.resize-column = 5;
+                                        root.resize-grab-x = self.absolute-position.x + self.mouse-x;
+                                        root.resize-base-width = root.col-owner-width;
+                                    } else if (ev.kind == PointerEventKind.up && root.resize-column == 5) {
+                                        root.persist-layout();
+                                        root.resize-column = -1;
+                                    }
+                                }
+                                moved => {
+                                    if (root.resize-column == 5) {
+                                        root.col-owner-width = max(
+                                            root.min-col-width,
+                                            root.resize-base-width
+                                                + (self.absolute-position.x + self.mouse-x - root.resize-grab-x)
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Rectangle { height: 1px; background: Theme.border-subtle; }
+
+                // File list. The area fills the panel height so right-click works
+                // on the whitespace below the rows too (#84); the single menu
+                // below greys out item actions when nothing was hit.
+                file-area := Rectangle {
+                    vertical-stretch: 1;
+                    clip: true;
+                    ScrollView {
+                        width: parent.width;
+                        height: parent.height;
+                        viewport-width: self.visible-width;
+                        viewport-height: max(self.visible-height, file-list.preferred-height);
+
+                        file-list := VerticalLayout {
+                            spacing: 0;
+
+                            if root.loading : Rectangle {
+                                height: 40px;
+                                Text { text: @tr("Loading..."); color: Theme.text-muted; font-size: Theme.fs-sm;
+                                       horizontal-alignment: center; vertical-alignment: center; }
+                            }
+
+                            if !root.loading && root.entries.length == 0 : Rectangle {
+                                height: 40px;
+                                Text { text: @tr("Empty directory"); color: Theme.text-muted; font-size: Theme.fs-sm;
+                                       horizontal-alignment: center; vertical-alignment: center; }
+                            }
+
+                            for entry[i] in root.entries : row := Rectangle {
+                                height: 24px;
+                                background: i == root.selected-row
+                                    ? #4a90e240
+                                    : (row-ta.has-hover
+                                        ? #4a90e225
+                                        : (mod(i, 2) == 0 ? transparent : #ffffff08));
+
+                                row-ta := TouchArea {
+                                    mouse-cursor: default;
+                                    clicked => {
+                                        root.selected-row = i;
+                                        file-list-focus.focus();
+                                    }
+                                    double-clicked => {
+                                        if (entry.is-dir) {
+                                            root.navigate(entry.full-path);
+                                        } else {
+                                            root.edit-external(entry.full-path);
+                                        }
+                                    }
+                                    pointer-event(ev) => {
+                                        if (ev.kind == PointerEventKind.down
+                                                && ev.button == PointerEventButton.right) {
+                                            root.selected-row = i;
+                                            file-list-focus.focus();
+                                            root.menu-target = entry.full-path;
+                                            root.menu-target-name = entry.name;
+                                            root.menu-target-is-dir = entry.is-dir;
+                                            root.menu-target-mode = entry.mode;
+                                            root.menu-x = self.absolute-position.x + self.mouse-x - file-area.absolute-position.x;
+                                            root.menu-y = self.absolute-position.y + self.mouse-y - file-area.absolute-position.y;
+                                            file-menu.show();
+                                        }
+                                    }
+                                }
+
+                                HorizontalLayout {
+                                    padding-left: 8px; padding-right: 8px; spacing: 4px;
+                                    Text {
+                                        text: entry.is-dir ? "📁 " + entry.name : "📄 " + entry.name;
+                                        color: entry.is-dir ? Theme.accent : Theme.text-primary;
+                                        font-size: Theme.fs-sm;
+                                        width: root.col-name-width;
+                                        overflow: elide;
+                                        vertical-alignment: center;
+                                    }
+                                    Text {
+                                        text: entry.is-dir ? "" : entry.size;
+                                        color: Theme.text-secondary; font-size: Theme.fs-xs;
+                                        width: root.col-size-width; horizontal-alignment: left; vertical-alignment: center;
+                                    }
+                                    Text {
+                                        text: entry.file-type;
+                                        color: Theme.text-secondary; font-size: Theme.fs-xs;
+                                        width: root.col-type-width; overflow: elide;
+                                        horizontal-alignment: center; vertical-alignment: center;
+                                    }
+                                    Text {
+                                        text: entry.modified;
+                                        color: Theme.text-muted; font-size: Theme.fs-xs;
+                                        width: root.col-modified-width; overflow: elide; vertical-alignment: center;
+                                    }
+                                    Text {
+                                        text: entry.mode-text;
+                                        color: Theme.text-secondary; font-size: Theme.fs-xs;
+                                        width: root.col-mode-width; vertical-alignment: center;
+                                    }
+                                    Text {
+                                        text: entry.owner-group;
+                                        color: Theme.text-secondary; font-size: Theme.fs-xs;
+                                        width: root.col-owner-width; overflow: elide; vertical-alignment: center;
+                                    }
+                                    Text {
+                                        text: "";
+                                        horizontal-stretch: 1;
+                                    }
+                                }
+                            }
+
+                            // Whitespace below the rows: right-click here opens the
+                            // menu with no target (item actions greyed out) (#84).
+                            ws := Rectangle {
+                                vertical-stretch: 1;
+                                min-height: 24px;
+                                ws-ta := TouchArea {
+                                    clicked => { file-list-focus.focus(); }
+                                    pointer-event(ev) => {
+                                        if (ev.kind == PointerEventKind.down
+                                                && ev.button == PointerEventButton.right) {
+                                            file-list-focus.focus();
+                                            root.selected-row = -1;
+                                            root.menu-target = "";
+                                            root.menu-x = self.absolute-position.x + self.mouse-x - file-area.absolute-position.x;
+                                            root.menu-y = self.absolute-position.y + self.mouse-y - file-area.absolute-position.y;
+                                            file-menu.show();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    file-list-focus := FocusScope {
+                        width: 0px;
+                        height: 0px;
+                        changed has-focus => { root.file-list-focused = self.has-focus; }
+                        key-pressed(e) => {
+                            if (root.entries.length == 0) {
+                                return reject;
+                            }
+                            if (e.text == Key.UpArrow) {
+                                if (root.selected-row <= 0) {
+                                    root.selected-row = 0;
+                                } else {
+                                    root.selected-row -= 1;
+                                }
+                                return accept;
+                            }
+                            if (e.text == Key.DownArrow) {
+                                if (root.selected-row < 0) {
+                                    root.selected-row = 0;
+                                } else if (root.selected-row < root.entries.length - 1) {
+                                    root.selected-row += 1;
+                                }
+                                return accept;
+                            }
+                            if (e.text == Key.Home) {
+                                root.selected-row = 0;
+                                return accept;
+                            }
+                            if (e.text == Key.End) {
+                                root.selected-row = root.entries.length - 1;
+                                return accept;
+                            }
+                            if (e.text == Key.Backspace) {
+                                root.navigate("..");
+                                return accept;
+                            }
+                            if (e.text == "\n" || e.text == "\u{000d}") {
+                                if (root.selected-row >= 0 && root.selected-row < root.entries.length) {
+                                    if (root.entries[root.selected-row].is-dir) {
+                                        root.navigate(root.entries[root.selected-row].full-path);
+                                    } else {
+                                        root.edit-external(root.entries[root.selected-row].full-path);
+                                    }
+                                    return accept;
+                                }
+                            }
+                            if (e.text == Key.Delete || e.text == "\u{007f}") {
+                                if (root.selected-row >= 0 && root.selected-row < root.entries.length) {
+                                    root.delete(root.entries[root.selected-row].full-path);
+                                    return accept;
+                                }
+                            }
+                            return reject;
+                        }
+                    }
+
+                    // One context menu for the whole list (#84). Item actions are
+                    // enabled only when an item was right-clicked (menu-target set);
+                    // new/refresh are always available.
+                    file-menu := PopupWindow {
+                        x: root.menu-x;
+                        y: root.menu-y;
+                        width: 148px;
+                        height: 13 * 27px + 8px;
+                        Rectangle {
+                            background: Theme.bg-panel;
+                            border-radius: Theme.radius-sm;
+                            border-width: 1px;
+                            border-color: Theme.border-strong;
+                            drop-shadow-blur: 12px;
+                            drop-shadow-color: #00000060;
+                            VerticalLayout {
+                                padding: 4px;
+                                spacing: 1px;
+                                SftpMenuItem {
+                                    label: @tr("Download");
+                                    enabled: root.menu-target != "";
+                                    clicked => { root.download(root.menu-target); }
+                                }
+                                SftpMenuItem {
+                                    label: @tr("View");
+                                    enabled: root.menu-target != "" && !root.menu-target-is-dir;
+                                    clicked => { root.view(root.menu-target); }
+                                }
+                                SftpMenuItem {
+                                    label: @tr("Edit");
+                                    enabled: root.menu-target != "" && !root.menu-target-is-dir;
+                                    clicked => { root.edit(root.menu-target); }
+                                }
+                                SftpMenuItem {
+                                    label: @tr("Open externally");
+                                    enabled: root.menu-target != "" && !root.menu-target-is-dir;
+                                    clicked => { root.open-external(root.menu-target); }
+                                }
+                                SftpMenuItem {
+                                    label: @tr("Edit externally");
+                                    enabled: root.menu-target != "" && !root.menu-target-is-dir;
+                                    clicked => { root.edit-external(root.menu-target); }
+                                }
+                                SftpMenuItem {
+                                    label: @tr("Configure external editor");
+                                    clicked => { root.configure-external-editor(); }
+                                }
+                                SftpMenuItem {
+                                    label: @tr("Rename");
+                                    enabled: root.menu-target != "";
+                                    clicked => { root.rename-request(root.menu-target, root.menu-target-name); }
+                                }
+                                SftpMenuItem {
+                                    label: @tr("Permissions");
+                                    enabled: root.menu-target != "";
+                                    clicked => { root.chmod-request(root.menu-target, root.menu-target-name, root.menu-target-mode); }
+                                }
+                                SftpMenuItem {
+                                    label: @tr("Copy path");
+                                    enabled: root.menu-target != "";
+                                    clicked => { root.copy-path(root.menu-target); }
+                                }
+                                SftpMenuItem {
+                                    label: @tr("Delete");
+                                    tint: #d86c6c;
+                                    enabled: root.menu-target != "";
+                                    clicked => { root.delete(root.menu-target); }
+                                }
+                                Rectangle { height: 1px; background: Theme.border-subtle; }
+                                SftpMenuItem {
+                                    label: @tr("New folder");
+                                    clicked => { root.new-folder(root.current-path); }
+                                }
+                                SftpMenuItem {
+                                    label: @tr("New file");
+                                    clicked => { root.new-file(root.current-path); }
+                                }
+                                SftpMenuItem {
+                                    label: @tr("Refresh");
+                                    clicked => { root.refresh(root.current-path); }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- Status bar (full width) --------------------------------------
+        Rectangle {
+            height: 18px;
+            background: Theme.bg-panel-alt;
+            Text {
+                x: 8px;
+                text: root.status;
+                color: Theme.text-muted;
+                font-size: Theme.fs-xs;
+                vertical-alignment: center;
+                height: parent.height;
+                overflow: elide;
+                width: parent.width - 16px;
+            }
+        }
+    }
+}

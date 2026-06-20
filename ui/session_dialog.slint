@@ -1,0 +1,704 @@
+import { Theme } from "theme.slint";
+import { LabeledInput, PrimaryButton, GhostButton } from "widgets.slint";
+import { ScrollView } from "std-widgets.slint";
+
+// One SSH port-forward row shown in the session dialog (#56). `summary` is a
+// ready-to-display line like "-L 127.0.0.1:8080 → host:80".
+export struct PortFwd {
+    kind: string,
+    summary: string,
+}
+
+export struct SessionDraft {
+    id: string,
+    name: string,
+    kind: string,      // "ssh" | "serial" | "telnet"
+    host: string,
+    port: int,
+    user: string,
+    auth: string,      // "password" | "key"
+    password: string,
+    private-key-path: string,
+    proxy: string,     // "" | "socks5://host:port" | "http://host:port"
+    group: string,     // folder/group name ("" = ungrouped)
+    // Serial-only (ignored unless kind == "serial")
+    serial-port: string,
+    baud-rate: int,
+    data-bits: int,
+    stop-bits: int,
+    parity: string,        // "none" | "odd" | "even"
+    flow-control: string,  // "none" | "hardware" | "software"
+}
+
+// A single segment in a segmented selector (auth toggle, baud presets, …).
+component SegOption inherits Rectangle {
+    in property <string> label;
+    in property <bool> active;
+    callback clicked();
+    height: 30px;
+    horizontal-stretch: 1;
+    border-radius: Theme.radius-sm;
+    border-width: 1px;
+    background: active ? Theme.accent : Theme.bg-root;
+    border-color: active ? Theme.accent : Theme.border-subtle;
+    Text {
+        text: root.label;
+        color: active ? white : Theme.text-primary;
+        font-size: Theme.fs-md;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// Compact single-line input (no label) used in the port-forward add form (#56).
+component MiniInput inherits Rectangle {
+    in property <string> placeholder;
+    in-out property <string> value;
+    height: 30px;
+    horizontal-stretch: 1;
+    border-radius: Theme.radius-sm;
+    border-width: 1px;
+    border-color: mi.has-focus ? Theme.accent : Theme.border-subtle;
+    background: Theme.bg-root;
+    mi := TextInput {
+        x: 8px;
+        width: parent.width - 16px;
+        height: parent.height;
+        color: Theme.text-primary;
+        font-family: Theme.ui-font-family;
+        font-size: Theme.fs-md;
+        vertical-alignment: center;
+        single-line: true;
+        text <=> root.value;
+    }
+    if root.value == "" : Text {
+        x: 8px;
+        height: parent.height;
+        text: root.placeholder;
+        color: Theme.text-muted;
+        font-size: Theme.fs-md;
+        vertical-alignment: center;
+    }
+}
+
+// Modal dialog for creating / editing a session (SSH / Serial / Telnet).
+// The dialog is purely presentational — it stores values in mutable
+// properties and emits `submit` / `cancel` callbacks up to the main window.
+export component SessionDialog inherits Rectangle {
+    in-out property <bool> is-open: false;
+    in-out property <bool> is-editing: false;
+    in-out property <string> draft-id;
+    in-out property <string> draft-name;
+    in-out property <string> draft-kind: "ssh";
+    in-out property <string> draft-host;
+    in-out property <string> draft-port: "22";
+    in-out property <string> draft-user;
+    // Set when Create/Save is pressed with an empty host (SSH/Telnet) (#110).
+    in-out property <bool> host-missing: false;
+    in-out property <string> draft-auth: "password";
+    in-out property <string> draft-password;
+    in-out property <string> draft-key-path;
+    in-out property <string> draft-proxy-type: "none";  // "none" | "socks5" | "http"
+    in-out property <string> draft-proxy-hostport;
+    in-out property <string> draft-group;
+    in-out property <string> draft-serial-port;
+    in-out property <string> draft-baud: "115200";
+    in-out property <string> draft-data-bits: "8";
+    in-out property <string> draft-stop-bits: "1";
+    in-out property <string> draft-parity: "none";
+    in-out property <string> draft-flow: "none";
+    in property <[string]> group-options;
+    property <bool> group-menu-open: false;
+
+    // Port forwards / tunnels (#56). `forwards` is the current list (fed from
+    // Rust); the nf-* properties hold the add-form fields.
+    in property <[PortFwd]> forwards;
+    property <string> nf-kind: "local";   // "local" | "remote" | "dynamic"
+    property <string> nf-bind: "127.0.0.1";
+    property <string> nf-port;
+    property <string> nf-host;
+    property <string> nf-host-port;
+    property <bool> show-advanced: false;   // collapse proxy + forwarding (#56)
+
+    callback submit(SessionDraft);
+    callback cancel();
+    callback add-forward(string /* kind */, string /* bind */, int /* port */,
+                         string /* host */, int /* host-port */);
+    callback delete-forward(int /* index */);
+    callback pick-key-file();   // open a native file picker for the private key
+
+    visible: is-open;
+    background: #000000aa;
+
+    // Clear the host-required flag each time the dialog opens (#110).
+    changed is-open => {
+        if (self.is-open) {
+            self.host-missing = false;
+        } else {
+            self.group-menu-open = false;
+        }
+    }
+
+    // Swallow clicks on the backdrop
+    TouchArea {
+        width: 100%; height: 100%;
+        clicked => { root.cancel(); }
+    }
+
+    Rectangle {
+        width: 440px;
+        // Height follows the content, but never exceeds the window — past that
+        // the body scrolls (the dialog grows with the advanced section / many
+        // port forwards) (#56).
+        height: min(body.preferred-height, parent.height - 40px);
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        background: Theme.bg-panel;
+        border-radius: Theme.radius-lg;
+        border-width: 1px;
+        border-color: Theme.border-strong;
+        drop-shadow-blur: 24px;
+        drop-shadow-color: #00000080;
+
+        // Prevent backdrop click from propagating when user clicks inside the card
+        TouchArea {
+            width: 100%; height: 100%;
+        }
+
+        Flickable {
+            width: 100%;
+            height: 100%;
+            viewport-width: self.width;
+            viewport-height: body.preferred-height;
+            body := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+
+            Text {
+                text: is-editing ? @tr("Edit session") : @tr("New session");
+                color: Theme.text-primary;
+                font-size: Theme.fs-xl;
+                font-weight: 600;
+            }
+
+            // Connection type selector (always shown).
+            VerticalLayout {
+                spacing: 4px;
+                Text {
+                    text: @tr("Connection type");
+                    color: Theme.text-secondary;
+                    font-size: Theme.fs-sm;
+                }
+                HorizontalLayout {
+                    spacing: 6px;
+                    SegOption {
+                        label: "SSH";
+                        active: root.draft-kind == "ssh";
+                        clicked => { root.draft-kind = "ssh"; }
+                    }
+                    SegOption {
+                        label: @tr("Serial");
+                        active: root.draft-kind == "serial";
+                        clicked => { root.draft-kind = "serial"; }
+                    }
+                    SegOption {
+                        label: @tr("Telnet");
+                        active: root.draft-kind == "telnet";
+                        clicked => { root.draft-kind = "telnet"; }
+                    }
+                }
+            }
+
+            LabeledInput {
+                label: @tr("Name");
+                placeholder: @tr("e.g. production web-01");
+                value <=> root.draft-name;
+            }
+
+            // Optional group/folder to organize sessions by business (#41).
+            VerticalLayout {
+                spacing: 4px;
+                Text {
+                    text: @tr("Group (optional)");
+                    color: Theme.text-secondary;
+                    font-size: Theme.fs-sm;
+                }
+                Rectangle {
+                    height: 32px;
+                    border-radius: Theme.radius-sm;
+                    border-width: 1px;
+                    border-color: groupin.has-focus ? Theme.accent : Theme.border-subtle;
+                    background: Theme.bg-root;
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 6px;
+                        spacing: 6px;
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            background: transparent;
+                            groupin := TextInput {
+                                width: parent.width;
+                                height: parent.height;
+                                text <=> root.draft-group;
+                                color: Theme.text-primary;
+                                font-family: Theme.ui-font-family;
+                                font-size: Theme.fs-md;
+                                vertical-alignment: center;
+                                single-line: true;
+                            }
+                            if root.draft-group == "" : Text {
+                                height: parent.height;
+                                text: @tr("e.g. Production / Database");
+                                color: Theme.text-muted;
+                                font-size: Theme.fs-md;
+                                vertical-alignment: center;
+                            }
+                        }
+                        Rectangle {
+                            width: 22px;
+                            height: 22px;
+                            y: (parent.height - self.height) / 2;
+                            border-radius: Theme.radius-sm;
+                            background: grp-ta.has-hover ? Theme.bg-hover : transparent;
+                            Text {
+                                text: root.group-menu-open ? "\u{E5CE}" : "\u{E5CF}";
+                                font-family: "Material Icons";
+                                color: Theme.text-secondary;
+                                font-size: Theme.fs-sm;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            grp-ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    if (root.group-options.length > 0) {
+                                        root.group-menu-open = !root.group-menu-open;
+                                        if (root.group-menu-open) {
+                                            group-popup.show();
+                                        } else {
+                                            group-popup.close();
+                                        }
+                                    }
+                                }
+                            }
+                            group-popup := PopupWindow {
+                                x: -292px;
+                                y: parent.height + 2px;
+                                width: 320px;
+                                height: min(220px, root.group-options.length * 24px + 8px);
+                                Rectangle {
+                                    width: parent.width;
+                                    height: parent.height;
+                                    background: Theme.bg-panel;
+                                    border-radius: Theme.radius-sm;
+                                    border-width: 1px;
+                                    border-color: Theme.border-strong;
+                                    drop-shadow-blur: 12px;
+                                    drop-shadow-color: #00000060;
+                                    ScrollView {
+                                        width: parent.width;
+                                        height: parent.height;
+                                        viewport-width: self.visible-width;
+                                        viewport-height: max(self.visible-height, groups-list.preferred-height);
+                                        groups-list := VerticalLayout {
+                                            padding: 4px;
+                                            spacing: 1px;
+                                            for grp[i] in root.group-options : Rectangle {
+                                                height: 24px;
+                                                border-radius: Theme.radius-sm;
+                                                background: row-ta.has-hover ? Theme.bg-hover : transparent;
+                                                row-ta := TouchArea {
+                                                    mouse-cursor: pointer;
+                                                    clicked => {
+                                                        root.draft-group = grp;
+                                                        root.group-menu-open = false;
+                                                        group-popup.close();
+                                                    }
+                                                }
+                                                Text {
+                                                    x: 8px;
+                                                    text: grp;
+                                                    color: Theme.text-primary;
+                                                    font-size: Theme.fs-sm;
+                                                    vertical-alignment: center;
+                                                    height: parent.height;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                close-policy: PopupClosePolicy.close-on-click-outside;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── SSH / Telnet share host + port ──────────────────────────────
+            if root.draft-kind != "serial" : HorizontalLayout {
+                spacing: 10px;
+                LabeledInput {
+                    label: @tr("Host / IP");
+                    placeholder: "192.168.1.10";
+                    value <=> root.draft-host;
+                    horizontal-stretch: 2;
+                }
+                LabeledInput {
+                    label: @tr("Port");
+                    placeholder: root.draft-kind == "telnet" ? "23" : "22";
+                    value <=> root.draft-port;
+                    horizontal-stretch: 1;
+                }
+            }
+
+            // Inline error when a host-less SSH/Telnet session is submitted (#110).
+            if root.host-missing && root.draft-host == "" && root.draft-kind != "serial" : Text {
+                text: @tr("Please enter a host / IP address.");
+                color: Theme.danger;
+                font-size: Theme.fs-sm;
+            }
+
+            // ── SSH-only: user + auth ───────────────────────────────────────
+            if root.draft-kind == "ssh" : LabeledInput {
+                label: @tr("Username");
+                placeholder: @tr("Prompted on connect if blank");
+                value <=> root.draft-user;
+            }
+
+            if root.draft-kind == "ssh" : VerticalLayout {
+                spacing: 4px;
+                Text {
+                    text: @tr("Authentication");
+                    color: Theme.text-secondary;
+                    font-size: Theme.fs-sm;
+                }
+                HorizontalLayout {
+                    spacing: 6px;
+                    SegOption {
+                        label: @tr("Password");
+                        active: root.draft-auth == "password";
+                        clicked => { root.draft-auth = "password"; }
+                    }
+                    SegOption {
+                        label: @tr("Private key");
+                        active: root.draft-auth == "key";
+                        clicked => { root.draft-auth = "key"; }
+                    }
+                }
+            }
+
+            if root.draft-kind == "ssh" && root.draft-auth == "password" : LabeledInput {
+                label: @tr("Password");
+                placeholder: root.is-editing ? @tr("Leave blank to keep the current password") : "••••••••";
+                password: true;
+                value <=> root.draft-password;
+            }
+
+            if root.draft-kind == "ssh" && root.draft-auth == "key" : VerticalLayout {
+                spacing: 4px;
+                Text {
+                    text: @tr("Private key file");
+                    color: Theme.text-secondary;
+                    font-size: Theme.fs-sm;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Rectangle {
+                        height: 32px;
+                        horizontal-stretch: 1;
+                        border-radius: Theme.radius-sm;
+                        border-width: 1px;
+                        border-color: keyin.has-focus ? Theme.accent : Theme.border-subtle;
+                        background: Theme.bg-root;
+                        keyin := TextInput {
+                            x: 10px; y: 0px;
+                            width: parent.width - 20px;
+                            height: parent.height;
+                            text <=> root.draft-key-path;
+                            color: Theme.text-primary;
+                            font-family: Theme.ui-font-family; // CJK-capable (#54)
+                            font-size: Theme.fs-md;
+                            vertical-alignment: center;
+                            single-line: true;
+                        }
+                        if root.draft-key-path == "" : Text {
+                            x: 10px; y: 0px;
+                            height: parent.height;
+                            text: @tr("e.g. /home/you/.ssh/id_ed25519");
+                            color: Theme.text-muted;
+                            font-size: Theme.fs-md;
+                            vertical-alignment: center;
+                        }
+                    }
+                    Rectangle {
+                        width: 64px; height: 32px;
+                        border-radius: Theme.radius-sm;
+                        border-width: 1px;
+                        border-color: Theme.border-subtle;
+                        background: browse-ta.has-hover ? Theme.bg-hover : Theme.bg-elevated;
+                        Text {
+                            text: @tr("Browse…");
+                            color: Theme.text-primary;
+                            font-size: Theme.fs-sm;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        browse-ta := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.pick-key-file(); }
+                        }
+                    }
+                }
+                Text {
+                    text: @tr("Pick the private key itself (not the .pub public key)");
+                    color: Theme.text-muted;
+                    font-size: Theme.fs-xs;
+                }
+            }
+
+            // Passphrase for an *encrypted* private key (#90). Reuses the
+            // password field; blank means the key isn't encrypted (or, when
+            // editing, keep the saved passphrase).
+            if root.draft-kind == "ssh" && root.draft-auth == "key" : LabeledInput {
+                label: @tr("Key passphrase");
+                placeholder: root.is-editing
+                    ? @tr("Leave blank to keep the current passphrase")
+                    : @tr("Leave blank if the key isn't encrypted");
+                password: true;
+                value <=> root.draft-password;
+            }
+
+            // ── Serial-only fields ──────────────────────────────────────────
+            if root.draft-kind == "serial" : LabeledInput {
+                label: @tr("Serial port");
+                placeholder: "COM3  /  /dev/ttyUSB0";
+                value <=> root.draft-serial-port;
+            }
+
+            if root.draft-kind == "serial" : LabeledInput {
+                label: @tr("Baud rate");
+                placeholder: "115200";
+                value <=> root.draft-baud;
+            }
+
+            if root.draft-kind == "serial" : VerticalLayout {
+                spacing: 4px;
+                Text {
+                    text: @tr("Data bits / Stop bits / Parity");
+                    color: Theme.text-secondary;
+                    font-size: Theme.fs-sm;
+                }
+                HorizontalLayout {
+                    spacing: 6px;
+                    SegOption { label: "7"; active: root.draft-data-bits == "7"; clicked => { root.draft-data-bits = "7"; } }
+                    SegOption { label: "8"; active: root.draft-data-bits == "8"; clicked => { root.draft-data-bits = "8"; } }
+                    Rectangle { width: 8px; }
+                    SegOption { label: "1"; active: root.draft-stop-bits == "1"; clicked => { root.draft-stop-bits = "1"; } }
+                    SegOption { label: "2"; active: root.draft-stop-bits == "2"; clicked => { root.draft-stop-bits = "2"; } }
+                    Rectangle { width: 8px; }
+                    SegOption { label: "N"; active: root.draft-parity == "none"; clicked => { root.draft-parity = "none"; } }
+                    SegOption { label: "O"; active: root.draft-parity == "odd"; clicked => { root.draft-parity = "odd"; } }
+                    SegOption { label: "E"; active: root.draft-parity == "even"; clicked => { root.draft-parity = "even"; } }
+                }
+            }
+
+            if root.draft-kind == "serial" : VerticalLayout {
+                spacing: 4px;
+                Text {
+                    text: @tr("Flow control");
+                    color: Theme.text-secondary;
+                    font-size: Theme.fs-sm;
+                }
+                HorizontalLayout {
+                    spacing: 6px;
+                    SegOption { label: @tr("None"); active: root.draft-flow == "none"; clicked => { root.draft-flow = "none"; } }
+                    SegOption { label: @tr("Hardware"); active: root.draft-flow == "hardware"; clicked => { root.draft-flow = "hardware"; } }
+                    SegOption { label: @tr("Software"); active: root.draft-flow == "software"; clicked => { root.draft-flow = "software"; } }
+                }
+            }
+
+            // ── Advanced (collapsed by default): proxy + port forwarding ────
+            if root.draft-kind != "serial" : Rectangle {
+                height: 26px;
+                adv-ta := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.show-advanced = !root.show-advanced; }
+                }
+                HorizontalLayout {
+                    spacing: 4px;
+                    Text {
+                        text: @tr("Advanced (proxy, tunnels)");
+                        color: adv-ta.has-hover ? Theme.text-primary : Theme.text-secondary;
+                        font-size: Theme.fs-sm;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        text: root.show-advanced ? "\u{E5CE}" : "\u{E5CF}";
+                        font-family: "Material Icons";
+                        color: Theme.text-muted;
+                        font-size: Theme.fs-md;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+            }
+
+            // ── Optional outbound proxy (SSH / Telnet only) ─────────────────
+            if root.show-advanced && root.draft-kind != "serial" : VerticalLayout {
+                spacing: 4px;
+                Text {
+                    text: @tr("Proxy (optional)");
+                    color: Theme.text-secondary;
+                    font-size: Theme.fs-sm;
+                }
+                HorizontalLayout {
+                    spacing: 6px;
+                    SegOption { label: @tr("None"); active: root.draft-proxy-type == "none"; clicked => { root.draft-proxy-type = "none"; } }
+                    SegOption { label: "SOCKS5"; active: root.draft-proxy-type == "socks5"; clicked => { root.draft-proxy-type = "socks5"; } }
+                    SegOption { label: "HTTP"; active: root.draft-proxy-type == "http"; clicked => { root.draft-proxy-type = "http"; } }
+                }
+                if root.draft-proxy-type != "none" : LabeledInput {
+                    label: @tr("Proxy address");
+                    placeholder: @tr("e.g. 127.0.0.1:1080");
+                    value <=> root.draft-proxy-hostport;
+                }
+                Text {
+                    text: root.draft-proxy-type == "none"
+                        ? @tr("No proxy — use $ALL_PROXY or connect directly")
+                        : @tr("Format: host:port  (with auth: user:pass@host:port)");
+                    color: Theme.text-muted;
+                    font-size: Theme.fs-xs;
+                }
+            }
+
+            // ── Port forwarding / tunnels (SSH only) (#56) ──────────────────
+            if root.show-advanced && root.draft-kind == "ssh" : VerticalLayout {
+                spacing: 6px;
+                Text {
+                    text: @tr("Port forwarding");
+                    color: Theme.text-secondary;
+                    font-size: Theme.fs-sm;
+                }
+
+                // Existing forwards, each with a delete button.
+                for f[i] in root.forwards : Rectangle {
+                    height: 30px;
+                    border-radius: Theme.radius-sm;
+                    background: Theme.bg-root;
+                    HorizontalLayout {
+                        padding-left: 8px; padding-right: 4px; spacing: 4px;
+                        Text {
+                            text: f.summary;
+                            color: Theme.text-primary;
+                            font-size: Theme.fs-sm;
+                            font-family: Theme.ui-font-family;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            overflow: elide;
+                        }
+                        Rectangle {
+                            width: 24px;
+                            y: (parent.height - self.height) / 2;
+                            height: 24px;
+                            border-radius: Theme.radius-sm;
+                            background: fdel.has-hover ? Theme.danger.with-alpha(0.18) : transparent;
+                            fdel := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.delete-forward(i); }
+                            }
+                            Text { text: "\u{E5CD}"; font-family: "Material Icons";
+                                   color: Theme.danger; font-size: Theme.fs-sm;
+                                   horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                    }
+                }
+
+                // Add form: kind selector, then bind/port (+ target for L/R).
+                HorizontalLayout {
+                    spacing: 6px;
+                    SegOption { label: @tr("Local (-L)"); active: root.nf-kind == "local"; clicked => { root.nf-kind = "local"; } }
+                    SegOption { label: @tr("Remote (-R)"); active: root.nf-kind == "remote"; clicked => { root.nf-kind = "remote"; } }
+                    SegOption { label: @tr("Dynamic (-D)"); active: root.nf-kind == "dynamic"; clicked => { root.nf-kind = "dynamic"; } }
+                }
+                HorizontalLayout {
+                    spacing: 6px;
+                    MiniInput { placeholder: "127.0.0.1"; value <=> root.nf-bind; }
+                    MiniInput { placeholder: @tr("Listen port"); value <=> root.nf-port; }
+                }
+                if root.nf-kind != "dynamic" : HorizontalLayout {
+                    spacing: 6px;
+                    MiniInput { placeholder: @tr("Target host"); value <=> root.nf-host; }
+                    MiniInput { placeholder: @tr("Target port"); value <=> root.nf-host-port; }
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    PrimaryButton {
+                        text: @tr("Add");
+                        clicked => {
+                            root.add-forward(root.nf-kind, root.nf-bind, root.nf-port.to-float(),
+                                             root.nf-host, root.nf-host-port.to-float());
+                            root.nf-port = "";
+                            root.nf-host = "";
+                            root.nf-host-port = "";
+                        }
+                    }
+                }
+                Text {
+                    text: root.nf-kind == "local"
+                        ? @tr("-L: local port → target reached from the server")
+                        : (root.nf-kind == "remote"
+                            ? @tr("-R: server port → target reached from here")
+                            : @tr("-D: local SOCKS5 proxy"));
+                    color: Theme.text-muted;
+                    font-size: Theme.fs-xs;
+                }
+            }
+
+            HorizontalLayout {
+                alignment: end;
+                spacing: 8px;
+                GhostButton {
+                    text: @tr("Cancel");
+                    clicked => { root.cancel(); }
+                }
+                PrimaryButton {
+                    text: is-editing ? @tr("Save") : @tr("Create");
+                    clicked => {
+                        // SSH/Telnet need a host; block submit and flag it (#110).
+                        if (root.draft-kind != "serial" && root.draft-host == "") {
+                            root.host-missing = true;
+                            return;
+                        }
+                        root.host-missing = false;
+                        root.submit({
+                            id: root.draft-id,
+                            name: root.draft-name,
+                            kind: root.draft-kind,
+                            host: root.draft-host,
+                            port: root.draft-port.to-float(),
+                            user: root.draft-user,
+                            auth: root.draft-auth,
+                            password: root.draft-password,
+                            private-key-path: root.draft-key-path,
+                            proxy: (root.draft-proxy-type == "none" || root.draft-proxy-hostport == "") ? ""
+                                 : root.draft-proxy-type == "http" ? "http://" + root.draft-proxy-hostport
+                                 : "socks5://" + root.draft-proxy-hostport,
+                            group: root.draft-group,
+                            serial-port: root.draft-serial-port,
+                            baud-rate: root.draft-baud.to-float(),
+                            data-bits: root.draft-data-bits.to-float(),
+                            stop-bits: root.draft-stop-bits.to-float(),
+                            parity: root.draft-parity,
+                            flow-control: root.draft-flow,
+                        });
+                    }
+                }
+            }
+        }
+        }
+    }
+}

@@ -1,0 +1,246 @@
+import { Theme } from "theme.slint";
+import { IconButton } from "widgets.slint";
+
+export struct TabInfo {
+    id: string,
+    title: string,
+    kind: string,   // "welcome" | "terminal"
+    connected: bool,
+}
+
+// --- SingleTab -------------------------------------------------------------
+component SingleTab inherits Rectangle {
+    in property <TabInfo> info;
+    in property <bool> active;
+    in property <length> forced-width: 112px;
+    callback selected();
+    callback closed();
+
+    height: 30px;
+    width: forced-width;
+    horizontal-stretch: 0;
+    clip: true;
+    border-radius: Theme.radius-sm;
+    background: active ? Theme.bg-panel
+        : (touch.has-hover ? Theme.bg-hover : transparent);
+    animate background { duration: 120ms; }
+
+    // Declared FIRST so the HorizontalLayout's children (close button) are at
+    // a higher z-order and receive their own click events.
+    touch := TouchArea {
+        mouse-cursor: default;
+        clicked => { root.selected(); }
+    }
+
+    Rectangle {
+        x: 10px;
+        y: (parent.height - self.height) / 2;
+        width: 8px;
+        height: 8px;
+        border-radius: 4px;
+        background: info.kind == "welcome" ? Theme.text-muted
+            : (info.connected ? Theme.success : Theme.warning);
+    }
+
+    Text {
+        x: 24px;
+        y: 1px;
+        width: root.width - 24px - (info.kind != "welcome" ? 28px : 10px);
+        height: parent.height - 1px;
+        text: info.title;
+        color: active ? Theme.text-primary : Theme.text-secondary;
+        font-size: Theme.fs-sm;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    if info.kind != "welcome" : IconButton {
+        x: root.width - self.width - 4px;
+        y: (parent.height - self.height) / 2;
+        glyph: "×";
+        size: 20px;
+        fg: Theme.text-muted;
+        fg-hover: Theme.text-primary;
+        clicked => { root.closed(); }
+    }
+}
+
+component ScrollArrow inherits Rectangle {
+    in property <string> glyph;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    width: 22px;
+    height: 22px;
+    background: touch.pressed && root.enabled
+        ? Theme.bg-active
+        : (touch.has-hover && root.enabled ? Theme.bg-hover : transparent);
+    animate background { duration: 120ms; }
+
+    Text {
+        text: root.glyph;
+        font-family: "Material Icons";
+        color: root.enabled
+            ? (touch.has-hover ? Theme.text-primary : Theme.text-secondary)
+            : Theme.text-muted;
+        font-size: Theme.fs-md;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); }
+    }
+}
+
+// --- TabBar ----------------------------------------------------------------
+export component TabBar inherits Rectangle {
+    in property <[TabInfo]> tabs;
+    in property <string> active-id;
+    in property <length> right-reserved-width: 0px;
+    callback tab-selected(string);
+    callback tab-closed(string);
+    callback new-tab();
+
+    height: 36px;
+    background: Theme.bg-panel-alt;
+    property <length> scroll-x: 0px;
+    property <length> tab-width: 112px;
+    property <length> tab-spacing: 2px;
+    property <int> previous-tab-count: 0;
+    property <length> edge-padding: 6px;
+    property <length> control-gap: 8px;
+    property <length> plus-width: 28px;
+    property <length> scroll-controls-width: 46px;
+    property <length> plus-gap: 6px;
+    property <int> tab-count: root.tabs.length;
+    property <length> tabs-space-no-scroll: max(
+        0px,
+        root.width - root.edge-padding * 2 - root.right-reserved-width
+    );
+    property <int> visible-tab-capacity: max(0, floor((root.tabs-space-no-scroll + root.tab-spacing) / (root.tab-width + root.tab-spacing)));
+    property <length> tabs-content-width: root.tabs.length > 0
+        ? root.tabs.length * (root.tab-width + root.tab-spacing) - root.tab-spacing
+        : 0px;
+    property <length> plus-x: root.tabs-content-width + root.plus-gap;
+    property <length> content-total-width: root.plus-x + root.plus-width;
+    property <bool> show-scroll-buttons: root.content-total-width > root.tabs-space-no-scroll;
+    property <length> tabs-viewport-width: max(
+        0px,
+        root.tabs-space-no-scroll - (root.show-scroll-buttons ? root.scroll-controls-width + root.control-gap : 0px)
+    );
+    property <length> max-scroll-x: max(0px, root.content-total-width - root.tabs-viewport-width);
+
+    init => {
+        root.previous-tab-count = root.tab-count;
+    }
+
+    changed tab-count => {
+        if (root.tab-count > root.previous-tab-count) {
+            root.scroll-x = root.max-scroll-x;
+        } else if (root.scroll-x > root.max-scroll-x) {
+            root.scroll-x = root.max-scroll-x;
+        }
+        if (root.content-total-width - root.scroll-x > root.tabs-viewport-width) {
+            root.scroll-x = root.max-scroll-x;
+        }
+        if (!root.show-scroll-buttons) {
+            root.scroll-x = 0px;
+        }
+        root.previous-tab-count = root.tab-count;
+    }
+
+    changed width => {
+        if (!root.show-scroll-buttons) {
+            root.scroll-x = 0px;
+        } else if (root.scroll-x > root.max-scroll-x) {
+            root.scroll-x = root.max-scroll-x;
+        }
+    }
+
+    changed show-scroll-buttons => {
+        if (!root.show-scroll-buttons) {
+            root.scroll-x = 0px;
+        } else if (root.scroll-x > root.max-scroll-x) {
+            root.scroll-x = root.max-scroll-x;
+        }
+    }
+
+    Rectangle {
+        x: root.edge-padding;
+        y: root.edge-padding;
+        width: root.tabs-viewport-width;
+        height: root.height - root.edge-padding * 2;
+        clip: true;
+
+        Rectangle {
+            x: -root.scroll-x;
+            y: 0px;
+            width: root.content-total-width;
+            height: parent.height;
+
+            for tab[i] in tabs : SingleTab {
+                x: i * (root.tab-width + root.tab-spacing);
+                y: 0px;
+                forced-width: root.tab-width;
+                info: tab;
+                active: tab.id == root.active-id;
+                selected => { root.tab-selected(tab.id); }
+                closed => { root.tab-closed(tab.id); }
+            }
+
+            IconButton {
+                x: root.plus-x;
+                y: (parent.height - self.height) / 2;
+                glyph: "+";
+                size: root.plus-width;
+                clicked => { root.new-tab(); }
+            }
+        }
+    }
+
+    if root.show-scroll-buttons : Rectangle {
+        x: root.width - root.edge-padding - root.scroll-controls-width;
+        y: (root.height - self.height) / 2;
+        width: root.scroll-controls-width;
+        height: 24px;
+        border-radius: Theme.radius-sm;
+        border-width: 1px;
+        border-color: Theme.border-subtle;
+        background: Theme.bg-panel;
+
+        Rectangle {
+            x: parent.width / 2;
+            y: 4px;
+            width: 1px;
+            height: parent.height - 8px;
+            background: Theme.border-subtle;
+        }
+
+        ScrollArrow {
+            x: 0px;
+            y: 1px;
+            width: parent.width / 2;
+            height: parent.height - 2px;
+            glyph: "\u{E5CB}";
+            enabled: root.scroll-x > 0px;
+            clicked => {
+                root.scroll-x = max(0px, root.scroll-x - 140px);
+            }
+        }
+
+        ScrollArrow {
+            x: parent.width / 2;
+            y: 1px;
+            width: parent.width / 2;
+            height: parent.height - 2px;
+            glyph: "\u{E5CC}";
+            enabled: root.scroll-x < root.max-scroll-x;
+            clicked => {
+                root.scroll-x = min(root.max-scroll-x, root.scroll-x + 140px);
+            }
+        }
+    }
+}

@@ -1,0 +1,83 @@
+[package]
+name = "xiaoxingshell"
+version = "1.0.0"
+edition = "2021"
+authors = ["xiaoxingshell contributors"]
+description = "A lightweight FinalShell-style SSH/terminal client written in Rust + Slint"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/your/xiaoxingshell"
+readme = "README.md"
+rust-version = "1.75"
+
+[dependencies]
+slint = { version = "1.8", features = ["compat-1-2"] }
+# Direct access to the winit window/events (OS file-drop for drag-and-drop upload).
+i-slint-backend-winit = "1.16"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "1"
+directories = "5"
+chrono = { version = "0.4", features = ["serde"] }
+sysinfo = "0.33"
+uuid = { version = "1", features = ["v4", "serde"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "net", "time", "fs"] }
+russh = "0.49"
+russh-keys = "0.49"
+ssh-key = "0.6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.8"
+async-trait = "0.1"
+futures = "0.3"
+vt100 = "0.15"
+russh-sftp = "2"
+rfd = "0.15"
+arboard = "3"
+# Zeroes password buffers on drop so plaintext credentials don't linger in
+# freed heap memory (core dumps / debuggers / /proc/pid/mem).
+zeroize = "1"
+# SOCKS5 proxy tunnelling for SSH/SFTP in network-restricted environments.
+# (HTTP CONNECT proxies are handled in src/proxy.rs without an extra crate.)
+tokio-socks = "0.5"
+base64 = "0.22"
+unicode-width = "0.2"
+# Enumerate installed system fonts for the Interface (font) settings picker.
+fontdb = "0.16"
+# Cross-platform serial port access for the Serial session type (#14, #17).
+# Opens COM3 / /dev/ttyUSB0 etc.; on Linux the default `libudev` feature is
+# used for port enumeration (CI installs libudev-dev).
+serialport = "4"
+# ChaCha20-Poly1305 AEAD for encrypting passwords at rest in sessions.json.
+# rand (OsRng) and base64 are already pulled in by other deps above.
+chacha20poly1305 = "0.10"
+# Detect whether the OS is running in dark or light mode.
+# Used on startup to honour the system preference before the user overrides it.
+dark-light = "1"
+# Decode the embedded PNG icon to set the window icon at runtime (Linux only).
+# On Windows the icon comes from the .ico embedded by winresource at link time;
+# on macOS it comes from the app bundle — neither needs runtime decoding.
+[target.'cfg(target_os = "linux")'.dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+# Native Wayland clipboard (wlr-data-control protocol) so copy/paste works on
+# Wayland sessions (KDE/wlroots) without relying on XWayland (issue #47).
+# Feature is additive over the base `arboard = "3"` dependency above.
+arboard = { version = "3", features = ["wayland-data-control"] }
+
+[build-dependencies]
+slint-build = "1.8"
+
+# Embeds assets/xiaoxingshell.ico into the .exe so Explorer / taskbar / shortcuts
+# show the app icon. Windows-only; ignored on other targets.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[profile.dev]
+opt-level = 1

@@ -1,0 +1,170 @@
+import { Theme } from "theme.slint";
+
+// --- IconButton ------------------------------------------------------------
+// A small square action button that accepts a single-character glyph (or short text).
+// Keeps visual language consistent across the app.
+export component IconButton inherits Rectangle {
+    in property <string> glyph;
+    in property <string> tooltip;
+    in property <length> size: 28px;
+    in property <brush> fg: Theme.text-secondary;
+    in property <brush> fg-hover: Theme.text-primary;
+    callback clicked();
+
+    width: size;
+    height: size;
+    border-radius: Theme.radius-sm;
+    background: touch.has-hover ? Theme.bg-hover : transparent;
+    animate background { duration: 120ms; }
+
+    Text {
+        text: glyph;
+        color: touch.has-hover ? fg-hover : fg;
+        font-size: Theme.fs-md;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// --- PrimaryButton ---------------------------------------------------------
+export component PrimaryButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> disabled: false;
+    callback clicked();
+
+    height: 30px;
+    min-width: 80px;
+    border-radius: Theme.radius-sm;
+    background: disabled
+        ? Theme.bg-elevated
+        : (touch.pressed ? Theme.accent-pressed
+           : (touch.has-hover ? Theme.accent-hover : Theme.accent));
+    animate background { duration: 120ms; }
+
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        alignment: center;
+        Text {
+            text: root.text;
+            color: disabled ? Theme.text-muted : white;
+            font-size: Theme.fs-md;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+    }
+
+    touch := TouchArea {
+        enabled: !disabled;
+        mouse-cursor: disabled ? default : pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// --- GhostButton -----------------------------------------------------------
+export component GhostButton inherits Rectangle {
+    in property <string> text;
+    callback clicked();
+
+    height: 30px;
+    min-width: 80px;
+    border-radius: Theme.radius-sm;
+    border-width: 1px;
+    border-color: touch.has-hover ? Theme.border-strong : Theme.border-subtle;
+    background: touch.pressed ? Theme.bg-active
+        : (touch.has-hover ? Theme.bg-hover : Theme.bg-panel);
+    animate background, border-color { duration: 120ms; }
+
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        alignment: center;
+        Text {
+            text: root.text;
+            color: Theme.text-primary;
+            font-size: Theme.fs-md;
+            vertical-alignment: center;
+        }
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// --- LabeledInput ----------------------------------------------------------
+export component LabeledInput inherits VerticalLayout {
+    in property <string> label;
+    in property <string> placeholder;
+    in-out property <string> value;
+    in property <bool> password: false;
+    spacing: 4px;
+
+    Text {
+        text: label;
+        color: Theme.text-secondary;
+        font-size: Theme.fs-sm;
+    }
+
+    Rectangle {
+        height: 32px;
+        border-radius: Theme.radius-sm;
+        border-width: 1px;
+        border-color: input.has-focus ? Theme.accent : Theme.border-subtle;
+        background: Theme.bg-root;
+
+        input := TextInput {
+            x: 10px;
+            y: 0px;
+            width: parent.width - 20px;
+            height: parent.height;
+            text <=> root.value;
+            color: Theme.text-primary;
+            // A CJK-capable family — TextInput doesn't glyph-fallback reliably
+            // across machines, so typed Chinese (incl. punctuation like 、) can
+            // render as tofu without an explicit font (#54).
+            font-family: Theme.ui-font-family;
+            font-size: Theme.fs-md;
+            vertical-alignment: center;
+            single-line: true;
+            input-type: root.password ? InputType.password : InputType.text;
+        }
+
+        // Lightweight placeholder — shown when value is empty.
+        if value == "" : Text {
+            x: 10px;
+            y: 0px;
+            height: parent.height;
+            text: placeholder;
+            color: Theme.text-muted;
+            font-size: Theme.fs-md;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// --- Sparkline -------------------------------------------------------------
+// Compact horizontal bar chart used in the stats sidebar.
+export component Sparkline inherits Rectangle {
+    in property <[float]> values;
+    in property <brush> line-color: Theme.accent;
+
+    background: Theme.bg-root;
+    border-radius: Theme.radius-sm;
+    clip: true;
+
+    for v[i] in values : Rectangle {
+        x: i * (parent.width / max(1, values.length));
+        y: parent.height - (parent.height * clamp(v, 0.0, 1.0));
+        width: (parent.width / max(1, values.length)) - 1px;
+        height: parent.height * clamp(v, 0.0, 1.0);
+        background: line-color.with-alpha(0.85);
+        border-radius: 1px;
+    }
+}

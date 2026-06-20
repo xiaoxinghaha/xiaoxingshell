@@ -1,0 +1,34 @@
+# Maintainer: jeff141 <REPLACE_WITH_YOUR_EMAIL>
+#
+# Binary package: installs the pre-built release tarball from GitHub, so Arch
+# users don't have to compile Rust + Slint themselves. The CI in
+# .github/workflows/aur-publish.yml keeps pkgver + checksums in sync on each
+# release; you can also `makepkg -si` this file directly.
+pkgname=xiaoxingshell-bin
+pkgver=0.3.6
+pkgrel=1
+pkgdesc="Lightweight FinalShell-style SSH/SFTP/terminal client (Rust + Slint)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/jeff141/meatshell"
+license=('MIT' 'Apache-2.0')
+provides=('meatshell')
+conflicts=('meatshell')
+depends=('fontconfig' 'freetype2' 'libxkbcommon' 'gtk3' 'hicolor-icon-theme')
+# The released binary is already stripped (Cargo.toml: strip = "symbols").
+options=('!strip')
+source_x86_64=("meatshell-${pkgver}-x86_64.tar.gz::${url}/releases/download/v${pkgver}/meatshell-v${pkgver}-linux-x86_64.tar.gz")
+source_aarch64=("meatshell-${pkgver}-aarch64.tar.gz::${url}/releases/download/v${pkgver}/meatshell-v${pkgver}-linux-aarch64.tar.gz")
+# `updpkgsums` (run by CI, or by you locally) fills these in. SKIP just disables
+# the integrity check for a manual build.
+sha256sums_x86_64=('SKIP')
+sha256sums_aarch64=('SKIP')
+
+package() {
+    # The tarball extracts to meatshell-v<ver>-linux-<arch>/ ; $CARCH is
+    # x86_64 / aarch64, matching the archive's name suffix.
+    local _dir="${srcdir}/meatshell-v${pkgver}-linux-${CARCH}"
+    install -Dm755 "${_dir}/meatshell"          "${pkgdir}/usr/bin/meatshell"
+    install -Dm644 "${_dir}/xiaoxingshell.desktop"  "${pkgdir}/usr/share/applications/xiaoxingshell.desktop"
+    install -Dm644 "${_dir}/icon@512.png"       "${pkgdir}/usr/share/icons/hicolor/512x512/apps/meatshell.png"
+    install -Dm644 "${_dir}/README.md"          "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+}

@@ -1,0 +1,1133 @@
+import { Theme } from "theme.slint";
+import { SftpPanel, SftpEntry, SftpTreeNode } from "sftp_panel.slint";
+
+// Embed the terminal fonts here too so the cell-probe Text below measures
+// with the CORRECT font (the built-in Meatshell Mono), not a system fallback.
+// Font imports in app.slint are globally available in theory, but some Slint
+// builds only register them in the entry-point file's component tree; importing
+// them here guarantees the probe uses Meatshell Mono for its width calc.
+import "fonts/MeatshellMono-Regular.ttf";
+import "fonts/MeatshellMono-Bold.ttf";
+
+// One coloured run of text on the terminal grid.  The Rust side groups
+// consecutive vt100 cells that share fg + bg + bold into a single span and
+// tags it with its grid position (row, col) and width in cells, so the UI can
+// place both a background fill and the text with absolute monospace coordinates.
+// `bg` is transparent (alpha 0) when the cell uses the default background.
+export struct TermSpan {
+    text: string,
+    fg: color,
+    bg: color,
+    bold: bool,
+    row: int,
+    col: int,
+    cells: int,
+    cjk: bool,   // contains CJK chars → render with the CJK-capable font (#54)
+}
+
+// A find-match highlight rectangle on the terminal grid.
+export struct TermMatch {
+    row: int,
+    col: int,
+    len: int,
+}
+
+// One saved quick command (#55): a name shown on the chip + the text to send.
+export struct QuickCmd {
+    name: string,
+    command: string,
+}
+
+// --- MenuItem --------------------------------------------------------------
+// One row of the terminal right-click context menu (MDL2 icon + label).
+component MenuItem inherits Rectangle {
+    in property <string> icon;
+    in property <string> label;
+    callback clicked();
+
+    height: 28px;
+    border-radius: Theme.radius-sm;
+    background: ta.has-hover ? Theme.bg-hover : transparent;
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        spacing: 8px;
+        Text {
+            text: root.icon;
+            font-family: "Material Icons";
+            color: Theme.text-secondary;
+            font-size: Theme.fs-sm;
+            vertical-alignment: center;
+        }
+        Text {
+            text: root.label;
+            color: Theme.text-primary;
+            font-size: Theme.fs-md;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+    }
+}
+
+// --- TerminalView ----------------------------------------------------------
+
+export component TerminalView inherits Rectangle {
+    in property <string> tab-id;
+    in property <string> status-line: @tr("Not connected");
+    in property <[TermSpan]> spans;     // coloured runs of the visible screen
+    in property <int> cursor-row;       // cursor cell (grid coords)
+    in property <int> cursor-col;
+    in property <int> rows-used;        // content rows, for viewport sizing
+    in property <bool>   is-alt-screen;
+    in property <[TermMatch]> find-matches; // search-highlight rectangles
+    in property <[TermMatch]> selection;    // drag-selection highlight rectangles
+
+    in property <string>  sftp-path: "/";
+    in property <[SftpEntry]> sftp-entries;
+    in property <string>  sftp-status: "";
+    in property <bool>    sftp-loading: false;
+    in property <[SftpTreeNode]> sftp-tree-nodes: [];
+
+    in-out property <length> sftp-panel-height: 220px;
+    // Shared with the AppWindow (like sftp-panel-height) so a startup default can
+    // collapse the panel and the state stays consistent across tabs (#78).
+    in-out property <length> sftp-saved-height: 220px;   // height to restore on un-collapse
+    in-out property <bool>   sftp-collapsed: false;       // SFTP panel minimised (toolbar only)
+    in-out property <length> sftp-tree-width: 160px;
+    in-out property <length> sftp-col-name-width: 180px;
+    in-out property <length> sftp-col-size-width: 72px;
+    in-out property <length> sftp-col-type-width: 110px;
+    in-out property <length> sftp-col-modified-width: 130px;
+    in-out property <length> sftp-col-mode-width: 90px;
+    in-out property <length> sftp-col-owner-width: 110px;
+    in-out property <string> sftp-sort-column: "name";
+    in-out property <bool> sftp-sort-ascending: true;
+
+    // Command bar (#55): quick commands + input box + history (all shared/global,
+    // fed from Rust); send-to-all is a per-tab toggle.
+    in property <[QuickCmd]> quick-commands;
+    in property <[string]> command-history;   // oldest first (newest last, #113)
+    property <bool> send-to-all: false;
+    property <bool> quick-open: false;         // quick-command popup visibility
+    property <bool> history-open: false;       // history dropdown visibility
+    property <int> history-cursor: -1;         // ↑/↓ recall index (-1 = live input)
+    callback run-command(string /* cmd */, bool /* to-all */);
+    callback manage-quick-commands();          // open the add/edit/delete dialog
+    callback copy-text(string);                // copy a history command to clipboard (#96)
+    callback delete-history(int /* index */);  // remove a history entry (#96)
+
+    callback send-key(string, bool, bool, bool);
+    callback terminal-resize(float, float);
+    callback sftp-navigate(string);
+    callback sftp-download(string);
+    callback sftp-upload-clicked(string, bool);
+    callback sftp-refresh(string);
+    callback sftp-tree-expand(string);
+    callback sftp-delete(string);
+    callback sftp-view(string);
+    callback sftp-edit(string);
+    callback sftp-open-external(string);
+    callback sftp-edit-external(string);
+    callback sftp-configure-external-editor();
+    callback sftp-sort-request(string, bool);
+    callback persist-sftp-panel-layout(length, length, bool, length, length, length, length, length, length, length);
+    // Context-menu extensions (#69), forwarded up to the app shell.
+    callback sftp-rename-request(string, string);
+    callback sftp-chmod-request(string, string, int);
+    callback sftp-copy-path(string);
+    callback sftp-new-folder(string);
+    callback sftp-new-file(string);
+    callback paste-from-clipboard();
+    callback copy-terminal-text();
+    callback clear-terminal();              // wipe this session's screen buffer
+    callback find-query-changed(string);    // recompute search highlights
+    callback terminal-scroll(int);          // scroll history by N lines (+ = up)
+    callback select-start(int, int);        // begin drag-selection at (row, col)
+    callback select-update(int, int);       // extend drag-selection to (row, col)
+    callback select-end();                  // finish selection → copy to clipboard
+    callback select-word(int, int);         // double-click selection at (row, col)
+    callback select-line(int, int);         // triple-click selection at (row, col)
+    callback select-autoscroll(int);        // auto-scroll while dragging past edge (dir: -1 up / +1 down)
+    callback copy-selection-or-ctrl-c();    // copy selection if present, else send Ctrl+C
+
+    // Right-click context-menu anchor + find-bar visibility (private UI state).
+    property <length> ctx-x;
+    property <length> ctx-y;
+    property <bool> find-active: false;
+    property <bool> selecting: false;
+    // Auto-scroll direction while drag-selecting past the visible edge.
+    // 0 = none, -1 = above top (scroll to older), +1 = below bottom (newer).
+    property <int> autoscroll-dir: 0;
+    property <length> vis-y: 0px;   // scratch: cursor Y within the visible viewport
+    property <bool> awaiting-third-click: false;
+    property <int> multi-click-row: -1;
+    property <int> multi-click-col: -1;
+
+    background: Theme.term-bg;
+    forward-focus: ime-input;
+
+    // Drag state (private)
+    property <bool>   sftp-dragging:     false;
+    property <length> drag-start-mouse-y: 0px;
+
+    // --- Real cell-size measurement ----------------------------------------
+    // A hidden Text rendered with the exact terminal font reports the true
+    // Consolas cell width/height for the current font size.  We derive the PTY
+    // column/row counts from these measured cells instead of guessing 8×16px,
+    // so full-screen programs (nano/vim) get an accurate row count and their
+    // bottom shortcut bar is no longer clipped off the visible area.
+    // Measure a 50-char run, not a single glyph: a single Text's preferred-width
+    // includes left/right side bearings and is wider than the real per-character
+    // advance, which would make absolutely-positioned spans drift apart.  The
+    // average advance over a long run (side bearings amortised) is accurate.
+    // Cell-size probe: must be RENDERED (opacity:0, not visible:false) so Slint
+    // resolves the correct embedded font before computing preferred-width/height.
+    // visible:false can skip font loading and fall back to a system font (e.g.
+    // Consolas ~6.5 px/char instead of Meatshell Mono ~7.6 px/char), giving a
+    // cell-w that is too narrow and a term-cols that is too large.
+    cell-probe := Text {
+        text: "MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM"; // exactly 50×M
+        font-family: Theme.term-font-family;
+        font-size: Theme.term-font-size;
+        // Keep it in layout but invisible: opacity:0 forces full font loading.
+        opacity: 0;
+        // Park it at y<0 so it never overlaps terminal content.
+        y: -200px;
+        width: 0px; // zero out layout contribution
+        height: 0px;
+    }
+    // cell-w / cell-h come straight from the probe so they ALWAYS match the
+    // font the spans below are actually rendered with.  (Forcing a hard-coded
+    // minimum here is dangerous: if the spans fall back to a system font, a
+    // mismatched cell-w garbles the grid.  Keep them derived from one source.)
+    property <length> cell-w: max(1px, cell-probe.preferred-width / 50);
+    property <length> cell-h: max(1px, cell-probe.preferred-height);
+    // Usable text box = root.width minus the 10px left/right padding of
+    // output-text; usable height = key-capture height minus the 8px top pad
+    // and the 16px bottom focus-recovery strip.
+    property <float> term-cols: max(10, floor((root.width - 20px) / cell-w));
+    property <float> term-rows: max(5,  floor((key-capture.height - 24px) / cell-h));
+    // Only resize the PTY while this tab is visible.  Inactive tabs are laid
+    // out at width 0 (→ term-cols collapses to 10); resizing the remote to 10
+    // columns reflows the vt100 screen and destroys the scrollback, so when you
+    // switch back the output is gone.  Guarding on `visible` keeps each hidden
+    // session frozen at its real size; `changed visible` re-syncs on return.
+    changed term-cols => { if (root.visible) { root.terminal-resize(root.term-cols, root.term-rows); } }
+    changed term-rows => { if (root.visible) { root.terminal-resize(root.term-cols, root.term-rows); } }
+
+    init => { root.terminal-resize(root.term-cols, root.term-rows); }
+
+    changed spans => {
+        // Bash: keep the latest output pinned to the bottom.
+        // Alt-screen (nano/vim/htop/btop): the program owns a fixed full screen,
+        // so the viewport must stay top-aligned (viewport-y = 0).  Scrolling to
+        // the bottom would push the title bar + content off the top, leaving only
+        // the program's status bar — exactly the "nano shows nothing" symptom.
+        if (!root.is-alt-screen) {
+            flickable.viewport-y = flickable.height - flickable.viewport-height;
+        } else {
+            flickable.viewport-y = 0;
+        }
+    }
+    changed is-alt-screen => {
+        // Reset scroll on every mode switch (entering/leaving nano, vim, btop…).
+        // Snapping to top on alt-screen entry ensures the full-screen program's
+        // frame is shown from row 0, not from wherever history left off.
+        if (root.is-alt-screen) {
+            flickable.viewport-y = 0;
+        } else {
+            // Return to normal mode: pin to the most recent output.
+            flickable.viewport-y = flickable.height - flickable.viewport-height;
+        }
+    }
+    changed visible => {
+        if (self.visible) {
+            ime-input.focus();
+            // Re-sync the PTY size on return (it was frozen while hidden).
+            root.terminal-resize(root.term-cols, root.term-rows);
+        }
+    }
+
+    VerticalLayout {
+        spacing: 0;
+
+        // --- Status strip ---------------------------------------------------
+        Rectangle {
+            height: 24px;
+            background: Theme.bg-panel-alt;
+            HorizontalLayout {
+                padding-left: 10px; padding-right: 10px;
+                Text {
+                    text: root.status-line;
+                    color: Theme.text-secondary;
+                    font-size: Theme.fs-xs;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                // Alt-screen indicator only.  IMPORTANT: never put cell-w / cell-h
+                // (a Text's preferred-size) inside another Text's `text` — doing so
+                // makes Slint compute one text layout *inside* another, which
+                // re-enters parley's FontContext RefCell and panics ("already
+                // borrowed").  A plain bool flag is safe.
+                if root.is-alt-screen : Text {
+                    text: "[ALT]";
+                    color: Theme.success;
+                    font-size: Theme.fs-xs;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        // --- Key-capture scope + scrollable output --------------------------
+        key-capture := FocusScope {
+            vertical-stretch: 1;
+            // Any click inside this scope (e.g. the middle-click paste strip)
+            // can grab focus to the FocusScope itself.  Key forwarding lives on
+            // the hidden `ime-input` TextInput, so a bare FocusScope focus means
+            // the cursor stops blinking and typing stops working.  Forwarding
+            // focus to ime-input guarantees the text input always ends up with
+            // the keyboard focus, no matter what grabbed it.
+            forward-focus: ime-input;
+            property <bool> cursor-blink: true;
+
+            init => { ime-input.focus(); }
+
+            Timer {
+                running: ime-input.has-focus;
+                interval: 530ms;
+                triggered => { key-capture.cursor-blink = !key-capture.cursor-blink; }
+            }
+
+            // Auto-scroll while the drag-selection is held past the top/bottom
+            // edge: ticks repeatedly so the scrollback keeps moving even when the
+            // mouse is held still beyond the edge.
+            Timer {
+                running: root.selecting && root.autoscroll-dir != 0;
+                interval: 50ms;
+                triggered => { root.select-autoscroll(root.autoscroll-dir); }
+            }
+
+            Timer {
+                running: root.awaiting-third-click;
+                interval: 420ms;
+                triggered => { root.awaiting-third-click = false; }
+            }
+
+            VerticalLayout {
+                spacing: 0;
+
+                flickable := Flickable {
+                    vertical-stretch: 1;
+                    // Non-interactive: a Flickable steals fast drags from child
+                    // TouchAreas for its own flick gesture, which broke quick
+                    // drag-selection (slow drags worked, fast ones selected
+                    // nothing). We scroll via the wheel (scroll-event below →
+                    // terminal-scroll) and pin programmatically, so we don't need
+                    // the Flickable's own drag-scrolling (#119-followup).
+                    interactive: false;
+                    viewport-width: self.width;
+                    // Alt-screen: lock the viewport to exactly the visible height
+                    // so the full-screen program (nano/vim) renders top-aligned
+                    // with no internal scroll.  Bash: let the viewport grow with
+                    // the content so we can scroll back through history.
+                    viewport-height: root.is-alt-screen
+                        ? self.height
+                        : max(self.height, 8px + root.rows-used * root.cell-h + 8px);
+
+                    // The terminal grid.  Each coloured run is placed with
+                    // absolute coordinates derived from its (row, col) and the
+                    // measured Consolas cell size — no per-line layout needed,
+                    // which keeps the model flat (a single `for`).
+                    Rectangle {
+                        x: 10px;
+                        y: 8px;
+                        width: parent.width - 20px;
+                        height: flickable.viewport-height - 8px;
+
+                        // Click-to-focus over the whole terminal body.  Without
+                        // this, clicking anywhere in the output area blurs the
+                        // hidden ime-input (Slint clears focus on a click that
+                        // lands on a non-focusable element), which makes the
+                        // cursor vanish and keystrokes stop — recoverable only by
+                        // reopening the tab.  This TouchArea sits *below* the text
+                        // (Text never grabs pointer events, so clicks fall through
+                        // to it) and restores focus on every click; middle-click
+                        // also pastes, matching the bottom strip.
+                        body-touch := TouchArea {
+                            mouse-cursor: text;
+                            pointer-event(ev) => {
+                                if (ev.kind == PointerEventKind.down) {
+                                    // Any button press re-takes keyboard focus.
+                                    ime-input.focus();
+                                    if (ev.button == PointerEventButton.right) {
+                                        root.ctx-x = self.mouse-x;
+                                        root.ctx-y = self.mouse-y;
+                                        ctx-menu.show();
+                                    } else if (ev.button == PointerEventButton.left) {
+                                        let row = floor(self.mouse-y / root.cell-h);
+                                        let col = floor(self.mouse-x / root.cell-w);
+                                        if (root.awaiting-third-click
+                                                && row == root.multi-click-row
+                                                && col == root.multi-click-col) {
+                                            root.awaiting-third-click = false;
+                                            root.selecting = false;
+                                            root.autoscroll-dir = 0;
+                                            root.select-line(row, col);
+                                            root.copy-terminal-text();
+                                        } else {
+                                            root.awaiting-third-click = false;
+                                            root.selecting = true;
+                                            root.select-start(row, col);
+                                        }
+                                    }
+                                } else if (ev.kind == PointerEventKind.up) {
+                                    if (ev.button == PointerEventButton.middle) {
+                                        root.paste-from-clipboard();
+                                        ime-input.focus();
+                                    } else if (ev.button == PointerEventButton.left
+                                            && root.selecting) {
+                                        root.selecting = false;
+                                        root.autoscroll-dir = 0;
+                                        root.select-end();
+                                    }
+                                }
+                            }
+                            double-clicked => {
+                                let row = floor(self.mouse-y / root.cell-h);
+                                let col = floor(self.mouse-x / root.cell-w);
+                                root.awaiting-third-click = true;
+                                root.multi-click-row = row;
+                                root.multi-click-col = col;
+                                root.selecting = false;
+                                root.autoscroll-dir = 0;
+                                root.select-word(row, col);
+                                root.copy-terminal-text();
+                                ime-input.focus();
+                            }
+                            moved => {
+                                if (root.selecting) {
+                                    // Position of the cursor within the *visible*
+                                    // viewport (body-touch sits on the grid Rectangle
+                                    // at content y=8px; viewport-y offsets the scroll).
+                                    root.select-update(
+                                        floor(self.mouse-y / root.cell-h),
+                                        floor(self.mouse-x / root.cell-w));
+                                    if (!root.is-alt-screen) {
+                                        // vy = mouse position inside the visible window.
+                                        // Only auto-scroll once the drag actually leaves
+                                        // the top/bottom edge — selecting *within* the
+                                        // visible area must never make the view jump or
+                                        // the selection snap to an edge row (#41). Slint
+                                        // captures the pointer while pressed, so dragging
+                                        // past the edge still scrolls to extend across
+                                        // more than one screen.
+                                        root.vis-y = self.mouse-y + 8px + flickable.viewport-y;
+                                        if (root.vis-y < 0) {
+                                            root.autoscroll-dir = -1;       // past top → older
+                                        } else if (root.vis-y > flickable.height) {
+                                            root.autoscroll-dir = 1;        // past bottom → newer
+                                        } else {
+                                            root.autoscroll-dir = 0;
+                                        }
+                                    }
+                                }
+                            }
+                            scroll-event(ev) => {
+                                // Wheel scrolls the scrollback history (~3 lines
+                                // per notch).  Positive delta-y = scroll up = older.
+                                // In alt-screen mode (vim/nano/btop) the program
+                                // handles scroll itself — suppress our history scroll
+                                // so the full-screen UI isn't pushed out of view.
+                                if (!root.is-alt-screen) {
+                                    root.terminal-scroll(ev.delta-y > 0 ? 3 : -3);
+                                }
+                                accept
+                            }
+                        }
+
+                        // Drag-selection highlights (under the text, blue tint).
+                        for s in root.selection : Rectangle {
+                            x: s.col * root.cell-w;
+                            y: s.row * root.cell-h;
+                            width: s.len * root.cell-w;
+                            height: root.cell-h;
+                            background: Theme.accent.with-alpha(0.40);
+                        }
+
+                        // Search-match highlights (behind the text).
+                        for m in root.find-matches : Rectangle {
+                            x: m.col * root.cell-w;
+                            y: m.row * root.cell-h;
+                            width: m.len * root.cell-w;
+                            height: root.cell-h;
+                            background: Theme.warning.with-alpha(0.45);
+                            border-radius: 2px;
+                        }
+
+                        // Each span = a background fill (transparent for the
+                        // default bg) with its text on top.  Wrapping the Text in
+                        // the bg Rectangle keeps one element per span and renders
+                        // btop/htop/mc panels, meter bars and graph fills.
+                        for span in root.spans : Rectangle {
+                            x: span.col * root.cell-w;
+                            y: span.row * root.cell-h;
+                            width: span.cells * root.cell-w;
+                            height: root.cell-h;
+                            background: span.bg;
+                            // A wide-CJK span is a single char in a 2-cell box; clip
+                            // it so a glyph whose advance differs from 2×cell-w can't
+                            // bleed over the neighbouring cell / cursor (#60 follow-up).
+                            clip: span.cjk;
+                            // Auto-sized Text (no width/height bindings) so its
+                            // layout never re-enters parley's FontContext.
+                            Text {
+                                x: 0px;
+                                y: 0px;
+                                text: span.text;
+                                color: span.fg;
+                                // CJK spans use the CJK-capable UI font: the mono
+                                // terminal font lacks CJK glyphs and Slint tofu's
+                                // *isolated* CJK punctuation (、。,) on fallback (#54).
+                                font-family: span.cjk ? Theme.ui-font-family : Theme.term-font-family;
+                                font-size: Theme.term-font-size;
+                                font-weight: span.bold ? 700 : 400;
+                            }
+                        }
+
+                        // Blinking block cursor (overlay, decoupled from text).
+                        Rectangle {
+                            x: root.cursor-col * root.cell-w;
+                            y: root.cursor-row * root.cell-h;
+                            width: root.cell-w;
+                            height: root.cell-h;
+                            background: Theme.term-fg;
+                            visible: ime-input.has-focus && key-capture.cursor-blink;
+                        }
+
+                        // --- Right-click context menu ---------------------
+                        ctx-menu := PopupWindow {
+                            x: root.ctx-x;
+                            y: root.ctx-y;
+                            width: 132px;
+                            height: 132px;
+                            Rectangle {
+                                background: Theme.bg-panel;
+                                border-radius: Theme.radius-sm;
+                                border-width: 1px;
+                                border-color: Theme.border-strong;
+                                drop-shadow-blur: 12px;
+                                drop-shadow-color: #00000060;
+                                VerticalLayout {
+                                    padding: 4px;
+                                    spacing: 1px;
+                                    MenuItem {
+                                        icon: "\u{E14D}"; label: @tr("Copy");
+                                        clicked => { root.copy-terminal-text(); ime-input.focus(); }
+                                    }
+                                    MenuItem {
+                                        icon: "\u{E14F}"; label: @tr("Paste");
+                                        clicked => { root.paste-from-clipboard(); ime-input.focus(); }
+                                    }
+                                    MenuItem {
+                                        icon: "\u{E872}"; label: @tr("Clear buffer");
+                                        clicked => { root.clear-terminal(); ime-input.focus(); }
+                                    }
+                                    MenuItem {
+                                        icon: "\u{E8B6}"; label: @tr("Find");
+                                        clicked => { root.find-active = true; }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Bottom focus-recovery / middle-click-paste strip
+                Rectangle {
+                    height: 16px;
+                    background: Theme.term-bg;
+                    TouchArea {
+                        mouse-cursor: text;
+                        clicked => { ime-input.focus(); }
+                        pointer-event(ev) => {
+                            if (ev.button == PointerEventButton.middle
+                                    && ev.kind == PointerEventKind.up) {
+                                root.paste-from-clipboard();
+                                ime-input.focus();
+                            }
+                        }
+                    }
+                }
+            }
+
+            // --- Hidden TextInput — keyboard + Chinese IME capture -----------
+            //
+            // Key design decision: return `accept` for EVERY key and forward
+            // them all via send-key.  Returning `reject` makes Slint bubble the
+            // event without inserting the character into `text`, so `edited`
+            // never fires for regular keystrokes — only IME-committed chars
+            // (which go through a separate WM_IME_CHAR path) reach `edited`.
+            //
+            // By forwarding everything in key-pressed we guarantee English and
+            // all direct-mode input reaches the PTY.  `edited` is kept as a
+            // safety net for IME commits that Windows delivers via WM_IME_CHAR
+            // rather than WM_CHAR (and therefore don't fire key-pressed).
+            ime-input := TextInput {
+                x: 0;
+                y: key-capture.height - 16px;
+                width: key-capture.width;
+                height: 1px;
+                opacity: 0;
+                single-line: true;
+
+                // Reset blink phase on focus gain so cursor appears immediately.
+                changed has-focus => {
+                    if (self.has-focus) { key-capture.cursor-blink = true; }
+                }
+
+                key-pressed(event) => {
+                    // ── Ctrl+Shift+C: copy terminal buffer ───────────────────
+                    if (event.modifiers.control && event.modifiers.shift
+                            && (event.text == "c" || event.text == "C"
+                                || event.text == "\u{0003}")) {
+                        root.copy-terminal-text();
+                        accept
+                    // ── Ctrl+C: copy current selection, else interrupt ──────
+                    } else if (event.modifiers.control && !event.modifiers.shift
+                            && (event.text == "c" || event.text == "C"
+                                || event.text == "\u{0003}")) {
+                        root.copy-selection-or-ctrl-c();
+                        accept
+                    // ── Ctrl+V or Ctrl+Shift+V: paste from clipboard ─────────
+                    // We accept Ctrl+V (with or without Shift) so the familiar
+                    // Windows paste shortcut works in addition to Ctrl+Shift+V.
+                    } else if (event.modifiers.control
+                            && (event.text == "v" || event.text == "V"
+                                || event.text == "\u{0016}")) {
+                        root.paste-from-clipboard();
+                        // Clipboard access on Windows can deliver WM_KILLFOCUS.
+                        // Restore focus explicitly so the cursor keeps blinking.
+                        ime-input.focus();
+                        accept
+                    // ── All other keys (printable, Ctrl+X, arrows, …) ────────
+                    // Return `accept` for everything: `reject` bubbles without
+                    // inserting the char into TextInput, so `edited` never fires
+                    // for regular keystrokes — the character would be lost.
+                    } else {
+                        root.send-key(event.text, event.modifiers.control,
+                                      event.modifiers.alt, event.modifiers.shift);
+                        accept
+                    }
+                }
+
+                // Safety-net for IME commits delivered via WM_IME_CHAR (which
+                // may not fire key-pressed).  Guard with preedit-text == "" to
+                // skip in-progress compositions.
+                edited => {
+                    if (self.preedit-text == "" && self.text != "") {
+                        root.send-key(self.text, false, false, false);
+                        self.text = "";
+                    }
+                }
+            }
+
+            // --- Find bar (overlay, top) ------------------------------------
+            if root.find-active : Rectangle {
+                x: 0;
+                y: 0;
+                width: parent.width;
+                height: 34px;
+                background: Theme.bg-panel;
+                border-width: 1px;
+                border-color: Theme.border-strong;
+                border-radius: Theme.radius-sm;
+
+                HorizontalLayout {
+                    padding: 6px;
+                    spacing: 6px;
+                    Text {
+                        text: "\u{E8B6}";
+                        font-family: "Material Icons";
+                        color: Theme.text-secondary;
+                        font-size: Theme.fs-sm;
+                        vertical-alignment: center;
+                    }
+                    Rectangle {
+                        background: Theme.bg-root;
+                        border-radius: 3px;
+                        horizontal-stretch: 1;
+                        find-input := TextInput {
+                            x: 6px;
+                            width: parent.width - 12px;
+                            height: parent.height;
+                            color: Theme.text-primary;
+                            font-family: Theme.ui-font-family; // CJK-capable (#54)
+                            font-size: Theme.fs-md;
+                            vertical-alignment: center;
+                            single-line: true;
+                            // Grab focus as soon as the bar appears.
+                            init => { self.focus(); }
+                            edited => { root.find-query-changed(self.text); }
+                            key-pressed(e) => {
+                                if (e.text == "\u{001b}") {       // Esc closes find
+                                    root.find-active = false;
+                                    root.find-query-changed("");
+                                    self.text = "";
+                                    ime-input.focus();
+                                    accept
+                                } else {
+                                    reject
+                                }
+                            }
+                        }
+                    }
+                    Rectangle {
+                        width: 24px;
+                        close-ta := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                root.find-active = false;
+                                root.find-query-changed("");
+                                find-input.text = "";
+                                ime-input.focus();
+                            }
+                        }
+                        Text {
+                            text: "\u{E5CD}";
+                            font-family: "Material Icons";
+                            color: close-ta.has-hover ? Theme.text-primary : Theme.text-secondary;
+                            font-size: Theme.fs-sm;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- Command bar (#55): quick commands + input box + history ---------
+        cmd-bar := Rectangle {
+            height: 34px;
+            background: Theme.bg-panel-alt;
+            border-width: 0;
+
+            // Outside-click backdrop: covers the terminal above so clicking
+            // anywhere out of an open popup dismisses it.
+            if root.quick-open || root.history-open : TouchArea {
+                x: 0; y: -2000px; width: parent.width; height: 2000px;
+                clicked => { root.quick-open = false; root.history-open = false; }
+            }
+
+            HorizontalLayout {
+                padding-left: 8px; padding-right: 8px;
+                padding-top: 4px; padding-bottom: 4px;
+                spacing: 6px;
+
+                // Quick-command toggle.
+                Rectangle {
+                    width: qc-row.preferred-width + 16px;
+                    border-radius: Theme.radius-sm;
+                    background: qc-ta.has-hover || root.quick-open ? Theme.bg-hover : Theme.bg-elevated;
+                    qc-ta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.history-open = false; root.quick-open = !root.quick-open; }
+                    }
+                    qc-row := HorizontalLayout {
+                        width: parent.width; height: parent.height;
+                        alignment: center;
+                        spacing: 3px;
+                        Text { text: @tr("Quick"); color: Theme.text-secondary; font-size: Theme.fs-sm;
+                               vertical-alignment: center; }
+                        Text { text: "\u{E5CE}"; font-family: "Material Icons"; color: Theme.text-muted;
+                               font-size: Theme.fs-sm; vertical-alignment: center; }
+                    }
+                }
+
+                // Command input.
+                Rectangle {
+                    horizontal-stretch: 1;
+                    border-radius: Theme.radius-sm;
+                    border-width: 1px;
+                    border-color: cmd-input.has-focus ? Theme.accent : Theme.border-subtle;
+                    background: Theme.bg-root;
+                    cmd-input := TextInput {
+                        x: 8px;
+                        width: parent.width - 16px;
+                        height: parent.height;
+                        color: Theme.text-primary;
+                        font-family: Theme.ui-font-family;
+                        font-size: Theme.fs-md;
+                        vertical-alignment: center;
+                        single-line: true;
+                        // Enter sends; ↑/↓ recall history.
+                        accepted => {
+                            root.run-command(self.text, root.send-to-all);
+                            self.text = "";
+                            root.history-cursor = -1;
+                        }
+                        key-pressed(e) => {
+                            if (e.text == Key.UpArrow) {
+                                // Model is oldest→newest (#113): first ↑ jumps to
+                                // the newest (last), further ↑ steps toward older.
+                                if (root.command-history.length > 0) {
+                                    root.history-cursor = root.history-cursor == -1
+                                        ? root.command-history.length - 1
+                                        : max(root.history-cursor - 1, 0);
+                                    self.text = root.command-history[root.history-cursor];
+                                }
+                                accept
+                            } else if (e.text == Key.DownArrow) {
+                                // ↓ steps toward newer; past the newest → live input.
+                                if (root.history-cursor != -1) {
+                                    if (root.history-cursor < root.command-history.length - 1) {
+                                        root.history-cursor += 1;
+                                        self.text = root.command-history[root.history-cursor];
+                                    } else {
+                                        root.history-cursor = -1;
+                                        self.text = "";
+                                    }
+                                }
+                                accept
+                            } else {
+                                reject
+                            }
+                        }
+                    }
+                    if cmd-input.text == "" : Text {
+                        x: 8px;
+                        height: parent.height;
+                        text: @tr("Type a command, Enter to send");
+                        color: Theme.text-muted;
+                        font-size: Theme.fs-md;
+                        vertical-alignment: center;
+                    }
+                }
+
+                // History toggle.
+                Rectangle {
+                    width: 28px;
+                    border-radius: Theme.radius-sm;
+                    background: hist-ta.has-hover || root.history-open ? Theme.bg-hover : Theme.bg-elevated;
+                    hist-ta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.quick-open = false; root.history-open = !root.history-open; }
+                    }
+                    Text { text: "\u{E5CE}"; font-family: "Material Icons"; color: Theme.text-secondary;
+                           font-size: Theme.fs-md; horizontal-alignment: center; vertical-alignment: center; }
+                }
+
+                // Send-to-all toggle.
+                Rectangle {
+                    width: all-row.preferred-width + 14px;
+                    border-radius: Theme.radius-sm;
+                    background: root.send-to-all ? Theme.accent
+                              : all-ta.has-hover ? Theme.bg-hover : Theme.bg-elevated;
+                    all-ta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.send-to-all = !root.send-to-all; }
+                    }
+                    all-row := HorizontalLayout {
+                        width: parent.width; height: parent.height;
+                        alignment: center;
+                        Text { text: @tr("All sessions"); font-size: Theme.fs-sm; vertical-alignment: center;
+                               color: root.send-to-all ? #ffffff : Theme.text-secondary; }
+                    }
+                }
+
+                // Send button.
+                Rectangle {
+                    width: send-row.preferred-width + 18px;
+                    border-radius: Theme.radius-sm;
+                    background: send-ta.has-hover ? Theme.accent-hover : Theme.accent;
+                    send-ta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            root.run-command(cmd-input.text, root.send-to-all);
+                            cmd-input.text = "";
+                            root.history-cursor = -1;
+                        }
+                    }
+                    send-row := HorizontalLayout {
+                        width: parent.width; height: parent.height;
+                        alignment: center;
+                        Text { text: @tr("Send"); color: #ffffff; font-size: Theme.fs-sm;
+                               vertical-alignment: center; }
+                    }
+                }
+            }
+
+            // --- Quick-command popup (opens upward) --------------------------
+            if root.quick-open : Rectangle {
+                x: 8px;
+                width: 300px;
+                height: min(260px, qc-col.preferred-height + 8px);
+                y: -self.height - 2px;
+                background: Theme.bg-panel;
+                border-radius: Theme.radius-md;
+                border-width: 1px;
+                border-color: Theme.border-strong;
+                drop-shadow-blur: 16px;
+                drop-shadow-color: #00000070;
+                TouchArea {}  // swallow clicks
+                Flickable {
+                    viewport-width: self.width;
+                    viewport-height: max(self.height, qc-col.preferred-height);
+                    qc-col := VerticalLayout {
+                        padding: 4px;
+                        alignment: start;
+                        if root.quick-commands.length == 0 : Text {
+                            text: @tr("No quick commands yet");
+                            color: Theme.text-muted; font-size: Theme.fs-xs;
+                            horizontal-alignment: center;
+                            height: 32px; vertical-alignment: center;
+                        }
+                        for q in root.quick-commands : Rectangle {
+                            height: 34px;
+                            border-radius: Theme.radius-sm;
+                            background: q-item-ta.has-hover ? Theme.bg-hover : transparent;
+                            q-item-ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    root.run-command(q.command, root.send-to-all);
+                                    root.quick-open = false;
+                                }
+                            }
+                            VerticalLayout {
+                                padding-left: 8px; padding-right: 8px;
+                                Text { text: q.name; color: Theme.text-primary; font-size: Theme.fs-sm;
+                                       overflow: elide; }
+                                Text { text: q.command; color: Theme.text-muted; font-size: Theme.fs-xs;
+                                       overflow: elide; font-family: Theme.ui-font-family; }
+                            }
+                        }
+                        // Manage entry.
+                        Rectangle {
+                            height: 30px;
+                            border-radius: Theme.radius-sm;
+                            background: mng-ta.has-hover ? Theme.bg-hover : transparent;
+                            mng-ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.quick-open = false; root.manage-quick-commands(); }
+                            }
+                            Text { text: @tr("Manage…"); color: Theme.accent; font-size: Theme.fs-sm;
+                                   horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                    }
+                }
+            }
+
+            // --- History popup (opens upward) -------------------------------
+            if root.history-open : Rectangle {
+                x: parent.width - 308px;
+                width: 300px;
+                height: min(260px, max(40px, h-col.preferred-height + 8px));
+                y: -self.height - 2px;
+                background: Theme.bg-panel;
+                border-radius: Theme.radius-md;
+                border-width: 1px;
+                border-color: Theme.border-strong;
+                drop-shadow-blur: 16px;
+                drop-shadow-color: #00000070;
+                TouchArea {}
+                Flickable {
+                    viewport-width: self.width;
+                    viewport-height: max(self.height, h-col.preferred-height);
+                    h-col := VerticalLayout {
+                        padding: 4px;
+                        alignment: start;
+                        if root.command-history.length == 0 : Text {
+                            text: @tr("No history yet");
+                            color: Theme.text-muted; font-size: Theme.fs-xs;
+                            horizontal-alignment: center;
+                            height: 32px; vertical-alignment: center;
+                        }
+                        for h[i] in root.command-history : Rectangle {
+                            height: 28px;
+                            border-radius: Theme.radius-sm;
+                            background: h-item-ta.has-hover ? Theme.bg-hover : transparent;
+                            // Row body click recalls the command into the input box.
+                            h-item-ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    cmd-input.text = h;
+                                    root.history-open = false;
+                                    cmd-input.focus();
+                                }
+                            }
+                            HorizontalLayout {
+                                padding-left: 8px; padding-right: 4px; spacing: 1px;
+                                Text {
+                                    text: h;
+                                    color: Theme.text-secondary;
+                                    font-size: Theme.fs-sm;
+                                    font-family: Theme.ui-font-family;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                    overflow: elide;
+                                }
+                                // Run (▶) — execute immediately, on this tab.
+                                Rectangle {
+                                    width: 24px; y: (parent.height - self.height) / 2; height: 24px;
+                                    border-radius: Theme.radius-sm;
+                                    background: hrun.has-hover ? Theme.accent.with-alpha(0.25) : transparent;
+                                    hrun := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => {
+                                            root.run-command(h, root.send-to-all);
+                                            root.history-open = false;
+                                        }
+                                    }
+                                    Text { text: "\u{E037}"; font-family: "Material Icons";
+                                           color: Theme.accent; font-size: Theme.fs-md;
+                                           horizontal-alignment: center; vertical-alignment: center; }
+                                }
+                                // Copy (⧉) — to clipboard, keep the popup open.
+                                Rectangle {
+                                    width: 24px; y: (parent.height - self.height) / 2; height: 24px;
+                                    border-radius: Theme.radius-sm;
+                                    background: hcopy.has-hover ? Theme.bg-elevated : transparent;
+                                    hcopy := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.copy-text(h); }
+                                    }
+                                    Text { text: "\u{E14D}"; font-family: "Material Icons";
+                                           color: Theme.text-secondary; font-size: Theme.fs-sm;
+                                           horizontal-alignment: center; vertical-alignment: center; }
+                                }
+                                // Delete (×) — remove this entry.
+                                Rectangle {
+                                    width: 24px; y: (parent.height - self.height) / 2; height: 24px;
+                                    border-radius: Theme.radius-sm;
+                                    background: hdel.has-hover ? Theme.danger.with-alpha(0.18) : transparent;
+                                    hdel := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.delete-history(i); }
+                                    }
+                                    Text { text: "\u{E872}"; font-family: "Material Icons";
+                                           color: Theme.danger; font-size: Theme.fs-sm;
+                                           horizontal-alignment: center; vertical-alignment: center; }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- Drag handle ----------------------------------------------------
+        Rectangle {
+            height: 4px;
+            background: divider-ta.has-hover || root.sftp-dragging
+                ? Theme.accent
+                : Theme.border-subtle;
+
+            divider-ta := TouchArea {
+                mouse-cursor: row-resize;
+
+                pointer-event(ev) => {
+                    if (ev.kind == PointerEventKind.down) {
+                        root.sftp-dragging      = true;
+                        root.drag-start-mouse-y = self.mouse-y;
+                    } else if (ev.kind == PointerEventKind.up) {
+                        root.sftp-dragging = false;
+                        root.persist-sftp-panel-layout(root.sftp-panel-height, root.sftp-saved-height, root.sftp-collapsed,
+                            root.sftp-tree-width,
+                            root.sftp-col-name-width, root.sftp-col-size-width, root.sftp-col-type-width,
+                            root.sftp-col-modified-width, root.sftp-col-mode-width, root.sftp-col-owner-width);
+                    }
+                }
+
+                moved => {
+                    if (root.sftp-dragging) {
+                        root.sftp-collapsed = false; // dragging the handle un-collapses
+                        root.sftp-panel-height = clamp(
+                            root.sftp-panel-height + root.drag-start-mouse-y - self.mouse-y,
+                            60px,
+                            root.height - 24px - 4px - 16px - 80px
+                        );
+                        root.sftp-saved-height = root.sftp-panel-height;
+                    }
+                }
+            }
+        }
+
+        // --- SFTP panel -----------------------------------------------------
+        SftpPanel {
+            height: root.sftp-panel-height;
+            collapsed:     root.sftp-collapsed;
+            tree-width: root.sftp-tree-width;
+            col-name-width: root.sftp-col-name-width;
+            col-size-width: root.sftp-col-size-width;
+            col-type-width: root.sftp-col-type-width;
+            col-modified-width: root.sftp-col-modified-width;
+            col-mode-width: root.sftp-col-mode-width;
+            col-owner-width: root.sftp-col-owner-width;
+            sort-column: root.sftp-sort-column;
+            sort-ascending: root.sftp-sort-ascending;
+            current-path:  root.sftp-path;
+            entries:       root.sftp-entries;
+            status:        root.sftp-status;
+            loading:       root.sftp-loading;
+            tree-nodes:    root.sftp-tree-nodes;
+            toggle-collapsed => {
+                if (root.sftp-collapsed) {
+                    // Restore to the saved height.
+                    root.sftp-panel-height = root.sftp-saved-height;
+                    root.sftp-collapsed = false;
+                    root.persist-sftp-panel-layout(root.sftp-panel-height, root.sftp-saved-height, root.sftp-collapsed,
+                        root.sftp-tree-width,
+                        root.sftp-col-name-width, root.sftp-col-size-width, root.sftp-col-type-width,
+                        root.sftp-col-modified-width, root.sftp-col-mode-width, root.sftp-col-owner-width);
+                } else {
+                    // Minimise: remember the height, shrink to the toolbar (30px).
+                    root.sftp-saved-height = root.sftp-panel-height;
+                    root.sftp-panel-height = 30px;
+                    root.sftp-collapsed = true;
+                    root.persist-sftp-panel-layout(root.sftp-panel-height, root.sftp-saved-height, root.sftp-collapsed,
+                        root.sftp-tree-width,
+                        root.sftp-col-name-width, root.sftp-col-size-width, root.sftp-col-type-width,
+                        root.sftp-col-modified-width, root.sftp-col-mode-width, root.sftp-col-owner-width);
+                }
+            }
+            navigate(path)      => { root.sftp-navigate(path); }
+            download(path)      => { root.sftp-download(path); }
+            upload-clicked(dir, folder) => { root.sftp-upload-clicked(dir, folder); }
+            refresh(path)       => { root.sftp-refresh(path); }
+            tree-expand(path)   => { root.sftp-tree-expand(path); }
+            delete(path)        => { root.sftp-delete(path); }
+            view(path)          => { root.sftp-view(path); }
+            edit(path)          => { root.sftp-edit(path); }
+            open-external(path) => { root.sftp-open-external(path); }
+            edit-external(path) => { root.sftp-edit-external(path); }
+            configure-external-editor() => { root.sftp-configure-external-editor(); }
+            sort-request(column) => {
+                root.sftp-sort-column = self.sort-column;
+                root.sftp-sort-ascending = self.sort-ascending;
+                root.sftp-sort-request(column, self.sort-ascending);
+            }
+            persist-layout() => {
+                root.sftp-tree-width = self.tree-width;
+                root.sftp-col-name-width = self.col-name-width;
+                root.sftp-col-size-width = self.col-size-width;
+                root.sftp-col-type-width = self.col-type-width;
+                root.sftp-col-modified-width = self.col-modified-width;
+                root.sftp-col-mode-width = self.col-mode-width;
+                root.sftp-col-owner-width = self.col-owner-width;
+                root.persist-sftp-panel-layout(root.sftp-panel-height, root.sftp-saved-height, root.sftp-collapsed,
+                    root.sftp-tree-width,
+                    root.sftp-col-name-width, root.sftp-col-size-width, root.sftp-col-type-width,
+                    root.sftp-col-modified-width, root.sftp-col-mode-width, root.sftp-col-owner-width);
+            }
+            rename-request(path, name) => { root.sftp-rename-request(path, name); }
+            chmod-request(path, name, mode) => { root.sftp-chmod-request(path, name, mode); }
+            copy-path(path)     => { root.sftp-copy-path(path); }
+            new-folder(dir)     => { root.sftp-new-folder(dir); }
+            new-file(dir)       => { root.sftp-new-file(dir); }
+        }
+    }
+}
