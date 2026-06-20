@@ -140,18 +140,24 @@ jobs:
 
             cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$CONTENTS/MacOS/${APP_NAME}"
 
-            # Generate .icns from the 512×512 PNG using sips + iconutil (both
+            # Re-encode the source icon to a clean PNG first. This avoids sips
+            # format confusion when the repo icon asset was regenerated or
+            # replaced on Windows and still has stale metadata.
+            APP_ICON_CANONICAL="${RUNNER_TEMP}/${APP_NAME}-icon.png"
+            sips -s format png "${APP_ICON_PNG}" --out "${APP_ICON_CANONICAL}" >/dev/null
+
+            # Generate .icns from the canonical PNG using sips + iconutil (both
             # ship with every macOS, no extra tooling needed in CI).
             mkdir -p "${APP_NAME}.iconset"
-            sips -z 16  16  "${APP_ICON_PNG}" --out "${APP_NAME}.iconset/icon_16x16.png"       >/dev/null
-            sips -z 32  32  "${APP_ICON_PNG}" --out "${APP_NAME}.iconset/icon_16x16@2x.png"    >/dev/null
-            sips -z 32  32  "${APP_ICON_PNG}" --out "${APP_NAME}.iconset/icon_32x32.png"        >/dev/null
-            sips -z 64  64  "${APP_ICON_PNG}" --out "${APP_NAME}.iconset/icon_32x32@2x.png"    >/dev/null
-            sips -z 128 128 "${APP_ICON_PNG}" --out "${APP_NAME}.iconset/icon_128x128.png"     >/dev/null
-            sips -z 256 256 "${APP_ICON_PNG}" --out "${APP_NAME}.iconset/icon_128x128@2x.png"  >/dev/null
-            sips -z 256 256 "${APP_ICON_PNG}" --out "${APP_NAME}.iconset/icon_256x256.png"     >/dev/null
-            sips -z 512 512 "${APP_ICON_PNG}" --out "${APP_NAME}.iconset/icon_256x256@2x.png"  >/dev/null
-            sips -z 512 512 "${APP_ICON_PNG}" --out "${APP_NAME}.iconset/icon_512x512.png"     >/dev/null
+            sips -z 16  16  "${APP_ICON_CANONICAL}" --out "${APP_NAME}.iconset/icon_16x16.png"       >/dev/null
+            sips -z 32  32  "${APP_ICON_CANONICAL}" --out "${APP_NAME}.iconset/icon_16x16@2x.png"    >/dev/null
+            sips -z 32  32  "${APP_ICON_CANONICAL}" --out "${APP_NAME}.iconset/icon_32x32.png"        >/dev/null
+            sips -z 64  64  "${APP_ICON_CANONICAL}" --out "${APP_NAME}.iconset/icon_32x32@2x.png"    >/dev/null
+            sips -z 128 128 "${APP_ICON_CANONICAL}" --out "${APP_NAME}.iconset/icon_128x128.png"     >/dev/null
+            sips -z 256 256 "${APP_ICON_CANONICAL}" --out "${APP_NAME}.iconset/icon_128x128@2x.png"  >/dev/null
+            sips -z 256 256 "${APP_ICON_CANONICAL}" --out "${APP_NAME}.iconset/icon_256x256.png"     >/dev/null
+            sips -z 512 512 "${APP_ICON_CANONICAL}" --out "${APP_NAME}.iconset/icon_256x256@2x.png"  >/dev/null
+            sips -z 512 512 "${APP_ICON_CANONICAL}" --out "${APP_NAME}.iconset/icon_512x512.png"     >/dev/null
             iconutil -c icns "${APP_NAME}.iconset" -o "$CONTENTS/Resources/${APP_NAME}.icns"
 
             # Substitute __VERSION__ placeholder (strip leading 'v' from tag)
