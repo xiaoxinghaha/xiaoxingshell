@@ -257,16 +257,3 @@ jobs:
         with:
           files: ${{ env.MSI }}
           fail_on_unmatched_files: false
-
-permissions:
-  contents: write
-
-- name: Upload Release Assets
-  uses: softprops/action-gh-release@v2
-  with:
-    tag_name: v1.0.0
-    files: |
-      dist/*.exe
-      dist/*
-  env:
-    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
