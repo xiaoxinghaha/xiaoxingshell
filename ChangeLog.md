@@ -186,8 +186,78 @@
 - `src/config.rs`
 - `src/app.rs`
 
+#### 4. 优化“本地输入优化”的会话级状态与控制键处理
+
+- 默认状态：
+  “本地输入优化”默认不再自动开启。
+- 会话记忆：
+  每个 SSH 会话会分别记住上次选择的本地输入优化开关状态，不再互相影响。
+- 控制键处理：
+  当本地输入优化开启时，按下 `Ctrl`、`Alt` 或 `Tab` 会先把本地缓冲文字交还给远端，然后本次按键进入直连模式。
+- 修复：
+  解决在本地输入优化模式下输入文字后按 `Ctrl+U`、`Tab` 等按键时，提示符内容被本地乐观渲染误删或显示异常的问题。
+- 交互命令：
+  对 `python`、`passwd`、`mysql`、`less`、`more`、`vim` 等交互式命令加入直连白名单，执行这些命令后会保持直连模式直到下一个 shell prompt。
+- UI 修复：
+  侧栏“本地输入优化”的复选框改为受控自绘控件，修复一个会话勾选后其它会话视觉上也跟着勾选的问题。
+
+涉及文件：
+
+- `src/app.rs`
+- `src/config.rs`
+- `ui/sidebar.slint`
+- `ui/app.slint`
+
+#### 5. SFTP 支持“下载文件夹(zip)”高速下载
+
+- 新增：
+  SFTP 文件列表右键菜单中，在“下载”下方新增“下载文件夹(zip)”。
+- 实现：
+  对文件夹使用远端 `zip -r` 先生成临时压缩包，再通过 SFTP 下载单个 `文件夹.zip`，下载完成后会尝试删除远端临时 zip。
+- 效率：
+  避免大量小文件逐个 SFTP 下载带来的往返开销，适合文件数量很多的目录。
+- 错误提示：
+  如果远端没有安装 `zip` 命令，会提示“远端未安装 zip 命令”。
+- 错误提示：
+  如果远端磁盘空间不足或触发配额限制，会提示“远端磁盘空间不足,无法生成临时 zip”。
+- 保留兼容：
+  原有“下载”文件夹的递归逐文件下载逻辑仍然保留。
+
+涉及文件：
+
+- `ui/sftp_panel.slint`
+- `ui/terminal_view.slint`
+- `ui/app.slint`
+- `src/app.rs`
+- `src/sftp.rs`
+- `lang/zh/LC_MESSAGES/xiaoxingshell.po`
+- `lang/zh/LC_MESSAGES/meatshell.po`
+- `lang/en/LC_MESSAGES/xiaoxingshell.po`
+- `lang/en/LC_MESSAGES/meatshell.po`
+
+#### 6. 优化 SFTP 右键菜单与标签页视觉细节
+
+- 菜单翻译：
+  中文模式下，“Download folder (zip)”现在显示为“下载文件夹(zip)”。
+- 菜单布局：
+  SFTP 右键菜单加宽，并为菜单文字增加省略处理，避免英文长菜单项超出边框。
+- 标签页：
+  标签页中的状态圆点、标题文字和关闭按钮整体上移 `2px`，视觉上更接近垂直居中。
+
+涉及文件：
+
+- `ui/sftp_panel.slint`
+- `ui/tabs.slint`
+- `lang/zh/LC_MESSAGES/xiaoxingshell.po`
+- `lang/zh/LC_MESSAGES/meatshell.po`
+- `lang/en/LC_MESSAGES/xiaoxingshell.po`
+- `lang/en/LC_MESSAGES/meatshell.po`
+
 ### 验证情况
 
 - 已完成 `cargo check`
 - 已完成 `cargo test config::tests -- --nocapture`
+- 已完成 `cargo test key_tests -- --nocapture`
+- 已完成 `cargo test sanitize_tests -- --nocapture`
+- 已完成本地输入优化相关单元测试
 - 编译与配置相关测试通过

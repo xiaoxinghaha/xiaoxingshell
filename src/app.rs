@@ -847,6 +847,7 @@ pub fn run() -> Result<()> {
         let weak = window.as_weak();
         let handles = handles.clone();
         let bufs = bufs.clone();
+        let store = store.clone();
         let statuses = tab_statuses.clone();
         let local = local_snap.clone();
         let net = local_net_hist.clone();
@@ -873,18 +874,23 @@ pub fn run() -> Result<()> {
                     None
                 } else {
                     buf.lock_local_input_until_prompt();
-                    if buf.local_line.is_empty() {
-                        None
-                    } else {
-                        let flush = std::mem::take(&mut buf.local_line);
-                        buf.local_line_cells = 0;
-                        buf.local_cursor_chars = 0;
-                        buf.local_cursor_cells = 0;
-                        buf.suppress_echo = flush.clone();
-                        Some(flush.into_bytes())
-                    }
+                    buf.handoff_local_line_to_remote()
+                        .map(|line| line.into_bytes())
                 }
             };
+
+            if let Some(session_id) = statuses
+                .lock()
+                .ok()
+                .and_then(|m| m.get(&active).map(|st| st.session_id.clone()))
+            {
+                let mut s = store.borrow_mut();
+                if let Some(mut sess) = s.get(&session_id).cloned() {
+                    sess.ui_state.local_input_optimization = enabled;
+                    s.upsert(sess);
+                    let _ = s.save();
+                }
+            }
 
             if let Some(bytes) = queued {
                 if let Some(handle) = handles.borrow().get(active.as_str()) {
@@ -2301,6 +2307,8 @@ fn wire_session_callbacks(
             // Serial / Telnet have no SFTP side-channel.
             let has_sftp = session.kind == SessionKind::Ssh;
             let local_buffer_enabled = session.kind == SessionKind::Ssh;
+            let local_buffer_preferred = local_buffer_enabled
+                && session.ui_state.local_input_optimization;
 
             // Seed the per-tab status so the sidebar shows "连接中 host" the
             // moment this tab becomes active (the `changed active-tab-id`
@@ -2369,7 +2377,7 @@ fn wire_session_callbacks(
                     local_cursor_chars: 0,
                     local_cursor_cells: 0,
                     local_buffer_enabled,
-                    local_buffer_preferred: local_buffer_enabled,
+                    local_buffer_preferred,
                     local_prompt_ready: false,
                     local_passthrough_until_prompt: false,
                     suppress_echo: String::new(),
@@ -3339,6 +3347,16 @@ fn apply_session_event_to_window(
             );
         }
         SessionEvent::CommandRan(cmd) => {
+            if should_force_passthrough_for_command(&cmd) {
+                if let Ok(mut map) = bufs.lock() {
+                    if let Some(buf) = map.get_mut(tab_id) {
+                        buf.lock_local_input_until_prompt();
+                    }
+                }
+                if win.get_active_tab_id().as_str() == tab_id {
+                    refresh_sidebar(win, statuses, local, local_net_hist, bufs);
+                }
+            }
             // A command typed directly in the terminal, captured via the shell
             // hook (#113). Record it in the same command-box history, reusing the
             // de-dup/move-to-end logic, and refresh the model.
@@ -3737,6 +3755,11 @@ fn wire_tab_callbacks(
                 {
                     let mut s = store.borrow_mut();
                     if let Some(mut sess) = s.get(&session_id).cloned() {
+                        let local_input_optimization = bufs
+                            .lock()
+                            .ok()
+                            .and_then(|m| m.get(&id).map(|buf| buf.local_buffer_preferred))
+                            .unwrap_or(sess.ui_state.local_input_optimization);
                         sess.ui_state.sftp_panel_height = w.get_sftp_panel_height() as u32;
                         sess.ui_state.sftp_saved_height = w.get_sftp_saved_height() as u32;
                         sess.ui_state.sftp_collapsed = w.get_sftp_collapsed();
@@ -3748,6 +3771,7 @@ fn wire_tab_callbacks(
                             w.get_sftp_col_modified_width() as u32;
                         sess.ui_state.sftp_col_mode_width = w.get_sftp_col_mode_width() as u32;
                         sess.ui_state.sftp_col_owner_width = w.get_sftp_col_owner_width() as u32;
+                        sess.ui_state.local_input_optimization = local_input_optimization;
                         s.upsert(sess);
                         let _ = s.save();
                     }
@@ -3959,6 +3983,49 @@ fn wire_sftp_callbacks(
                 }
             });
         });
+    }
+    {
+        let sftp_handles = sftp_handles.clone();
+        let weak = window.as_weak();
+        window.on_sftp_download_folder_zip(
+            move |tab_id: SharedString, remote_path: SharedString| {
+                let tab_id = tab_id.to_string();
+                let remote_path = remote_path.to_string();
+                let (preset, always_ask) = weak
+                    .upgrade()
+                    .map(|w| {
+                        (
+                            w.get_download_dir().to_string(),
+                            w.get_download_always_ask(),
+                        )
+                    })
+                    .unwrap_or_default();
+                if !always_ask && !preset.is_empty() {
+                    if let Ok(handles) = sftp_handles.lock() {
+                        if let Some(h) = handles.get(&tab_id) {
+                            h.download_dir_zip(remote_path, preset);
+                            if let Some(w) = weak.upgrade() {
+                                w.set_download_open(true);
+                            }
+                        }
+                    }
+                    return;
+                }
+                let sftp_handles = sftp_handles.clone();
+                let weak = weak.clone();
+                std::thread::spawn(move || {
+                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                        let local_dir = dir.to_string_lossy().to_string();
+                        if let Ok(handles) = sftp_handles.lock() {
+                            if let Some(h) = handles.get(&tab_id) {
+                                h.download_dir_zip(remote_path, local_dir);
+                            }
+                        }
+                        let _ = weak.upgrade_in_event_loop(|w| w.set_download_open(true));
+                    }
+                });
+            },
+        );
     }
     {
         let sftp_handles = sftp_handles.clone();
@@ -4560,7 +4627,8 @@ fn wire_key_input(
                             b.local_cursor_chars = 0;
                             b.local_cursor_cells = 0;
                             b.local_buffer_enabled = session.kind == SessionKind::Ssh;
-                            b.local_buffer_preferred = b.local_buffer_enabled;
+                            b.local_buffer_preferred = b.local_buffer_enabled
+                                && session.ui_state.local_input_optimization;
                             b.local_prompt_ready = false;
                             b.local_passthrough_until_prompt = false;
                             b.suppress_echo.clear();
@@ -4789,28 +4857,19 @@ fn wire_key_input(
                 if let Some(buf) = map.get_mut(tid.as_str()) {
                     local_mode_was_active = buf.can_local_buffer_input();
                     if buf.can_local_buffer_input() {
-                        if key.as_str() == "\n" && !ctrl && !alt {
+                        if ctrl || alt || key.as_str() == "\t" {
+                            if let Some(flush) = buf.handoff_local_line_to_remote() {
+                                locally_queued_send = Some(flush.into_bytes());
+                                repaint_after_local = true;
+                            }
+                        } else if key.as_str() == "\n" && !ctrl && !alt {
                             if !buf.local_line.is_empty() {
-                                let committed = std::mem::take(&mut buf.local_line);
-                                buf.local_line_cells = 0;
-                                buf.local_cursor_chars = 0;
-                                buf.local_cursor_cells = 0;
+                                let committed = buf.take_local_line();
                                 buf.commit_local_line_optimistically(&committed);
                                 buf.suppress_echo = format!("{}\r", committed);
                                 locally_queued_send = Some(committed.into_bytes());
                                 repaint_after_local = true;
                                 consume_locally = true;
-                            }
-                        } else if key.as_str() == "\t" && !ctrl && !alt {
-                            if !buf.local_line.is_empty() {
-                                let flush = std::mem::take(&mut buf.local_line);
-                                buf.local_line_cells = 0;
-                                buf.local_cursor_chars = 0;
-                                buf.local_cursor_cells = 0;
-                                buf.commit_local_line_optimistically(&flush);
-                                buf.suppress_echo = flush.clone();
-                                locally_queued_send = Some(flush.into_bytes());
-                                repaint_after_local = true;
                             }
                         } else if key.as_str() == "\u{0008}" && !ctrl && !alt {
                             if buf.backspace_local_char() {
@@ -4834,11 +4893,7 @@ fn wire_key_input(
                             repaint_after_local = true;
                             consume_locally = true;
                         } else if !buf.local_line.is_empty() {
-                            let flush = std::mem::take(&mut buf.local_line);
-                            buf.local_line_cells = 0;
-                            buf.local_cursor_chars = 0;
-                            buf.local_cursor_cells = 0;
-                            buf.suppress_echo = flush.clone();
+                            let flush = buf.handoff_local_line_to_remote().unwrap_or_default();
                             locally_queued_send = Some(flush.into_bytes());
                             repaint_after_local = true;
                         }
@@ -5878,6 +5933,52 @@ fn terminal_token_class(ch: char) -> u8 {
     }
 }
 
+fn should_force_passthrough_for_command(cmd: &str) -> bool {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let first = trimmed
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_matches(|c: char| c == '\'' || c == '"' || c == '`');
+    matches!(
+        first,
+        "python"
+            | "python2"
+            | "python3"
+            | "python3.9"
+            | "python3.11"
+            | "python3.12"
+            | "ipython"
+            | "bpython"
+            | "mysql"
+            | "psql"
+            | "sqlite3"
+            | "mongo"
+            | "redis-cli"
+            | "passwd"
+            | "sudo"
+            | "su"
+            | "ssh"
+            | "sftp"
+            | "ftp"
+            | "telnet"
+            | "less"
+            | "more"
+            | "man"
+            | "view"
+            | "vi"
+            | "vim"
+            | "nvim"
+            | "top"
+            | "htop"
+            | "btop"
+            | "watch"
+    )
+}
+
 impl TermBuffer {
     fn clear_local_input(&mut self) {
         self.local_line.clear();
@@ -5885,6 +5986,22 @@ impl TermBuffer {
         self.local_cursor_chars = 0;
         self.local_cursor_cells = 0;
         self.suppress_echo.clear();
+    }
+
+    fn take_local_line(&mut self) -> String {
+        let line = std::mem::take(&mut self.local_line);
+        self.local_line_cells = 0;
+        self.local_cursor_chars = 0;
+        self.local_cursor_cells = 0;
+        line
+    }
+
+    fn handoff_local_line_to_remote(&mut self) -> Option<String> {
+        if self.local_line.is_empty() {
+            return None;
+        }
+        let line = self.take_local_line();
+        Some(line)
     }
 
     fn lock_local_input_until_prompt(&mut self) {
@@ -6918,7 +7035,7 @@ mod selection_tests {
             local_cursor_chars: 0,
             local_cursor_cells: 0,
             local_buffer_enabled: true,
-            local_buffer_preferred: true,
+            local_buffer_preferred: false,
             local_prompt_ready: false,
             local_passthrough_until_prompt: false,
             suppress_echo: String::new(),
@@ -7008,5 +7125,34 @@ mod selection_tests {
         assert_eq!(buf.extract_selection_text(), "second");
         buf.select_line_at(3);
         assert_eq!(buf.extract_selection_text(), "third");
+    }
+
+    #[test]
+    fn handoff_local_line_keeps_remote_echo_visible() {
+        let mut buf = make_buf(5, 40, &[], &["root@host:~# "], 0);
+        buf.local_prompt_ready = true;
+        for ch in "abc".chars() {
+            buf.insert_local_char(ch);
+        }
+
+        assert_eq!(buf.handoff_local_line_to_remote().as_deref(), Some("abc"));
+        assert!(buf.local_line.is_empty());
+        assert!(buf.suppress_echo.is_empty());
+    }
+
+    #[test]
+    fn optimistic_enter_suppresses_committed_echo_only() {
+        let mut buf = make_buf(5, 40, &[], &["root@host:~# "], 0);
+        buf.local_prompt_ready = true;
+        for ch in "pwd".chars() {
+            buf.insert_local_char(ch);
+        }
+
+        let committed = buf.take_local_line();
+        buf.commit_local_line_optimistically(&committed);
+        buf.suppress_echo = format!("{}\r", committed);
+
+        assert!(buf.local_line.is_empty());
+        assert_eq!(buf.suppress_echo, "pwd\r");
     }
 }

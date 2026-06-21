@@ -226,7 +226,7 @@ export component AppWindow inherits Window {
     in property <[DiskInfo]> disks;         // active tab's filesystem usage
     in property <string> app-version;       // from Rust: env!("CARGO_PKG_VERSION")
     in property <bool> local-input-toggle-visible;
-    in-out property <bool> local-input-optimization-enabled: false;
+    in property <bool> local-input-optimization-enabled: false;
     in property <bool> local-input-optimization-active;
     in property <string> local-input-status-text;
     callback select-net-iface(string);
@@ -476,6 +476,7 @@ export component AppWindow inherits Window {
     callback sftp-navigate(string /* tab-id */, string /* path */);
     // Trigger a download: Rust opens a save-folder dialog then transfers.
     callback sftp-download(string /* tab-id */, string /* remote-path */);
+    callback sftp-download-folder-zip(string /* tab-id */, string /* remote-path */);
     callback sftp-download-range(string /* tab-id */, int /* start */, int /* end */);
     // Trigger an upload: Rust opens a file-picker dialog then transfers.
     callback sftp-upload-clicked(string /* tab-id */, string /* remote-dir */, bool /* folder */);
@@ -669,7 +670,6 @@ export component AppWindow inherits Window {
                     local-input-status-text: root.local-input-status-text;
                     select-net-iface(i) => { root.select-net-iface(i); }
                     set-local-input-optimization(v) => {
-                        root.local-input-optimization-enabled = v;
                         root.set-local-input-optimization(v);
                     }
                     copy-connection-address() => { root.copy-connection-address(); }
@@ -831,6 +831,7 @@ export component AppWindow inherits Window {
                             terminal-resize(w, h) => { root.terminal-resize(term.id, w, h) }
                             sftp-navigate(path) => { root.sftp-navigate(term.id, path); }
                             sftp-download(path) => { root.sftp-download(term.id, path); }
+                            sftp-download-folder-zip(path) => { root.sftp-download-folder-zip(term.id, path); }
                             sftp-download-range(start, end) => { root.sftp-download-range(term.id, start, end); }
                             sftp-upload-clicked(dir, folder) => { root.sftp-upload-clicked(term.id, dir, folder); }
                             sftp-refresh(path) => { root.sftp-refresh(term.id, path); }

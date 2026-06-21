@@ -125,6 +125,7 @@ export component TerminalView inherits Rectangle {
     callback terminal-resize(float, float);
     callback sftp-navigate(string);
     callback sftp-download(string);
+    callback sftp-download-folder-zip(string);
     callback sftp-download-range(int, int);
     callback sftp-upload-clicked(string, bool);
     callback sftp-refresh(string);
@@ -1097,6 +1098,7 @@ export component TerminalView inherits Rectangle {
             }
             navigate(path)      => { root.sftp-navigate(path); }
             download(path)      => { root.sftp-download(path); }
+            download-folder-zip(path) => { root.sftp-download-folder-zip(path); }
             download-range(start, end) => { root.sftp-download-range(start, end); }
             upload-clicked(dir, folder) => { root.sftp-upload-clicked(dir, folder); }
             refresh(path)       => { root.sftp-refresh(path); }

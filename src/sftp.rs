@@ -20,6 +20,7 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
 use russh::client::{self, Handler};
+use russh::ChannelMsg;
 use russh::keys::key::PrivateKeyWithHashAlg;
 use russh::keys::load_secret_key;
 use russh::Disconnect;
@@ -52,6 +53,8 @@ pub enum SftpCommand {
     ToggleTreeNode(String),
     /// Download a remote file to a local directory.
     Download { remote: String, local_dir: String },
+    /// Ask the remote host to zip a directory, then download that one archive.
+    DownloadDirZip { remote: String, local_dir: String },
     /// Upload a local file into a remote directory.
     Upload { local: String, remote_dir: String },
     /// Upload a local file to an exact remote file path.
@@ -98,6 +101,11 @@ impl SftpHandle {
         let _ = self
             .commands
             .send(SftpCommand::Download { remote, local_dir });
+    }
+    pub fn download_dir_zip(&self, remote: String, local_dir: String) {
+        let _ = self
+            .commands
+            .send(SftpCommand::DownloadDirZip { remote, local_dir });
     }
     pub fn cancel_transfer(&self, id: &str) {
         if let Ok(mut cancelled) = self.cancelled_transfers.lock() {
@@ -522,6 +530,86 @@ async fn run_sftp(
                                 t("下载失败", "Download failed")
                             )));
                         }
+                    }
+                }
+            }
+
+            SftpCommand::DownloadDirZip { remote, local_dir } => {
+                let dirname = sanitize_filename(&base_name(&remote));
+                let zip_name = format!("{dirname}.zip");
+                let local_path = format!("{}/{}", local_dir.trim_end_matches('/'), zip_name);
+                let id = Uuid::new_v4().to_string();
+                let is_dir = sftp
+                    .metadata(&remote)
+                    .await
+                    .ok()
+                    .map(|m| (m.permissions.unwrap_or(0) & 0o170_000) == 0o040_000)
+                    .unwrap_or(false);
+                if !is_dir {
+                    let msg = t("目标不是文件夹", "target is not a folder");
+                    emit_transfer(
+                        &events,
+                        &id,
+                        &session.id,
+                        &zip_name,
+                        &local_path,
+                        &remote,
+                        false,
+                        0,
+                        0,
+                        2,
+                        &msg,
+                    );
+                    let _ = events.send(SessionEvent::SftpStatus(format!(
+                        "{}: {msg}",
+                        t("下载失败", "Download failed")
+                    )));
+                    continue;
+                }
+
+                let _ = events.send(SessionEvent::SftpStatus(format!(
+                    "{} {}...",
+                    t("正在远端打包", "Creating remote zip"),
+                    zip_name
+                )));
+                match download_dir_as_remote_zip(
+                    &handle,
+                    &sftp,
+                    &ui_tab_id,
+                    &remote,
+                    &local_path,
+                    &zip_name,
+                    &id,
+                    &events,
+                    &cancelled_transfers,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        let _ = events.send(SessionEvent::SftpStatus(format!(
+                            "{}: {}",
+                            t("下载完成", "Downloaded"),
+                            zip_name
+                        )));
+                    }
+                    Err(e) => {
+                        emit_transfer(
+                            &events,
+                            &id,
+                            &session.id,
+                            &zip_name,
+                            &local_path,
+                            &remote,
+                            false,
+                            0,
+                            0,
+                            2,
+                            &e.to_string(),
+                        );
+                        let _ = events.send(SessionEvent::SftpStatus(format!(
+                            "{}: {e}",
+                            t("下载失败", "Download failed")
+                        )));
                     }
                 }
             }
@@ -1070,6 +1158,13 @@ fn parent_dir(path: &str) -> String {
         Some(0) | None => "/".to_string(),
         Some(i) => p[..i].to_string(),
     }
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 /// Open a local file with the OS default application.
@@ -1668,6 +1763,122 @@ async fn download_dir(
     Ok(())
 }
 
+async fn download_dir_as_remote_zip(
+    handle: &client::Handle<SftpClientHandler>,
+    sftp: &SftpSession,
+    tab_id: &str,
+    remote_dir: &str,
+    local_zip: &str,
+    zip_name: &str,
+    id: &str,
+    events: &UnboundedSender<SessionEvent>,
+    cancelled_transfers: &Arc<Mutex<HashSet<String>>>,
+) -> Result<()> {
+    let remote_dir = remote_dir.trim_end_matches('/');
+    let remote_parent = parent_dir(remote_dir);
+    let remote_name = base_name(remote_dir);
+    let remote_zip = format!(
+        "/tmp/meatshell-{}-{}.zip",
+        sanitize_filename(&remote_name),
+        Uuid::new_v4()
+    );
+    let cmd = format!(
+        "PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; command -v zip >/dev/null 2>&1 || {{ echo 'zip command not found' >&2; exit 127; }}; cd {} && rm -f {} && zip -qry {} {}",
+        shell_quote(&remote_parent),
+        shell_quote(&remote_zip),
+        shell_quote(&remote_zip),
+        shell_quote(&remote_name),
+    );
+
+    if let Err(err) = run_remote_exec(handle, &cmd).await {
+        let _ = sftp.remove_file(&remote_zip).await;
+        return Err(err);
+    }
+
+    let result = download_impl(
+        sftp,
+        tab_id,
+        &remote_zip,
+        local_zip,
+        zip_name,
+        id,
+        events,
+        cancelled_transfers,
+    )
+    .await;
+    let _ = sftp.remove_file(&remote_zip).await;
+    result
+}
+
+async fn run_remote_exec(handle: &client::Handle<SftpClientHandler>, cmd: &str) -> Result<()> {
+    let mut channel = handle
+        .channel_open_session()
+        .await
+        .context("open remote exec channel")?;
+    channel
+        .exec(true, cmd.as_bytes())
+        .await
+        .context("start remote exec")?;
+
+    let mut stderr = String::new();
+    let mut exit_status: Option<u32> = None;
+    while let Some(msg) = channel.wait().await {
+        match msg {
+            ChannelMsg::ExtendedData { data, ext: _ } => {
+                stderr.push_str(&String::from_utf8_lossy(&data));
+            }
+            ChannelMsg::Data { data } => {
+                tracing::debug!("remote exec stdout: {}", String::from_utf8_lossy(&data));
+            }
+            ChannelMsg::ExitStatus { exit_status: code } => {
+                exit_status = Some(code);
+            }
+            ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+
+    match exit_status {
+        Some(0) => Ok(()),
+        Some(code) => Err(anyhow!(remote_zip_error_message(code, &stderr))),
+        None => {
+            let detail = stderr.trim();
+            if detail.is_empty() {
+                Err(anyhow!(t(
+                    "远端打包失败: 未收到退出状态",
+                    "remote zip failed: no exit status received"
+                )))
+            } else {
+                Err(anyhow!(remote_zip_error_message(255, detail)))
+            }
+        }
+    }
+}
+
+fn remote_zip_error_message(code: u32, stderr: &str) -> String {
+    let detail = stderr.trim();
+    let lower = detail.to_ascii_lowercase();
+    if code == 127 || lower.contains("zip command not found") {
+        return t("远端未安装 zip 命令", "remote zip command is not installed").to_string();
+    }
+    if lower.contains("no space left on device")
+        || lower.contains("enospc")
+        || lower.contains("disk quota exceeded")
+        || lower.contains("quota exceeded")
+    {
+        return t(
+            "远端磁盘空间不足,无法生成临时 zip",
+            "remote disk is full; cannot create temporary zip",
+        )
+        .to_string();
+    }
+    if detail.is_empty() {
+        format!("remote zip failed with exit code {code}")
+    } else {
+        format!("remote zip failed with exit code {code}: {detail}")
+    }
+}
+
 /// Recursively remove a remote directory tree (#50 follow-up).
 ///
 /// A plain `remove_dir` only deletes an *empty* directory, so deleting an
@@ -1947,7 +2158,7 @@ const _: fn() = || {
 
 #[cfg(test)]
 mod sanitize_tests {
-    use super::sanitize_filename;
+    use super::{remote_zip_error_message, sanitize_filename, shell_quote};
 
     #[test]
     fn plain_names_pass_through() {
@@ -2002,5 +2213,25 @@ mod sanitize_tests {
         assert_eq!(sanitize_filename(""), "file");
         assert_eq!(sanitize_filename("   "), "file");
         assert_eq!(sanitize_filename("..."), "file");
+    }
+
+    #[test]
+    fn shell_quote_handles_spaces_and_quotes() {
+        assert_eq!(shell_quote("/tmp/a b"), "'/tmp/a b'");
+        assert_eq!(shell_quote("it's"), "'it'\"'\"'s'");
+        assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn remote_zip_errors_are_human_readable() {
+        assert!(remote_zip_error_message(127, "zip command not found").contains("zip"));
+        assert!(
+            remote_zip_error_message(3, "zip I/O error: No space left on device")
+                .contains("磁盘空间不足")
+        );
+        assert!(
+            remote_zip_error_message(3, "Disk quota exceeded")
+                .contains("磁盘空间不足")
+        );
     }
 }

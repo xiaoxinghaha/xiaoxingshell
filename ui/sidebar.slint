@@ -1,6 +1,5 @@
 import { Theme } from "theme.slint";
 import { Sparkline } from "widgets.slint";
-import { CheckBox } from "std-widgets.slint";
 
 // One filesystem row for the disk-usage panel.
 export struct DiskInfo {
@@ -217,7 +216,7 @@ export component Sidebar inherits Rectangle {
     // always matches Cargo.toml without hand-editing this file.
     in property <string> app-version;
     in property <bool> local-input-toggle-visible: false;
-    in-out property <bool> local-input-optimization-enabled: false;
+    in property <bool> local-input-optimization-enabled: false;
     in property <bool> local-input-optimization-active: false;
     in property <string> local-input-status-text: "";
     callback select-net-iface(string);
@@ -306,26 +305,64 @@ export component Sidebar inherits Rectangle {
 
         Rectangle { height: 1px; background: Theme.border-subtle; }
 
-        if root.local-input-toggle-visible : VerticalLayout {
-            spacing: 6px;
+        if root.local-input-toggle-visible : Rectangle {
+            height: 75px;
 
-            HorizontalLayout {
-                spacing: 8px;
+            VerticalLayout {
+                spacing: 6px;
 
-                CheckBox {
-                    text: @tr("本地输入优化");
-                    checked <=> root.local-input-optimization-enabled;
-                    toggled => { root.set-local-input-optimization(self.checked); }
+                Rectangle {
+                    height: 22px;
+
+                    HorizontalLayout {
+                        spacing: 8px;
+
+                        Rectangle {
+                            width: 18px;
+                            height: 18px;
+                            border-radius: 2px;
+                            border-width: 1px;
+                            border-color: root.local-input-optimization-enabled ? Theme.accent : Theme.border-strong;
+                            background: root.local-input-optimization-enabled ? Theme.accent : transparent;
+                            vertical-stretch: 0;
+
+                            Text {
+                                visible: root.local-input-optimization-enabled;
+                                text: "\u{E5CA}";
+                                font-family: "Material Icons";
+                                color: white;
+                                font-size: 14px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                width: parent.width;
+                                height: parent.height;
+                            }
+                        }
+
+                        Text {
+                            text: @tr("本地输入优化");
+                            color: Theme.text-primary;
+                            font-size: Theme.fs-sm;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            root.set-local-input-optimization(!root.local-input-optimization-enabled);
+                        }
+                    }
                 }
-            }
 
-            Text {
-                text: root.local-input-status-text;
-                color: root.local-input-optimization-active ? Theme.success : Theme.text-primary;
-                font-size: Theme.fs-xs;
-            }
+                Text {
+                    text: root.local-input-status-text;
+                    color: root.local-input-optimization-active ? Theme.success : Theme.text-primary;
+                    font-size: Theme.fs-xs;
+                }
 
-            Rectangle { height: 1px; background: Theme.border-subtle; }
+                Rectangle { height: 1px; background: Theme.border-subtle; }
+            }
         }
 
         // System stats — local machine on the welcome tab, the remote server

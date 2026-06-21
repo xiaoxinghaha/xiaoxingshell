@@ -150,6 +150,9 @@ msgstr "Empty directory"
 msgid "Download"
 msgstr "Download"
 
+msgid "Download folder (zip)"
+msgstr "Download folder (zip)"
+
 msgid "Update available:"
 msgstr "Update available:"
 

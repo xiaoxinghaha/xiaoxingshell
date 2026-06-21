@@ -248,6 +248,9 @@ pub struct SessionUiState {
     pub sftp_col_mode_width: u32,
     #[serde(default)]
     pub sftp_col_owner_width: u32,
+    /// Per-session preference for SSH local input optimization. Defaults off.
+    #[serde(default)]
+    pub local_input_optimization: bool,
 }
 
 impl Session {

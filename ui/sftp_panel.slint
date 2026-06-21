@@ -40,11 +40,13 @@ component SftpMenuItem inherits Rectangle {
     }
     Text {
         x: 10px;
+        width: parent.width - 20px;
         text: root.label;
         color: root.enabled ? root.tint : Theme.text-muted;
         font-size: Theme.fs-sm;
         vertical-alignment: center;
         height: parent.height;
+        overflow: elide;
     }
 }
 
@@ -99,6 +101,7 @@ export component SftpPanel inherits Rectangle {
     callback toggle-collapsed();    // minimise / restore the panel
     callback navigate(string);
     callback download(string);
+    callback download-folder-zip(string);
     callback download-range(int, int);
     callback upload-clicked(string /* remote dir */, bool /* folder */);
     callback refresh(string);
@@ -1039,7 +1042,7 @@ export component SftpPanel inherits Rectangle {
                     file-menu := PopupWindow {
                         x: root.menu-x;
                         y: root.menu-y;
-                        width: 148px;
+                        width: 184px;
                         height: 13 * 27px + 8px;
                         Rectangle {
                             background: Theme.bg-panel;
@@ -1063,6 +1066,11 @@ export component SftpPanel inherits Rectangle {
                                             root.download(root.menu-target);
                                         }
                                     }
+                                }
+                                SftpMenuItem {
+                                    label: @tr("Download folder (zip)");
+                                    enabled: root.menu-target != "" && root.menu-target-is-dir;
+                                    clicked => { root.download-folder-zip(root.menu-target); }
                                 }
                                 SftpMenuItem {
                                     label: @tr("View");
