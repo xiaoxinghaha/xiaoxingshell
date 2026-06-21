@@ -10,6 +10,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Per-terminal state: vt100 parser drives all rendering for both normal
 /// (bash) and alt-screen (vim/nano/htop) modes.
@@ -458,6 +459,27 @@ pub fn run() -> Result<()> {
     window.set_term_fonts(ModelRc::from(Rc::new(VecModel::from(
         system_monospace_fonts(),
     ))));
+
+    // Restore the last saved top-level window size/position when available.
+    // If there is no saved geometry yet, we keep the Slint defaults and center
+    // the window once it has a real size.
+    {
+        let s = store.borrow();
+        if let Some((x, y, width, height)) = s.window_geometry() {
+            window
+                .window()
+                .set_size(slint::PhysicalSize::new(width, height));
+            if let (Some(px), Some(py)) = (x, y) {
+                window
+                    .window()
+                    .set_position(slint::PhysicalPosition::new(px, py));
+            }
+        }
+        if s.window_maximized() {
+            window.window().set_maximized(true);
+            window.set_window_maximized(true);
+        }
+    }
 
     // Command bar (#55): seed quick commands + history from the config.
     window.set_quick_commands(quick_cmd_model(&store.borrow()));
@@ -1228,12 +1250,50 @@ pub fn run() -> Result<()> {
 
     // OS file drag-and-drop → upload to the active session's SFTP directory,
     // but only when the file is dropped over the file-list area.
+    let geometry_save_timer = Rc::new(RefCell::new(slint::Timer::default()));
+    let save_window_geometry: Rc<dyn Fn(&AppWindow)> = Rc::new({
+        let store = store.clone();
+        move |w: &AppWindow| {
+            let is_max = w.window().is_maximized();
+            let size = w.window().size();
+            let pos = w.window().position();
+            let mut s = store.borrow_mut();
+            s.set_window_maximized(is_max);
+            if !is_max && size.width > 0 && size.height > 0 {
+                s.set_window_geometry(Some(pos.x), Some(pos.y), size.width, size.height);
+            }
+            let _ = s.save();
+        }
+    });
+    let schedule_window_geometry_save = {
+        let weak = window.as_weak();
+        let timer = geometry_save_timer.clone();
+        let save_window_geometry = save_window_geometry.clone();
+        move || {
+            timer.borrow_mut().start(
+                slint::TimerMode::SingleShot,
+                Duration::from_millis(500),
+                {
+                    let weak = weak.clone();
+                    let save = save_window_geometry.clone();
+                    move || {
+                        if let Some(w) = weak.upgrade() {
+                            save(&w);
+                        }
+                    }
+                },
+            );
+        }
+    };
+
     {
         use i_slint_backend_winit::winit::event::WindowEvent as WEvent;
         use i_slint_backend_winit::EventResult;
         let weak = window.as_weak();
         let sh = sftp_handles.clone();
         let close_handles = handles.clone();
+        let schedule_save = schedule_window_geometry_save.clone();
+        let save_window_geometry = save_window_geometry.clone();
         window.window().on_winit_window_event(move |_w, event| {
             match event {
                 WEvent::DroppedFile(path) => {
@@ -1251,8 +1311,15 @@ pub fn run() -> Result<()> {
                             .unwrap_or(false);
                         win.set_window_maximized(maxed);
                     }
+                    schedule_save();
+                }
+                WEvent::Moved(_) => {
+                    schedule_save();
                 }
                 WEvent::CloseRequested => {
+                    if let Some(win) = weak.upgrade() {
+                        save_window_geometry(&win);
+                    }
                     // Confirm before closing if there are open session tabs (#88),
                     // so a stray double-click on the title-bar icon / X / Alt+F4
                     // doesn't silently drop live sessions. The confirm dialog's
@@ -1285,6 +1352,7 @@ pub fn run() -> Result<()> {
     }
     {
         let weak = window.as_weak();
+        let schedule_save = schedule_window_geometry_save.clone();
         window.on_win_maximize_toggle(move || {
             if let Some(w) = weak.upgrade() {
                 let now = w.window().with_winit_window(|ww| {
@@ -1295,14 +1363,17 @@ pub fn run() -> Result<()> {
                 if let Some(m) = now {
                     w.set_window_maximized(m);
                 }
+                schedule_save();
             }
         });
     }
     {
         let weak = window.as_weak();
         let close_handles = handles.clone();
+        let save = save_window_geometry.clone();
         window.on_win_close(move || {
             if let Some(w) = weak.upgrade() {
+                save(&w);
                 // Mirror the native-X behaviour: confirm if sessions are open.
                 if close_handles.borrow().is_empty() {
                     let _ = slint::quit_event_loop();
@@ -1344,13 +1415,24 @@ pub fn run() -> Result<()> {
         });
     }
 
-    // Center the window on the primary monitor once it's shown (size is only
-    // known after the first frame, so defer via a single-shot timer).
-    {
+    // First launch (no saved geometry yet) still starts centered.
+    if store.borrow().window_geometry().is_none() && !store.borrow().window_maximized() {
         let weak = window.as_weak();
-        slint::Timer::single_shot(std::time::Duration::from_millis(30), move || {
+        slint::Timer::single_shot(Duration::from_millis(30), move || {
             if let Some(w) = weak.upgrade() {
                 center_window(&w);
+            }
+        });
+    }
+
+    // One initial save after the first frame so a first-run centered window
+    // also gets persisted without waiting for the user to resize it.
+    {
+        let weak = window.as_weak();
+        let save = save_window_geometry.clone();
+        slint::Timer::single_shot(Duration::from_millis(120), move || {
+            if let Some(w) = weak.upgrade() {
+                save(&w);
             }
         });
     }

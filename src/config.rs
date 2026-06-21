@@ -286,6 +286,25 @@ pub struct QuickCommand {
     pub command: String,
 }
 
+/// Last non-minimized top-level window placement. Size is the client area
+/// (inner size) in physical pixels; position is the outer top-left in physical
+/// screen coordinates. On platforms that don't expose window positioning (for
+/// example some Wayland sessions), x/y may stay absent while width/height still
+/// restore correctly.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WindowState {
+    #[serde(default)]
+    pub x: Option<i32>,
+    #[serde(default)]
+    pub y: Option<i32>,
+    #[serde(default)]
+    pub width: u32,
+    #[serde(default)]
+    pub height: u32,
+    #[serde(default)]
+    pub maximized: bool,
+}
+
 /// On-disk layout. Keep additive to ease forward-compat.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ConfigFile {
@@ -348,6 +367,9 @@ pub struct ConfigFile {
     /// sessions (same path, falling back to each panel's current dir).
     #[serde(default)]
     pub sync_upload: bool,
+    /// Remember the main window's last placement so relaunch restores it.
+    #[serde(default)]
+    pub window_state: WindowState,
 }
 
 /// Portable export file (issue #46): sessions with everything in plaintext
@@ -744,6 +766,47 @@ impl ConfigStore {
 
     pub fn set_download_always_ask(&mut self, ask: bool) {
         self.cache.download_always_ask = ask;
+    }
+
+    /// Saved window placement. Returns `(x, y, width, height)` where x/y may be
+    /// absent on window systems that don't expose absolute positioning.
+    pub fn window_geometry(&self) -> Option<(Option<i32>, Option<i32>, u32, u32)> {
+        let ws = &self.cache.window_state;
+        if ws.width == 0 || ws.height == 0 {
+            None
+        } else {
+            Some((ws.x, ws.y, ws.width, ws.height))
+        }
+    }
+
+    pub fn window_maximized(&self) -> bool {
+        self.cache.window_state.maximized
+    }
+
+    pub fn set_window_geometry(
+        &mut self,
+        x: Option<i32>,
+        y: Option<i32>,
+        width: u32,
+        height: u32,
+    ) {
+        let ws = &mut self.cache.window_state;
+        if let Some(x) = x {
+            ws.x = Some(x);
+        }
+        if let Some(y) = y {
+            ws.y = Some(y);
+        }
+        if width > 0 {
+            ws.width = width;
+        }
+        if height > 0 {
+            ws.height = height;
+        }
+    }
+
+    pub fn set_window_maximized(&mut self, maximized: bool) {
+        self.cache.window_state.maximized = maximized;
     }
 
     // ── Session groups / folders (#41) ────────────────────────────────────

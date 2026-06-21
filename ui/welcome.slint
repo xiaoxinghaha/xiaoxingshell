@@ -18,6 +18,7 @@ export struct SessionInfo {
 // --- SessionRow ------------------------------------------------------------
 component SessionRow inherits Rectangle {
     in property <SessionInfo> session;
+    in property <bool> compact: false;
     callback connect();
     callback edit();
     callback duplicate();
@@ -27,7 +28,7 @@ component SessionRow inherits Rectangle {
     // "move to group" submenu can iterate it to list each group exactly once.
     in property <[SessionInfo]> all-sessions;
 
-    height: 36px;
+    height: root.compact ? 48px : 36px;
     border-radius: Theme.radius-sm;
     background: touch.has-hover ? Theme.bg-hover : transparent;
     animate background { duration: 120ms; }
@@ -176,7 +177,7 @@ component SessionRow inherits Rectangle {
             }
         }
 
-        Text {
+        if !root.compact : Text {
             text: session.name;
             color: Theme.text-primary;
             font-size: Theme.fs-md;
@@ -184,7 +185,7 @@ component SessionRow inherits Rectangle {
             width: 180px;
             overflow: elide;
         }
-        Text {
+        if !root.compact : Text {
             text: session.host + ":" + session.port;
             color: Theme.text-secondary;
             font-size: Theme.fs-sm;
@@ -192,12 +193,245 @@ component SessionRow inherits Rectangle {
             width: 180px;
             overflow: elide;
         }
-        Text {
+        if !root.compact : Text {
             text: session.user;
             color: Theme.text-secondary;
             font-size: Theme.fs-sm;
             vertical-alignment: center;
             horizontal-stretch: 1;
+        }
+
+        if root.compact : VerticalLayout {
+            spacing: 2px;
+            vertical-stretch: 1;
+            alignment: center;
+
+            Text {
+                text: session.name;
+                color: Theme.text-primary;
+                font-size: Theme.fs-md;
+                font-weight: 600;
+                overflow: elide;
+            }
+            Text {
+                text: session.user == ""
+                    ? (session.host + ":" + session.port)
+                    : (session.user + "@" + session.host + ":" + session.port);
+                color: Theme.text-secondary;
+                font-size: Theme.fs-sm;
+                overflow: elide;
+            }
+        }
+    }
+}
+
+export component SessionBrowser inherits Rectangle {
+    in property <[SessionInfo]> sessions;
+    in property <string> import-hint;        // result text after an import
+    in property <string> panel-title: @tr("Quick connect");
+    in property <bool> show-import-hint: true;
+    in property <bool> show-new-session: true;
+    in property <bool> compact-rows: false;
+    in-out property <length> scroll-y: 0px;
+    callback new-session();
+    callback import-ssh-config();
+    callback connect-session(string);
+    callback edit-session(string);
+    callback duplicate-session(string);
+    callback move-session(string /* id */, string /* group */);
+    callback toggle-group(string /* group */);
+    callback new-group();
+    callback edit-group(string /* current-name */);
+    callback delete-group(string /* name */);
+    callback remove-session(string);
+
+    background: Theme.bg-panel;
+    border-radius: Theme.radius-md;
+    border-width: 1px;
+    border-color: Theme.border-subtle;
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 12px;
+
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: root.panel-title;
+                color: Theme.text-primary;
+                font-size: Theme.fs-lg;
+                font-weight: 600;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            if root.show-import-hint : Text {
+                text: root.import-hint;
+                color: Theme.text-muted;
+                font-size: Theme.fs-sm;
+                vertical-alignment: center;
+            }
+            if root.show-new-session : PrimaryButton {
+                text: @tr("+ New session");
+                clicked => { root.new-session(); }
+            }
+        }
+
+        if sessions.length == 0 : Rectangle {
+            height: 120px;
+            background: Theme.bg-root;
+            border-radius: Theme.radius-sm;
+            border-width: 1px;
+            border-color: Theme.border-subtle;
+
+            VerticalLayout {
+                alignment: center;
+                spacing: 6px;
+                Text {
+                    text: @tr("No sessions yet");
+                    color: Theme.text-secondary;
+                    font-size: Theme.fs-md;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: @tr("Use 'New session' (top-right) to add your first server");
+                    color: Theme.text-muted;
+                    font-size: Theme.fs-sm;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+
+        if sessions.length > 0 : ScrollView {
+            vertical-stretch: 1;
+            viewport-y <=> root.scroll-y;
+            viewport-height: max(self.visible-height, quick-list.preferred-height);
+            property <length> content-width: self.visible-width;
+
+            Rectangle {
+                width: content-width;
+                quick-list := VerticalLayout {
+                    width: parent.width;
+                    spacing: 2px;
+                    for session[i] in sessions : VerticalLayout {
+                        width: parent.width;
+                        spacing: 2px;
+                        if session.group-header != "" : Rectangle {
+                            width: parent.width;
+                            height: 26px;
+                            property <length> gmx;
+                            property <length> gmy;
+                            HorizontalLayout {
+                                padding-top: 6px;
+                                padding-left: 4px;
+                                spacing: 4px;
+                                Text {
+                                    text: session.collapsed ? "\u{E5CC}" : "\u{E5CF}";
+                                    font-family: "Material Icons";
+                                    color: Theme.text-muted;
+                                    font-size: Theme.fs-sm;
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    text: "\u{E2C7}";
+                                    font-family: "Material Icons";
+                                    color: Theme.text-muted;
+                                    font-size: Theme.fs-sm;
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    text: session.group-header;
+                                    color: Theme.text-muted;
+                                    font-size: Theme.fs-xs;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                    horizontal-alignment: left;
+                                }
+                            }
+                            TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.toggle-group(session.group); }
+                                pointer-event(e) => {
+                                    if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) {
+                                        gmx = self.mouse-x;
+                                        gmy = self.mouse-y;
+                                        grp-menu.show();
+                                    }
+                                }
+                            }
+                            grp-menu := PopupWindow {
+                                x: gmx;
+                                y: gmy;
+                                width: 140px;
+                                height: (session.id == "" ? 3 : 2) * 28px + 9px;
+                                Rectangle {
+                                    background: Theme.bg-panel;
+                                    border-radius: Theme.radius-sm;
+                                    border-width: 1px;
+                                    border-color: Theme.border-strong;
+                                    drop-shadow-blur: 10px;
+                                    drop-shadow-color: #00000050;
+                                    VerticalLayout {
+                                        padding: 4px;
+                                        spacing: 1px;
+                                        Rectangle {
+                                            height: 28px;
+                                            border-radius: Theme.radius-sm;
+                                            background: eg-ta.has-hover ? Theme.bg-hover : transparent;
+                                            eg-ta := TouchArea { mouse-cursor: pointer; clicked => { root.edit-group(session.group); } }
+                                            HorizontalLayout {
+                                                padding-left: 10px; spacing: 8px;
+                                                Text { text: "\u{E3C9}"; font-family: "Material Icons"; color: Theme.text-secondary; font-size: Theme.fs-sm; vertical-alignment: center; }
+                                                Text { text: @tr("Edit group"); color: Theme.text-primary; font-size: Theme.fs-md; vertical-alignment: center; horizontal-stretch: 1; }
+                                            }
+                                        }
+                                        if session.id == "" : Rectangle {
+                                            height: 28px;
+                                            border-radius: Theme.radius-sm;
+                                            background: dg-ta.has-hover ? #cc333320 : transparent;
+                                            dg-ta := TouchArea { mouse-cursor: pointer; clicked => { root.delete-group(session.group); } }
+                                            HorizontalLayout {
+                                                padding-left: 10px; spacing: 8px;
+                                                Text { text: "\u{E872}"; font-family: "Material Icons"; color: #cc3333; font-size: Theme.fs-sm; vertical-alignment: center; }
+                                                Text { text: @tr("Delete group"); color: #cc3333; font-size: Theme.fs-md; vertical-alignment: center; horizontal-stretch: 1; }
+                                            }
+                                        }
+                                        Rectangle {
+                                            height: 28px;
+                                            border-radius: Theme.radius-sm;
+                                            background: ng-ta.has-hover ? Theme.bg-hover : transparent;
+                                            ng-ta := TouchArea { mouse-cursor: pointer; clicked => { root.new-group(); } }
+                                            HorizontalLayout {
+                                                padding-left: 10px; spacing: 8px;
+                                                Text { text: "\u{E2CC}"; font-family: "Material Icons"; color: Theme.text-secondary; font-size: Theme.fs-sm; vertical-alignment: center; }
+                                                Text { text: @tr("New group"); color: Theme.text-primary; font-size: Theme.fs-md; vertical-alignment: center; horizontal-stretch: 1; }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if session.id != "" && !session.collapsed : Rectangle {
+                            x: session.group != "" ? 20px : 0px;
+                            width: parent.width - self.x;
+                            height: root.compact-rows ? 48px : 36px;
+
+                            SessionRow {
+                                width: parent.width;
+                                height: parent.height;
+                                session: session;
+                                compact: root.compact-rows;
+                                all-sessions: root.sessions;
+                                connect => { root.connect-session(session.id); }
+                                edit => { root.edit-session(session.id); }
+                                duplicate => { root.duplicate-session(session.id); }
+                                move-to-group(g) => { root.move-session(session.id, g); }
+                                remove => { root.remove-session(session.id); }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -240,202 +474,26 @@ export component Welcome inherits Rectangle {
             }
         }
 
-        // Quick Connect card
-        Rectangle {
+        SessionBrowser {
             vertical-stretch: 1;
-            background: Theme.bg-panel;
-            border-radius: Theme.radius-md;
-            border-width: 1px;
-            border-color: Theme.border-subtle;
-
-            VerticalLayout {
-                padding: 16px;
-                spacing: 12px;
-
-                HorizontalLayout {
-                    spacing: 8px;
-                    Text {
-                        text: @tr("Quick connect");
-                        color: Theme.text-primary;
-                        font-size: Theme.fs-lg;
-                        font-weight: 600;
-                        vertical-alignment: center;
-                        horizontal-stretch: 1;
-                    }
-                    // Result of the last "Import ~/.ssh/config" (triggered from
-                    // the settings menu), e.g. "imported 3".
-                    Text {
-                        text: root.import-hint;
-                        color: Theme.text-muted;
-                        font-size: Theme.fs-sm;
-                        vertical-alignment: center;
-                    }
-                    PrimaryButton {
-                        text: @tr("+ New session");
-                        clicked => { root.new-session(); }
-                    }
-                }
-
-                if sessions.length == 0 : Rectangle {
-                    height: 120px;
-                    background: Theme.bg-root;
-                    border-radius: Theme.radius-sm;
-                    border-width: 1px;
-                    border-color: Theme.border-subtle;
-
-                    VerticalLayout {
-                        alignment: center;
-                        spacing: 6px;
-                        Text {
-                            text: @tr("No sessions yet");
-                            color: Theme.text-secondary;
-                            font-size: Theme.fs-md;
-                            horizontal-alignment: center;
-                        }
-                        Text {
-                            text: @tr("Use 'New session' (top-right) to add your first server");
-                            color: Theme.text-muted;
-                            font-size: Theme.fs-sm;
-                            horizontal-alignment: center;
-                        }
-                    }
-                }
-
-                if sessions.length > 0 : ScrollView {
-                    vertical-stretch: 1;
-                    viewport-y <=> root.scroll-y;
-                    viewport-height: max(self.visible-height, quick-list.preferred-height);
-                    property <length> content-width: self.visible-width;
-
-                    Rectangle {
-                        width: content-width;
-                        quick-list := VerticalLayout {
-                            width: parent.width;
-                            spacing: 2px;
-                            for session[i] in sessions : VerticalLayout {
-                                width: parent.width;
-                                spacing: 2px;
-                                // Group header on the first row of each group (#41).
-                                // Click anywhere on it to collapse / expand the group.
-                                if session.group-header != "" : Rectangle {
-                                    width: parent.width;
-                                    height: 26px;
-                                    // Right-click popup anchor.
-                                    property <length> gmx;
-                                    property <length> gmy;
-                                    HorizontalLayout {
-                                        padding-top: 6px;
-                                        padding-left: 4px;
-                                        spacing: 4px;
-                                        Text {
-                                            text: session.collapsed ? "\u{E5CC}" : "\u{E5CF}";
-                                            font-family: "Material Icons";
-                                            color: Theme.text-muted;
-                                            font-size: Theme.fs-sm;
-                                            vertical-alignment: center;
-                                        }
-                                        Text {
-                                            text: "\u{E2C7}";
-                                            font-family: "Material Icons";
-                                            color: Theme.text-muted;
-                                            font-size: Theme.fs-sm;
-                                            vertical-alignment: center;
-                                        }
-                                        Text {
-                                            text: session.group-header;
-                                            color: Theme.text-muted;
-                                            font-size: Theme.fs-xs;
-                                            font-weight: 700;
-                                            vertical-alignment: center;
-                                            horizontal-stretch: 1;
-                                            horizontal-alignment: left;
-                                        }
-                                    }
-                                    TouchArea {
-                                        mouse-cursor: pointer;
-                                        clicked => { root.toggle-group(session.group); }
-                                        pointer-event(e) => {
-                                            if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) {
-                                                gmx = self.mouse-x;
-                                                gmy = self.mouse-y;
-                                                grp-menu.show();
-                                            }
-                                        }
-                                    }
-                                    grp-menu := PopupWindow {
-                                        x: gmx;
-                                        y: gmy;
-                                        width: 140px;
-                                        height: (session.id == "" ? 3 : 2) * 28px + 9px;
-                                        Rectangle {
-                                            background: Theme.bg-panel;
-                                            border-radius: Theme.radius-sm;
-                                            border-width: 1px;
-                                            border-color: Theme.border-strong;
-                                            drop-shadow-blur: 10px;
-                                            drop-shadow-color: #00000050;
-                                            VerticalLayout {
-                                                padding: 4px;
-                                                spacing: 1px;
-                                                Rectangle {
-                                                    height: 28px;
-                                                    border-radius: Theme.radius-sm;
-                                                    background: eg-ta.has-hover ? Theme.bg-hover : transparent;
-                                                    eg-ta := TouchArea { mouse-cursor: pointer; clicked => { root.edit-group(session.group); } }
-                                                    HorizontalLayout {
-                                                        padding-left: 10px; spacing: 8px;
-                                                        Text { text: "\u{E3C9}"; font-family: "Material Icons"; color: Theme.text-secondary; font-size: Theme.fs-sm; vertical-alignment: center; }
-                                                        Text { text: @tr("Edit group"); color: Theme.text-primary; font-size: Theme.fs-md; vertical-alignment: center; horizontal-stretch: 1; }
-                                                    }
-                                                }
-                                                if session.id == "" : Rectangle {
-                                                    height: 28px;
-                                                    border-radius: Theme.radius-sm;
-                                                    background: dg-ta.has-hover ? #cc333320 : transparent;
-                                                    dg-ta := TouchArea { mouse-cursor: pointer; clicked => { root.delete-group(session.group); } }
-                                                    HorizontalLayout {
-                                                        padding-left: 10px; spacing: 8px;
-                                                        Text { text: "\u{E872}"; font-family: "Material Icons"; color: #cc3333; font-size: Theme.fs-sm; vertical-alignment: center; }
-                                                        Text { text: @tr("Delete group"); color: #cc3333; font-size: Theme.fs-md; vertical-alignment: center; horizontal-stretch: 1; }
-                                                    }
-                                                }
-                                                Rectangle {
-                                                    height: 28px;
-                                                    border-radius: Theme.radius-sm;
-                                                    background: ng-ta.has-hover ? Theme.bg-hover : transparent;
-                                                    ng-ta := TouchArea { mouse-cursor: pointer; clicked => { root.new-group(); } }
-                                                    HorizontalLayout {
-                                                        padding-left: 10px; spacing: 8px;
-                                                        Text { text: "\u{E2CC}"; font-family: "Material Icons"; color: Theme.text-secondary; font-size: Theme.fs-sm; vertical-alignment: center; }
-                                                        Text { text: @tr("New group"); color: Theme.text-primary; font-size: Theme.fs-md; vertical-alignment: center; horizontal-stretch: 1; }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                if session.id != "" && !session.collapsed : Rectangle {
-                                    x: session.group != "" ? 20px : 0px;
-                                    width: parent.width - self.x;
-                                    height: 36px;
-
-                                    SessionRow {
-                                        width: parent.width;
-                                        height: parent.height;
-                                        session: session;
-                                        all-sessions: root.sessions;
-                                        connect => { root.connect-session(session.id); }
-                                        edit => { root.edit-session(session.id); }
-                                        duplicate => { root.duplicate-session(session.id); }
-                                        move-to-group(g) => { root.move-session(session.id, g); }
-                                        remove => { root.remove-session(session.id); }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            sessions: root.sessions;
+            import-hint: root.import-hint;
+            scroll-y <=> root.scroll-y;
+            panel-title: @tr("Quick connect");
+            show-import-hint: true;
+            show-new-session: true;
+            compact-rows: false;
+            new-session => { root.new-session(); }
+            import-ssh-config => { root.import-ssh-config(); }
+            connect-session(id) => { root.connect-session(id); }
+            edit-session(id) => { root.edit-session(id); }
+            duplicate-session(id) => { root.duplicate-session(id); }
+            move-session(id, group) => { root.move-session(id, group); }
+            toggle-group(group) => { root.toggle-group(group); }
+            new-group => { root.new-group(); }
+            edit-group(name) => { root.edit-group(name); }
+            delete-group(name) => { root.delete-group(name); }
+            remove-session(id) => { root.remove-session(id); }
         }
     }
 }

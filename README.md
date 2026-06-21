@@ -56,7 +56,7 @@ xattr -dr com.apple.quarantine xiaoxingshell # 去掉「未签名应用」的 Ga
 
 - [x] FinalShell 风格 UI，深色 / 浅色 / 跟随系统主题
 - [x] 本地输入优化，对于高延迟服务器会比较友好
-- [x] 支持双击选中单词 三击选中一行 CTRL+C 进行复制  CTRL+V 进行粘贴
+- [x] 支持双击选中单词、三击选中一行、`Ctrl+C` 复制、`Ctrl+V` 粘贴
 - [x] 本机 + 远端资源监控（CPU / 内存 / 交换 / 网络 / 磁盘）
 - [x] 完整 VT/ANSI 终端模拟（btop / htop / vim 全屏正常渲染）
 - [x] 多标签页（欢迎页 + 多个会话）
@@ -66,16 +66,15 @@ xattr -dr com.apple.quarantine xiaoxingshell # 去掉「未签名应用」的 Ga
     / `~/Library/Application Support/xiaoxingshell/sessions.json`（macOS）
 - [x] SSH（`russh`，纯 Rust）：密码 / 私钥 / 加密私钥（密码短语）
 - [x] SFTP 文件浏览 + 上传 / 下载（拖拽）+ 终端内 ZMODEM（`sz`）接收
-- [x] 双击文件进行编辑 编辑后自动上传覆盖服务器文件并提示上传时间。
-- [x] SSH 端口转发 / 隧道：本地 -L / 远程 -R / 动态 -D（SOCKS5）
+- [x] 双击文件进行编辑，保存后自动上传覆盖服务器文件并提示上传时间
+- [x] SSH 端口转发 / 隧道：本地 `-L` / 远程 `-R` / 动态 `-D`（SOCKS5）
 - [x] 快捷命令 + 命令输入框（可群发到所有会话）+ 命令历史
 - [x] 串口 / Telnet 会话
 - [x] 出站代理（SOCKS5 / HTTP）
 - [x] 会话密码加密存储（ChaCha20-Poly1305）
 - [x] 点击眼睛可显示会话密码
-
-
-
+- [x] 左侧“会话管理器”面板，可快速展开已保存会话并连续打开多个标签页
+- [x] 记住主窗口大小、位置和最大化状态，下次启动自动恢复
 
 ## 技术栈
 
@@ -94,12 +93,17 @@ xattr -dr com.apple.quarantine xiaoxingshell # 去掉「未签名应用」的 Ga
 cargo run --release
 ```
 
-首次启动会在 `%APPDATA%/xiaoxingshell/sessions.json` 建立空的会话库。点击右上
-角 **“＋ 新建会话”** 添加第一台服务器。
+首次启动会在以下位置建立空的会话库：
+
+- Windows：`%APPDATA%/xiaoxingshell/sessions.json`
+- Linux：`~/.config/xiaoxingshell/sessions.json`
+- macOS：`~/Library/Application Support/xiaoxingshell/sessions.json`
+
+然后在欢迎页右上角点击 **“+ New session”** 添加第一台服务器。
 
 ## 项目布局
 
-```
+```text
 xiaoxingshell/
 ├── Cargo.toml
 ├── build.rs                 # Slint 编译器入口
@@ -111,7 +115,7 @@ xiaoxingshell/
 │   ├── tabs.slint           # 顶部标签栏
 │   ├── welcome.slint        # 欢迎页 / 快速连接
 │   ├── session_dialog.slint # 新建 / 编辑会话弹框
-│   └── terminal_view.slint  # 终端视图（v0.1 行缓冲）
+│   └── terminal_view.slint  # 终端视图
 └── src/
     ├── main.rs
     ├── app.rs               # UI ↔ 后端桥接
@@ -122,12 +126,11 @@ xiaoxingshell/
 
 ## 开发提示
 
-- Slint 控件有非常严格的布局 DSL，改 `.slint` 后 `cargo check` 是最快的
-  反馈方式。
+- Slint 控件的布局 DSL 比较严格，改 `.slint` 后 `cargo check` 通常是最快的反馈方式。
 - 应用事件循环是单线程（Slint 要求），所有跨线程 UI 更新通过
   `slint::invoke_from_event_loop` 回调。
 - 目前 `check_server_key` 接受任意服务端密钥（类似 `StrictHostKeyChecking=no`），
-  生产使用前请接入 known_hosts 校验。
+  生产使用前建议接入 `known_hosts` 校验。
 
 ## License
 

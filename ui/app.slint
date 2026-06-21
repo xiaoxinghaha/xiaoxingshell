@@ -17,7 +17,7 @@ import "fonts/MaterialIcons-Regular.ttf";
 import { Theme } from "theme.slint";
 import { Sidebar, DiskInfo } from "sidebar.slint";
 import { TabBar, TabInfo } from "tabs.slint";
-import { Welcome, SessionInfo } from "welcome.slint";
+import { Welcome, SessionBrowser, SessionInfo } from "welcome.slint";
 import { SessionDialog, SessionDraft, PortFwd } from "session_dialog.slint";
 import { ConfirmDialog } from "confirm_dialog.slint";
 import { LabeledInput, PrimaryButton, GhostButton } from "widgets.slint";
@@ -137,6 +137,55 @@ component IconBtn inherits Rectangle {
     }
 }
 
+component NavRailBtn inherits Rectangle {
+    in property <string> icon;
+    in property <string> tooltip;
+    in property <bool> active: false;
+    callback clicked();
+    width: 38px;
+    height: 38px;
+    border-radius: Theme.radius-md;
+    background: ta.has-hover || root.active ? Theme.bg-hover : transparent;
+    animate background { duration: 100ms; }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+
+    Text {
+        text: root.icon;
+        font-family: "Material Icons";
+        color: root.active ? Theme.accent : Theme.text-secondary;
+        font-size: 18px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    if ta.has-hover && root.tooltip != "" : Rectangle {
+        x: parent.width + 8px;
+        y: (parent.height - self.height) / 2;
+        width: rail-tip.preferred-width + 16px;
+        height: 24px;
+        background: Theme.bg-elevated;
+        border-radius: Theme.radius-sm;
+        border-width: 1px;
+        border-color: Theme.border-strong;
+        drop-shadow-blur: 8px;
+        drop-shadow-color: #00000060;
+
+        rail-tip := Text {
+            text: root.tooltip;
+            color: Theme.text-primary;
+            font-size: Theme.fs-xs;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            width: parent.width;
+            height: parent.height;
+        }
+    }
+}
+
 export component AppWindow inherits Window {
     title: "xiaoxingshell";
     icon: @image-url("../assets/icon.png");
@@ -187,6 +236,7 @@ export component AppWindow inherits Window {
     // --- Top-right popups --------------------------------------------------
     in-out property <bool> download-open: false;  // download manager popup
     in-out property <bool> settings-open: false;  // settings menu popup
+    in-out property <int> nav-panel-open: 0;      // 0 none / 1 session manager
 
     // Immersive custom title bar (#119). Rust sets `custom-titlebar` true on
     // Windows/Linux (frameless); macOS keeps native decorations. The callbacks
@@ -534,135 +584,352 @@ export component AppWindow inherits Window {
             }
         }
 
-        HorizontalLayout {
-        spacing: 0;
-
-        // Left sidebar — collapsible (width animates to 0).
-        Sidebar {
-            width: root.sidebar-collapsed ? 0px : 220px;
-            clip: true;
-            animate width { duration: 150ms; easing: ease-out; }
-            connection-state: root.connection-state;
-            connection-address: root.connection-address;
-            conn-state: root.conn-state;
-            resource-title: root.resource-title;
-            cpu-percent: root.cpu-percent;
-            mem-percent: root.mem-percent;
-            swap-percent: root.swap-percent;
-            mem-detail: root.mem-detail;
-            swap-detail: root.swap-detail;
-            net-top-up: root.net-top-up;
-            net-top-down: root.net-top-down;
-            net-top-history: root.net-top-history;
-            net-bot-up: root.net-bot-up;
-            net-bot-down: root.net-bot-down;
-            net-bot-history: root.net-bot-history;
-            net-ifaces: root.net-ifaces;
-            net-selected: root.net-selected;
-            net-show-selector: root.net-show-selector;
-            disks: root.disks;
-            app-version: root.app-version;
-            local-input-toggle-visible: root.local-input-toggle-visible;
-            local-input-optimization-enabled: root.local-input-optimization-enabled;
-            local-input-optimization-active: root.local-input-optimization-active;
-            local-input-status-text: root.local-input-status-text;
-            select-net-iface(i) => { root.select-net-iface(i); }
-            set-local-input-optimization(v) => {
-                root.local-input-optimization-enabled = v;
-                root.set-local-input-optimization(v);
-            }
-            copy-connection-address() => { root.copy-connection-address(); }
-        }
-
-        // Right side: tabs + content
-        VerticalLayout {
-            spacing: 0;
-            horizontal-stretch: 1;
+        Rectangle {
+            vertical-stretch: 1;
+            background: Theme.bg-root;
 
             HorizontalLayout {
                 spacing: 0;
-                // Sidebar collapse / expand toggle.
-                Rectangle {
-                    width: 30px;
-                    background: sb-ta.has-hover ? Theme.bg-hover : Theme.bg-panel;
-                    sb-ta := TouchArea {
-                        mouse-cursor: pointer;
-                        clicked => { root.sidebar-collapsed = !root.sidebar-collapsed; }
-                    }
-                    Text {
-                        // chevron_right (show panel) when collapsed, else chevron_left
-                        text: root.sidebar-collapsed ? "\u{E5CC}" : "\u{E5CB}";
-                        font-family: "Material Icons";
-                        color: Theme.text-secondary;
-                        font-size: Theme.fs-md;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-                }
-                TabBar {
-                    horizontal-stretch: 1;
-                    tabs: root.tabs;
-                    active-id: root.active-tab-id;
-                    right-reserved-width: 0px;
-                    tab-selected(id) => {
-                        root.active-tab-id = id;
-                        root.tab-selected(id);
-                    }
-                    tab-closed(id) => { root.tab-closed(id); }
-                    new-tab() => { root.new-tab-clicked(); }
-                }
-                Rectangle {
-                    width: root.top-toolbar-reserve;
-                    background: Theme.bg-panel-alt;
-                    HorizontalLayout {
-                        x: 10px;
-                        y: 2px;
-                        width: parent.width - 10px;
-                        height: parent.height - 2px;
-                        spacing: 4px;
-                        alignment: end;
 
-                        IconBtn {
-                            icon: "\u{E627}";
-                            icon-color: root.sync-input ? Theme.accent : Theme.text-secondary;
-                            active: root.sync-input;
-                            tooltip: root.lang-en
-                                ? (root.sync-input ? "Sync input: ON" : "Sync input")
-                                : (root.sync-input ? "会话同步：开" : "会话同步");
-                            clicked => { root.sync-input = !root.sync-input; root.set-sync-input(root.sync-input); }
+                Rectangle {
+                    width: 52px;
+                    background: Theme.bg-panel-alt;
+                    border-width: 1px;
+                    border-color: Theme.border-subtle;
+
+                    VerticalLayout {
+                        padding-top: 14px;
+                        padding-bottom: 14px;
+                        padding-left: 7px;
+                        padding-right: 7px;
+                        spacing: 10px;
+
+                        NavRailBtn {
+                            icon: "\u{E2C7}";
+                            tooltip: root.lang-en ? "Session manager" : "会话管理器";
+                            active: root.nav-panel-open == 1;
+                            clicked => {
+                                root.nav-panel-open = root.nav-panel-open == 1 ? 0 : 1;
+                            }
                         }
-                        IconBtn {
-                            icon: Theme.dark ? "\u{E518}" : "\u{E51C}";
-                            icon-color: Theme.dark ? #f5c542 : #5856d6;
-                            tooltip: root.lang-en ? "Toggle theme" : "切换主题";
-                            clicked => { root.toggle-theme(); }
-                        }
-                        IconBtn {
-                            icon: "\u{E2C4}";
-                            tooltip: root.lang-en ? "Download" : "下载";
-                            active: root.download-open;
-                            clicked => { root.download-open = !root.download-open; root.settings-open = false; }
-                        }
-                        IconBtn {
+
+                        NavRailBtn {
                             icon: "\u{E8B8}";
-                            tooltip: root.lang-en ? "Settings" : "设置";
-                            active: root.settings-open;
-                            clicked => { root.settings-open = !root.settings-open; root.download-open = false; }
+                            tooltip: root.lang-en ? "Reserved" : "预留";
+                            active: false;
+                            clicked => { root.nav-panel-open = 0; }
+                        }
+
+                        NavRailBtn {
+                            icon: "\u{E88F}";
+                            tooltip: root.lang-en ? "Reserved" : "预留";
+                            active: false;
+                            clicked => { root.nav-panel-open = 0; }
+                        }
+
+                        NavRailBtn {
+                            icon: "\u{E0B7}";
+                            tooltip: root.lang-en ? "Reserved" : "预留";
+                            active: false;
+                            clicked => { root.nav-panel-open = 0; }
+                        }
+
+                        Rectangle { vertical-stretch: 1; }
+                    }
+                }
+
+                // Left sidebar — collapsible (width animates to 0).
+                Sidebar {
+                    width: root.sidebar-collapsed ? 0px : 220px;
+                    clip: true;
+                    animate width { duration: 150ms; easing: ease-out; }
+                    connection-state: root.connection-state;
+                    connection-address: root.connection-address;
+                    conn-state: root.conn-state;
+                    resource-title: root.resource-title;
+                    cpu-percent: root.cpu-percent;
+                    mem-percent: root.mem-percent;
+                    swap-percent: root.swap-percent;
+                    mem-detail: root.mem-detail;
+                    swap-detail: root.swap-detail;
+                    net-top-up: root.net-top-up;
+                    net-top-down: root.net-top-down;
+                    net-top-history: root.net-top-history;
+                    net-bot-up: root.net-bot-up;
+                    net-bot-down: root.net-bot-down;
+                    net-bot-history: root.net-bot-history;
+                    net-ifaces: root.net-ifaces;
+                    net-selected: root.net-selected;
+                    net-show-selector: root.net-show-selector;
+                    disks: root.disks;
+                    app-version: root.app-version;
+                    local-input-toggle-visible: root.local-input-toggle-visible;
+                    local-input-optimization-enabled: root.local-input-optimization-enabled;
+                    local-input-optimization-active: root.local-input-optimization-active;
+                    local-input-status-text: root.local-input-status-text;
+                    select-net-iface(i) => { root.select-net-iface(i); }
+                    set-local-input-optimization(v) => {
+                        root.local-input-optimization-enabled = v;
+                        root.set-local-input-optimization(v);
+                    }
+                    copy-connection-address() => { root.copy-connection-address(); }
+                }
+
+                // Right side: tabs + content
+                VerticalLayout {
+                    spacing: 0;
+                    horizontal-stretch: 1;
+
+                    HorizontalLayout {
+                        spacing: 0;
+                        // Sidebar collapse / expand toggle.
+                        Rectangle {
+                            width: 30px;
+                            background: sb-ta.has-hover ? Theme.bg-hover : Theme.bg-panel;
+                            sb-ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.sidebar-collapsed = !root.sidebar-collapsed; }
+                            }
+                            Text {
+                                // chevron_right (show panel) when collapsed, else chevron_left
+                                text: root.sidebar-collapsed ? "\u{E5CC}" : "\u{E5CB}";
+                                font-family: "Material Icons";
+                                color: Theme.text-secondary;
+                                font-size: Theme.fs-md;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                        TabBar {
+                            horizontal-stretch: 1;
+                            tabs: root.tabs;
+                            active-id: root.active-tab-id;
+                            right-reserved-width: 0px;
+                            tab-selected(id) => {
+                                root.active-tab-id = id;
+                                root.tab-selected(id);
+                            }
+                            tab-closed(id) => { root.tab-closed(id); }
+                            new-tab() => { root.new-tab-clicked(); }
+                        }
+                        Rectangle {
+                            width: root.top-toolbar-reserve;
+                            background: Theme.bg-panel-alt;
+                            HorizontalLayout {
+                                x: 10px;
+                                y: 2px;
+                                width: parent.width - 10px;
+                                height: parent.height - 2px;
+                                spacing: 4px;
+                                alignment: end;
+
+                                IconBtn {
+                                    icon: "\u{E627}";
+                                    icon-color: root.sync-input ? Theme.accent : Theme.text-secondary;
+                                    active: root.sync-input;
+                                    tooltip: root.lang-en
+                                        ? (root.sync-input ? "Sync input: ON" : "Sync input")
+                                        : (root.sync-input ? "会话同步：开" : "会话同步");
+                                    clicked => { root.sync-input = !root.sync-input; root.set-sync-input(root.sync-input); }
+                                }
+                                IconBtn {
+                                    icon: Theme.dark ? "\u{E518}" : "\u{E51C}";
+                                    icon-color: Theme.dark ? #f5c542 : #5856d6;
+                                    tooltip: root.lang-en ? "Toggle theme" : "切换主题";
+                                    clicked => { root.toggle-theme(); }
+                                }
+                                IconBtn {
+                                    icon: "\u{E2C4}";
+                                    tooltip: root.lang-en ? "Download" : "下载";
+                                    active: root.download-open;
+                                    clicked => { root.download-open = !root.download-open; root.settings-open = false; }
+                                }
+                                IconBtn {
+                                    icon: "\u{E8B8}";
+                                    tooltip: root.lang-en ? "Settings" : "设置";
+                                    active: root.settings-open;
+                                    clicked => { root.settings-open = !root.settings-open; root.download-open = false; }
+                                }
+                            }
+                        }
+                    }
+
+                    // Content area swaps based on active tab kind.
+                    Rectangle {
+                        vertical-stretch: 1;
+                        background: Theme.bg-root;
+
+                        // Welcome tab
+                        if root.active-tab-id == "welcome" : Welcome {
+                            sessions: root.sessions;
+                            import-hint: root.ssh-import-hint;
+                            scroll-y <=> root.welcome-scroll-y;
+                            new-session => { root.new-session-clicked(); }
+                            import-ssh-config => { root.import-ssh-config(); }
+                            connect-session(id) => { root.connect-session(id); }
+                            edit-session(id) => { root.edit-session(id); }
+                            duplicate-session(id) => { root.duplicate-session(id); }
+                            move-session(id, group) => { root.move-session(id, group); }
+                            toggle-group(group) => { root.toggle-group(group); }
+                            new-group => {
+                                root.group-dialog-orig = "";
+                                root.group-dialog-name = "";
+                                root.group-dialog-open = true;
+                            }
+                            edit-group(name) => {
+                                root.group-dialog-orig = name;
+                                root.group-dialog-name = name;
+                                root.group-dialog-open = true;
+                            }
+                            delete-group(name) => { root.delete-group(name); }
+                            remove-session(id) => { root.remove-session(id); }
+                        }
+
+                        // Terminal tabs — one TerminalView per terminal state. Only
+                        // the one matching `active-tab-id` is visible. Slint doesn't
+                        // allow nesting `if` directly inside a `for`, so we toggle
+                        // visibility instead and rely on the layout to overlap them.
+                        for term[i] in root.terminals : TerminalView {
+                            visible: term.id == root.active-tab-id;
+                            width: term.id == root.active-tab-id ? parent.width : 0px;
+                            height: term.id == root.active-tab-id ? parent.height : 0px;
+                            tab-id: term.id;
+                            status-line: term.status;
+                            spans: term.spans;
+                            cursor-row: term.cursor-row;
+                            cursor-col: term.cursor-col;
+                            rows-used: term.rows-used;
+                            is-alt-screen: term.is-alt-screen;
+                            find-matches: term.find-matches;
+                            selection: term.selection;
+                            sftp-panel-height <=> root.sftp-panel-height;
+                            sftp-collapsed <=> root.sftp-collapsed;
+                            sftp-saved-height <=> root.sftp-saved-height;
+                            sftp-tree-width <=> root.sftp-tree-width;
+                            sftp-col-name-width <=> root.sftp-col-name-width;
+                            sftp-col-size-width <=> root.sftp-col-size-width;
+                            sftp-col-type-width <=> root.sftp-col-type-width;
+                            sftp-col-modified-width <=> root.sftp-col-modified-width;
+                            sftp-col-mode-width <=> root.sftp-col-mode-width;
+                            sftp-col-owner-width <=> root.sftp-col-owner-width;
+                            sftp-path: term.sftp-path;
+                            sftp-entries: term.sftp-entries;
+                            sftp-status: term.sftp-status;
+                            sftp-loading: term.sftp-loading;
+                            sftp-tree-nodes: term.sftp-tree-nodes;
+                            quick-commands: root.quick-commands;
+                            command-history: root.command-history;
+                            run-command(cmd, all) => { root.run-command(term.id, cmd, all); }
+                            copy-text(t) => { root.copy-text(t); }
+                            delete-history(i) => { root.delete-history(i); }
+                            manage-quick-commands() => {
+                                root.qcm-name = "";
+                                root.qcm-command = "";
+                                root.quick-cmd-manage-open = true;
+                            }
+                            send-key(key, ctrl, alt, shift) => { root.send-key(term.id, key, ctrl, alt, shift) }
+                            terminal-resize(w, h) => { root.terminal-resize(term.id, w, h) }
+                            sftp-navigate(path) => { root.sftp-navigate(term.id, path); }
+                            sftp-download(path) => { root.sftp-download(term.id, path); }
+                            sftp-download-range(start, end) => { root.sftp-download-range(term.id, start, end); }
+                            sftp-upload-clicked(dir, folder) => { root.sftp-upload-clicked(term.id, dir, folder); }
+                            sftp-refresh(path) => { root.sftp-refresh(term.id, path); }
+                            sftp-tree-expand(path) => { root.sftp-tree-expand(term.id, path); }
+                            // Gate delete behind an in-app confirmation (#28): stash the
+                            // target and open the modal; the real delete fires on confirm.
+                            sftp-delete(path) => {
+                                root.confirm-delete-tab = term.id;
+                                root.confirm-delete-path = path;
+                                root.confirm-delete-open = true;
+                            }
+                            sftp-view(path) => { root.sftp-view(term.id, path); }
+                            sftp-edit(path) => { root.sftp-edit(term.id, path); }
+                            sftp-open-external(path) => { root.sftp-open-external(term.id, path); }
+                            sftp-edit-external(path) => { root.sftp-edit-external(term.id, path); }
+                            sftp-configure-external-editor() => { root.sftp-configure-external-editor(); }
+                            sftp-sort-request(column, ascending) => { root.sftp-sort-request(term.id, column, ascending); }
+                            persist-sftp-panel-layout(panel-height, saved-height, collapsed, tree-width, col-name, col-size, col-type, col-modified, col-mode, col-owner) => {
+                                root.persist-sftp-panel-layout(panel-height, saved-height, collapsed, tree-width, col-name, col-size, col-type, col-modified, col-mode, col-owner);
+                            }
+                            // #69 context-menu extensions → shared prompt dialog.
+                            sftp-rename-request(path, name) => {
+                                root.sftp-prompt-kind = "rename";
+                                root.sftp-prompt-tab = term.id;
+                                root.sftp-prompt-target = path;
+                                root.sftp-prompt-value = name;
+                                root.sftp-prompt-open = true;
+                            }
+                            sftp-chmod-request(path, name, mode) => {
+                                root.sftp-chmod-open(term.id, path, name, mode);
+                            }
+                            sftp-copy-path(path) => { root.sftp-copy-path(path); }
+                            sftp-new-folder(dir) => {
+                                root.sftp-prompt-kind = "mkdir";
+                                root.sftp-prompt-tab = term.id;
+                                root.sftp-prompt-target = dir;
+                                root.sftp-prompt-value = "";
+                                root.sftp-prompt-open = true;
+                            }
+                            sftp-new-file(dir) => {
+                                root.sftp-prompt-kind = "touch";
+                                root.sftp-prompt-tab = term.id;
+                                root.sftp-prompt-target = dir;
+                                root.sftp-prompt-value = "";
+                                root.sftp-prompt-open = true;
+                            }
+                            paste-from-clipboard() => { root.paste-from-clipboard(term.id); }
+                            copy-terminal-text() => { root.copy-terminal-text(term.id); }
+                            clear-terminal() => { root.clear-terminal(term.id); }
+                            find-query-changed(q) => { root.find-query-changed(term.id, q); }
+                            terminal-scroll(d) => { root.terminal-scroll(term.id, d); }
+                            select-start(r, c) => { root.term-select-start(term.id, r, c); }
+                            select-update(r, c) => { root.term-select-update(term.id, r, c); }
+                            select-end() => { root.term-select-end(term.id); }
+                            select-word(r, c) => { root.term-select-word(term.id, r, c); }
+                            select-line(r, c) => { root.term-select-line(term.id, r, c); }
+                            select-autoscroll(dir) => { root.term-select-autoscroll(term.id, dir); }
+                            copy-selection-or-ctrl-c() => { root.copy-selection-or-ctrl-c(term.id); }
                         }
                     }
                 }
             }
 
-            // Content area swaps based on active tab kind.
-            Rectangle {
-                vertical-stretch: 1;
-                background: Theme.bg-root;
+            if root.nav-panel-open != 0 : Rectangle {
+                x: 52px;
+                y: 0px;
+                width: parent.width - 52px;
+                height: parent.height;
+                background: transparent;
+                z: 2;
 
-                // Welcome tab
-                if root.active-tab-id == "welcome" : Welcome {
+                TouchArea {
+                    clicked => { root.nav-panel-open = 0; }
+                }
+            }
+
+            if root.nav-panel-open == 1 : Rectangle {
+                x: 52px;
+                y: 0px;
+                width: 320px;
+                height: parent.height;
+                background: Theme.bg-panel;
+                border-width: 1px;
+                border-color: Theme.border-subtle;
+                z: 3;
+
+                TouchArea {}
+
+                SessionBrowser {
+                    width: parent.width;
+                    height: parent.height;
+                    background: transparent;
+                    border-width: 0px;
                     sessions: root.sessions;
-                    import-hint: root.ssh-import-hint;
-                    scroll-y <=> root.welcome-scroll-y;
+                    import-hint: "";
+                    panel-title: root.lang-en ? "Session manager" : "会话管理器";
+                    show-import-hint: false;
+                    show-new-session: false;
+                    compact-rows: true;
                     new-session => { root.new-session-clicked(); }
                     import-ssh-config => { root.import-ssh-config(); }
                     connect-session(id) => { root.connect-session(id); }
@@ -683,115 +950,8 @@ export component AppWindow inherits Window {
                     delete-group(name) => { root.delete-group(name); }
                     remove-session(id) => { root.remove-session(id); }
                 }
-
-                // Terminal tabs — one TerminalView per terminal state. Only
-                // the one matching `active-tab-id` is visible. Slint doesn't
-                // allow nesting `if` directly inside a `for`, so we toggle
-                // visibility instead and rely on the layout to overlap them.
-                for term[i] in root.terminals : TerminalView {
-                    visible: term.id == root.active-tab-id;
-                    width: term.id == root.active-tab-id ? parent.width : 0px;
-                    height: term.id == root.active-tab-id ? parent.height : 0px;
-                    tab-id: term.id;
-                    status-line: term.status;
-                    spans: term.spans;
-                    cursor-row: term.cursor-row;
-                    cursor-col: term.cursor-col;
-                    rows-used: term.rows-used;
-                    is-alt-screen: term.is-alt-screen;
-                    find-matches: term.find-matches;
-                    selection: term.selection;
-                    sftp-panel-height <=> root.sftp-panel-height;
-                    sftp-collapsed <=> root.sftp-collapsed;
-                    sftp-saved-height <=> root.sftp-saved-height;
-                    sftp-tree-width <=> root.sftp-tree-width;
-                    sftp-col-name-width <=> root.sftp-col-name-width;
-                    sftp-col-size-width <=> root.sftp-col-size-width;
-                    sftp-col-type-width <=> root.sftp-col-type-width;
-                    sftp-col-modified-width <=> root.sftp-col-modified-width;
-                    sftp-col-mode-width <=> root.sftp-col-mode-width;
-                    sftp-col-owner-width <=> root.sftp-col-owner-width;
-                    sftp-path: term.sftp-path;
-                    sftp-entries: term.sftp-entries;
-                    sftp-status: term.sftp-status;
-                    sftp-loading: term.sftp-loading;
-                    sftp-tree-nodes: term.sftp-tree-nodes;
-                    quick-commands: root.quick-commands;
-                    command-history: root.command-history;
-                    run-command(cmd, all) => { root.run-command(term.id, cmd, all); }
-                    copy-text(t) => { root.copy-text(t); }
-                    delete-history(i) => { root.delete-history(i); }
-                    manage-quick-commands() => {
-                        root.qcm-name = "";
-                        root.qcm-command = "";
-                        root.quick-cmd-manage-open = true;
-                    }
-                    send-key(key, ctrl, alt, shift) => { root.send-key(term.id, key, ctrl, alt, shift) }
-                    terminal-resize(w, h) => { root.terminal-resize(term.id, w, h) }
-                    sftp-navigate(path) => { root.sftp-navigate(term.id, path); }
-                    sftp-download(path) => { root.sftp-download(term.id, path); }
-                    sftp-download-range(start, end) => { root.sftp-download-range(term.id, start, end); }
-                    sftp-upload-clicked(dir, folder) => { root.sftp-upload-clicked(term.id, dir, folder); }
-                    sftp-refresh(path) => { root.sftp-refresh(term.id, path); }
-                    sftp-tree-expand(path) => { root.sftp-tree-expand(term.id, path); }
-                    // Gate delete behind an in-app confirmation (#28): stash the
-                    // target and open the modal; the real delete fires on confirm.
-                    sftp-delete(path) => {
-                        root.confirm-delete-tab = term.id;
-                        root.confirm-delete-path = path;
-                        root.confirm-delete-open = true;
-                    }
-                    sftp-view(path) => { root.sftp-view(term.id, path); }
-                    sftp-edit(path) => { root.sftp-edit(term.id, path); }
-                    sftp-open-external(path) => { root.sftp-open-external(term.id, path); }
-                    sftp-edit-external(path) => { root.sftp-edit-external(term.id, path); }
-                    sftp-configure-external-editor() => { root.sftp-configure-external-editor(); }
-                    sftp-sort-request(column, ascending) => { root.sftp-sort-request(term.id, column, ascending); }
-                    persist-sftp-panel-layout(panel-height, saved-height, collapsed, tree-width, col-name, col-size, col-type, col-modified, col-mode, col-owner) => {
-                        root.persist-sftp-panel-layout(panel-height, saved-height, collapsed, tree-width, col-name, col-size, col-type, col-modified, col-mode, col-owner);
-                    }
-                    // #69 context-menu extensions → shared prompt dialog.
-                    sftp-rename-request(path, name) => {
-                        root.sftp-prompt-kind = "rename";
-                        root.sftp-prompt-tab = term.id;
-                        root.sftp-prompt-target = path;
-                        root.sftp-prompt-value = name;
-                        root.sftp-prompt-open = true;
-                    }
-                    sftp-chmod-request(path, name, mode) => {
-                        root.sftp-chmod-open(term.id, path, name, mode);
-                    }
-                    sftp-copy-path(path) => { root.sftp-copy-path(path); }
-                    sftp-new-folder(dir) => {
-                        root.sftp-prompt-kind = "mkdir";
-                        root.sftp-prompt-tab = term.id;
-                        root.sftp-prompt-target = dir;
-                        root.sftp-prompt-value = "";
-                        root.sftp-prompt-open = true;
-                    }
-                    sftp-new-file(dir) => {
-                        root.sftp-prompt-kind = "touch";
-                        root.sftp-prompt-tab = term.id;
-                        root.sftp-prompt-target = dir;
-                        root.sftp-prompt-value = "";
-                        root.sftp-prompt-open = true;
-                    }
-                    paste-from-clipboard() => { root.paste-from-clipboard(term.id); }
-                    copy-terminal-text() => { root.copy-terminal-text(term.id); }
-                    clear-terminal() => { root.clear-terminal(term.id); }
-                    find-query-changed(q) => { root.find-query-changed(term.id, q); }
-                    terminal-scroll(d) => { root.terminal-scroll(term.id, d); }
-                    select-start(r, c) => { root.term-select-start(term.id, r, c); }
-                    select-update(r, c) => { root.term-select-update(term.id, r, c); }
-                    select-end() => { root.term-select-end(term.id); }
-                    select-word(r, c) => { root.term-select-word(term.id, r, c); }
-                    select-line(r, c) => { root.term-select-line(term.id, r, c); }
-                    select-autoscroll(dir) => { root.term-select-autoscroll(term.id, dir); }
-                    copy-selection-or-ctrl-c() => { root.copy-selection-or-ctrl-c(term.id); }
-                }
             }
         }
-    }
     }
 
     // Frameless resize edges (#119): thin hit-zones that start an OS-level
