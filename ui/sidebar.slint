@@ -15,9 +15,10 @@ component StatRow inherits HorizontalLayout {
     in property <float> percent; // 0.0 .. 1.0
     in property <string> detail;
     in property <brush> bar-color: Theme.accent;
-    in property <brush> track-color: Theme.dark ? #eef0f4 : #f4f4f4;
-    in property <brush> value-color: #35383f;
-    in property <brush> detail-color: #4f535a;
+    in property <brush> track-color: Theme.dark ? #000000 : #eef0f4;
+    in property <brush> track-border-color: Theme.dark ? #000000 : #d7dbe1;
+    in property <brush> value-color: Theme.dark ? #ffffff : #111111;
+    in property <brush> detail-color: Theme.dark ? #ffffff : #111111;
 
     spacing: 6px;
     padding-left: 8px;
@@ -38,7 +39,7 @@ component StatRow inherits HorizontalLayout {
         background: root.track-color;
         border-radius: 0px;
         border-width: 1px;
-        border-color: #cfd3d8;
+        border-color: root.track-border-color;
         horizontal-stretch: 1;
         min-width: 108px;
 
@@ -389,19 +390,19 @@ export component Sidebar inherits Rectangle {
                 label: "CPU";
                 percent: root.cpu-percent;
                 detail: "";
-                bar-color: #a8d8a8;
+                bar-color: Theme.dark ? #2e7d32 : #a8d8a8;
             }
             StatRow {
                 label: @tr("Memory");
                 percent: root.mem-percent;
                 detail: root.mem-detail;
-                bar-color: #f2c59e;
+                bar-color: Theme.dark ? #2e7d32 : #a8d8a8;
             }
             StatRow {
                 label: @tr("Swap");
                 percent: root.swap-percent;
                 detail: root.swap-detail;
-                bar-color: #f2c59e;
+                bar-color: Theme.dark ? #2e7d32 : #a8d8a8;
             }
         }
 

@@ -18,8 +18,27 @@ mod system;
 mod telnet;
 mod zmodem;
 
+#[cfg(windows)]
+struct SingleInstanceGuard(isize);
+
+#[cfg(windows)]
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn CloseHandle(handle: isize) -> i32;
+        }
+        if self.0 != 0 {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     init_tracing();
+    let _single_instance = acquire_single_instance_guard()?;
 
     // ── IME policy ───────────────────────────────────────────────────────────
     // NOTE: We deliberately DO **NOT** call `ImmDisableIME` here.
@@ -37,6 +56,48 @@ fn main() -> anyhow::Result<()> {
     // `app::on_send_key`, so we no longer need (and must not use) ImmDisableIME.
 
     app::run()
+}
+
+#[cfg(windows)]
+fn acquire_single_instance_guard() -> anyhow::Result<SingleInstanceGuard> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateMutexW(
+            mutex_attributes: *mut core::ffi::c_void,
+            initial_owner: i32,
+            name: *const u16,
+        ) -> isize;
+        fn GetLastError() -> u32;
+    }
+
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+    let name: Vec<u16> = "Local\\xiaoxingshell_single_instance"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let handle = unsafe { CreateMutexW(std::ptr::null_mut(), 1, name.as_ptr()) };
+    if handle == 0 {
+        anyhow::bail!("failed to create single-instance mutex");
+    }
+    let last_error = unsafe { GetLastError() };
+    if last_error == ERROR_ALREADY_EXISTS {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn CloseHandle(handle: isize) -> i32;
+        }
+        unsafe {
+            CloseHandle(handle);
+        }
+        tracing::info!("another xiaoxingshell instance is already running");
+        anyhow::bail!("another instance is already running");
+    }
+    Ok(SingleInstanceGuard(handle))
+}
+
+#[cfg(not(windows))]
+fn acquire_single_instance_guard() -> anyhow::Result<()> {
+    Ok(())
 }
 
 /// Set up tracing: stderr (honours RUST_LOG, default info) **plus** a capped

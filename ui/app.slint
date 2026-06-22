@@ -270,6 +270,10 @@ export component AppWindow inherits Window {
     // Two-way binding to Theme.dark — Rust reads/writes this property and
     // Slint propagates it to every widget that references Theme colours.
     in-out property <bool> dark-mode <=> Theme.dark;
+    in-out property <brush> nav-rail-bg <=> Theme.nav-rail-bg;
+    in-out property <brush> top-bar-bg <=> Theme.top-bar-bg;
+    in-out property <brush> term-bg <=> Theme.term-bg;
+    in-out property <image> term-bg-image;
     // Keep Slint's std-widgets (LineEdit / Button / ComboBox in the dialogs) in
     // step with our theme — otherwise in light mode they keep the platform/dark
     // palette and their text/borders blend into the light dialog background.
@@ -280,17 +284,32 @@ export component AppWindow inherits Window {
     in-out property <string> ui-font-family <=> Theme.ui-font-family;
     in property <[string]> term-fonts;             // installed monospace families
     in-out property <bool> interface-open: false;  // Interface settings dialog
+    out property <length> ifd-width: 700px;
+    out property <length> ifd-height: 600px;
     // Interface dialog position (draggable by its title bar); init centered.
-    property <length> ifd-x: (root.width - 644px) / 2;
-    property <length> ifd-y: (root.height - 414px) / 2;
+    property <length> ifd-x: (root.width - root.ifd-width) / 2;
+    property <length> ifd-y: (root.height - root.ifd-height) / 2;
     property <bool> ifd-dragging;
     property <length> ifd-base-x;
     property <length> ifd-base-y;
     property <length> ifd-grab-x;
     property <length> ifd-grab-y;
-    property <string> ifd-page: "font";   // active Interface page: "font" | "sftp" | "sidebar" | "sync" | "download"
+    property <string> ifd-page: "font";   // active Interface page: "font" | "color" | "sftp" | "sidebar" | "sync" | "download"
     callback set-term-font(string);                // apply + persist font family
     callback set-term-font-size(int);              // apply + persist font size (px)
+    in-out property <string> nav-rail-color-text: "";
+    in-out property <string> top-bar-color-text: "";
+    in-out property <string> term-bg-color-text: "";
+    in-out property <string> term-bg-image-path: "";
+    in-out property <int> term-bg-image-opacity: 55;
+    in-out property <string> term-bg-image-fit: "cover";
+    callback set-nav-rail-bg(string);              // apply + persist nav rail background
+    callback set-top-bar-bg(string);               // apply + persist top bar background
+    callback set-term-bg(string);                  // apply + persist terminal background
+    callback pick-term-bg-image();                 // choose terminal background image
+    callback clear-term-bg-image();                // clear terminal background image
+    callback set-term-bg-image-opacity(int);       // apply + persist terminal bg image overlay opacity
+    callback set-term-bg-image-fit(string);        // apply + persist terminal bg image fit mode
     // SFTP follows the terminal's cd; opt out in Interface settings.
     in-out property <bool> sftp-follow-cd: true;
     callback set-sftp-follow-cd(bool);             // apply + persist
@@ -468,6 +487,8 @@ export component AppWindow inherits Window {
 
     // Raw keystroke forwarding: Rust converts key+modifiers to PTY bytes.
     callback send-key(string /* tab-id */, string /* key */, bool /* ctrl */, bool /* alt */, bool /* shift */);
+    // Terminal input focus policy, e.g. switch Windows IME to English.
+    callback terminal-focused(string /* tab-id */);
     // Notifies Rust of a PTY resize (pixel dimensions; Rust converts to cols/rows).
     callback terminal-resize(string /* tab-id */, float /* width-px */, float /* height-px */);
 
@@ -543,7 +564,7 @@ export component AppWindow inherits Window {
         // shows the toolbar icons via the overlay further below.
         if root.custom-titlebar : Rectangle {
             height: 38px;
-            background: Theme.bg-panel;
+            background: root.top-bar-bg;
             tb-drag := TouchArea {
                 pointer-event(e) => {
                     if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
@@ -594,7 +615,7 @@ export component AppWindow inherits Window {
 
                 Rectangle {
                     width: 52px;
-                    background: Theme.bg-panel-alt;
+                    background: root.nav-rail-bg;
                     border-width: 1px;
                     border-color: Theme.border-subtle;
 
@@ -616,9 +637,14 @@ export component AppWindow inherits Window {
 
                         NavRailBtn {
                             icon: "\u{E8B8}";
-                            tooltip: root.lang-en ? "Reserved" : "预留";
-                            active: false;
-                            clicked => { root.nav-panel-open = 0; }
+                            tooltip: root.lang-en ? "Settings" : "设置";
+                            active: root.interface-open;
+                            clicked => {
+                                root.nav-panel-open = 0;
+                                root.settings-open = false;
+                                root.interface-open = true;
+                                root.ifd-page = "color";
+                            }
                         }
 
                         NavRailBtn {
@@ -828,7 +854,18 @@ export component AppWindow inherits Window {
                                 root.quick-cmd-manage-open = true;
                             }
                             send-key(key, ctrl, alt, shift) => { root.send-key(term.id, key, ctrl, alt, shift) }
+                            terminal-focused() => { root.terminal-focused(term.id); }
                             terminal-resize(w, h) => { root.terminal-resize(term.id, w, h) }
+                            terminal-bg-image: root.term-bg-image;
+                            terminal-bg-image-enabled: root.term-bg-image-path != "";
+                            terminal-bg-image-overlay-alpha: root.term-bg-image-opacity / 100;
+                            terminal-bg-image-fit-mode: root.term-bg-image-fit == "contain"
+                                ? 1
+                                : root.term-bg-image-fit == "fill"
+                                    ? 2
+                                    : root.term-bg-image-fit == "preserve"
+                                        ? 3
+                                        : 0;
                             sftp-navigate(path) => { root.sftp-navigate(term.id, path); }
                             sftp-download(path) => { root.sftp-download(term.id, path); }
                             sftp-download-folder-zip(path) => { root.sftp-download-folder-zip(term.id, path); }
@@ -2109,8 +2146,8 @@ export component AppWindow inherits Window {
         Rectangle {
             x: root.ifd-x;
             y: root.ifd-y;
-            width: 644px;   // +15%
-            height: 414px;  // +15%
+            width: root.ifd-width;
+            height: root.ifd-height;
             background: Theme.bg-panel;
             border-radius: Theme.radius-md;
             border-width: 1px;
@@ -2144,10 +2181,10 @@ export component AppWindow inherits Window {
                                 // modal dialog becomes unclosable (#119-followup).
                                 root.ifd-x = clamp(
                                     root.ifd-base-x + (self.absolute-position.x + self.mouse-x - root.ifd-grab-x),
-                                    0px, max(0px, root.width - 644px));
+                                    0px, max(0px, root.width - root.ifd-width));
                                 root.ifd-y = clamp(
                                     root.ifd-base-y + (self.absolute-position.y + self.mouse-y - root.ifd-grab-y),
-                                    0px, max(0px, root.height - 414px));
+                                    0px, max(0px, root.height - root.ifd-height));
                             }
                         }
                     }
@@ -2203,6 +2240,27 @@ export component AppWindow inherits Window {
                                            color: Theme.text-primary; font-size: Theme.fs-sm; vertical-alignment: center; }
                                     Text { text: root.lang-en ? "Font" : "字体";
                                            color: Theme.text-primary; font-size: Theme.fs-md;
+                                           font-weight: 600;
+                                           vertical-alignment: center; horizontal-stretch: 1; }
+                                }
+                            }
+                            Rectangle {
+                                height: 30px;
+                                border-radius: Theme.radius-sm;
+                                background: root.ifd-page == "color"
+                                    ? Theme.bg-active
+                                    : (nav-color-ta.has-hover ? Theme.bg-hover : transparent);
+                                nav-color-ta := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { root.ifd-page = "color"; }
+                                }
+                                HorizontalLayout {
+                                    padding-left: 10px; spacing: 8px;
+                                    Text { text: "\u{E40A}"; font-family: "Material Icons";
+                                           color: Theme.text-primary; font-size: Theme.fs-sm; vertical-alignment: center; }
+                                    Text { text: root.lang-en ? "Colors" : "颜色";
+                                           color: Theme.text-primary; font-size: Theme.fs-md;
+                                           font-weight: 600;
                                            vertical-alignment: center; horizontal-stretch: 1; }
                                 }
                             }
@@ -2223,6 +2281,7 @@ export component AppWindow inherits Window {
                                            color: Theme.text-primary; font-size: Theme.fs-sm; vertical-alignment: center; }
                                     Text { text: "SFTP";
                                            color: Theme.text-primary; font-size: Theme.fs-md;
+                                           font-weight: 600;
                                            vertical-alignment: center; horizontal-stretch: 1; }
                                 }
                             }
@@ -2243,6 +2302,7 @@ export component AppWindow inherits Window {
                                            color: Theme.text-primary; font-size: Theme.fs-sm; vertical-alignment: center; }
                                     Text { text: root.lang-en ? "Sidebars" : "侧栏";
                                            color: Theme.text-primary; font-size: Theme.fs-md;
+                                           font-weight: 600;
                                            vertical-alignment: center; horizontal-stretch: 1; }
                                 }
                             }
@@ -2263,6 +2323,7 @@ export component AppWindow inherits Window {
                                            color: Theme.text-primary; font-size: Theme.fs-sm; vertical-alignment: center; }
                                     Text { text: root.lang-en ? "Session sync" : "会话同步";
                                            color: Theme.text-primary; font-size: Theme.fs-md;
+                                           font-weight: 600;
                                            vertical-alignment: center; horizontal-stretch: 1; }
                                 }
                             }
@@ -2282,6 +2343,7 @@ export component AppWindow inherits Window {
                                            color: Theme.text-primary; font-size: Theme.fs-sm; vertical-alignment: center; }
                                     Text { text: root.lang-en ? "Download" : "下载";
                                            color: Theme.text-primary; font-size: Theme.fs-md;
+                                           font-weight: 600;
                                            vertical-alignment: center; horizontal-stretch: 1; }
                                 }
                             }
@@ -2290,174 +2352,455 @@ export component AppWindow inherits Window {
                     Rectangle {
                         horizontal-stretch: 73;
                         background: Theme.bg-panel;
-                        if root.ifd-page == "font" : VerticalLayout {
-                            padding: 18px;
-                            spacing: 14px;
-                            alignment: start;
+                        settings-scroll := ScrollView {
+                            horizontal-stretch: 1;
+                            vertical-stretch: 1;
+                            viewport-width: self.width;
 
-                            VerticalLayout {
-                                spacing: 6px;
-                                Text { text: root.lang-en ? "Font family" : "字体";
-                                       color: Theme.text-secondary; font-size: Theme.fs-sm; }
-                                HorizontalLayout {
-                                    ComboBox {
-                                        width: 260px;
-                                        model: root.term-fonts;
-                                        current-value: root.term-font-family;
-                                        selected => { root.set-term-font(self.current-value); }
+                            Rectangle {
+                                width: settings-scroll.visible-width;
+
+                                if root.ifd-page == "font" : VerticalLayout {
+                                    width: parent.width;
+                                    padding: 18px;
+                                    spacing: 14px;
+                                    alignment: start;
+
+                                    VerticalLayout {
+                                        spacing: 6px;
+                                        Text { text: root.lang-en ? "Font family" : "字体";
+                                               color: Theme.text-secondary; font-size: Theme.fs-sm; }
+                                        HorizontalLayout {
+                                            ComboBox {
+                                                width: 260px;
+                                                model: root.term-fonts;
+                                                current-value: root.term-font-family;
+                                                selected => { root.set-term-font(self.current-value); }
+                                            }
+                                            Rectangle { horizontal-stretch: 1; }
+                                        }
                                     }
-                                    Rectangle { horizontal-stretch: 1; }
-                                }
-                            }
 
-                            VerticalLayout {
-                                spacing: 6px;
-                                Text { text: root.lang-en ? "Font size" : "字体大小";
-                                       color: Theme.text-secondary; font-size: Theme.fs-sm; }
-                                HorizontalLayout {
-                                    spacing: 10px;
-                                    SpinBox {
-                                        width: 120px;
-                                        value: root.term-font-size / 1px;
-                                        minimum: 8;
-                                        maximum: 32;
-                                        edited => { root.set-term-font-size(self.value); }
+                                    VerticalLayout {
+                                        spacing: 6px;
+                                        Text { text: root.lang-en ? "Font size" : "字体大小";
+                                               color: Theme.text-secondary; font-size: Theme.fs-sm; }
+                                        HorizontalLayout {
+                                            spacing: 10px;
+                                            SpinBox {
+                                                width: 120px;
+                                                value: root.term-font-size / 1px;
+                                                minimum: 8;
+                                                maximum: 32;
+                                                edited => { root.set-term-font-size(self.value); }
+                                            }
+                                            Text {
+                                                text: (root.term-font-size / 1px) + " px";
+                                                color: Theme.text-muted;
+                                                font-size: Theme.fs-sm;
+                                                vertical-alignment: center;
+                                            }
+                                            Rectangle { horizontal-stretch: 1; }
+                                        }
+                                    }
+
+                                    Rectangle {
+                                        height: 56px;
+                                        background: Theme.term-bg;
+                                        border-radius: Theme.radius-sm;
+                                        border-width: 1px;
+                                        border-color: Theme.border-subtle;
+                                        Text {
+                                            x: 10px;
+                                            text: "xiaoxingshell ~$ echo preview 0123";
+                                            font-family: Theme.term-font-family;
+                                            font-size: Theme.term-font-size;
+                                            color: Theme.term-fg;
+                                            vertical-alignment: center;
+                                            height: parent.height;
+                                        }
+                                    }
+                                }
+
+                                if root.ifd-page == "color" : VerticalLayout {
+                                    width: parent.width;
+                                    padding: 16px;
+                                    spacing: 12px;
+                                    alignment: start;
+
+                                    Rectangle {
+                                        width: parent.width - 36px;
+                                        height: 220px;
+                                        border-radius: Theme.radius-sm;
+                                        background: Theme.bg-panel-alt;
+                                        border-width: 1px;
+                                        border-color: Theme.border-subtle;
+
+                                        VerticalLayout {
+                                            padding: 14px;
+                                            spacing: 10px;
+
+                                            Text {
+                                                text: root.lang-en ? "Terminal background image" : "终端背景图片";
+                                                color: Theme.text-primary;
+                                                font-size: Theme.fs-md;
+                                            }
+
+                                            HorizontalLayout {
+                                                spacing: 8px;
+                                                Button {
+                                                    text: root.lang-en ? "Choose image" : "选择图片";
+                                                    clicked => { root.pick-term-bg-image(); }
+                                                }
+                                                Button {
+                                                    text: root.lang-en ? "Clear image" : "清除图片";
+                                                    clicked => { root.clear-term-bg-image(); }
+                                                }
+                                                Rectangle { horizontal-stretch: 1; }
+                                            }
+
+                                            Rectangle {
+                                                height: 32px;
+                                                border-radius: Theme.radius-sm;
+                                                border-width: 1px;
+                                                border-color: Theme.border-subtle;
+                                                background: Theme.bg-panel;
+                                                Text {
+                                                    x: 10px;
+                                                    width: parent.width - 20px;
+                                                    height: parent.height;
+                                                    text: root.term-bg-image-path == ""
+                                                        ? (root.lang-en ? "No image selected" : "未选择图片")
+                                                        : root.term-bg-image-path;
+                                                    color: root.term-bg-image-path == "" ? Theme.text-muted : Theme.text-primary;
+                                                    font-size: Theme.fs-sm;
+                                                    vertical-alignment: center;
+                                                    overflow: elide;
+                                                }
+                                            }
+
+                                            HorizontalLayout {
+                                                spacing: 10px;
+                                                Text {
+                                                    text: root.lang-en ? "Overlay" : "遮罩";
+                                                    color: Theme.text-secondary;
+                                                    font-size: Theme.fs-sm;
+                                                    vertical-alignment: center;
+                                                    width: 52px;
+                                                }
+                                                op-dec := Button {
+                                                    text: "-";
+                                                    clicked => {
+                                                        let next = max(0, root.term-bg-image-opacity - 5);
+                                                        root.term-bg-image-opacity = next;
+                                                        root.set-term-bg-image-opacity(next);
+                                                    }
+                                                }
+                                                Text {
+                                                    text: root.term-bg-image-opacity + "%";
+                                                    color: Theme.text-primary;
+                                                    font-size: Theme.fs-sm;
+                                                    vertical-alignment: center;
+                                                    width: 52px;
+                                                }
+                                                op-inc := Button {
+                                                    text: "+";
+                                                    clicked => {
+                                                        let next = min(100, root.term-bg-image-opacity + 5);
+                                                        root.term-bg-image-opacity = next;
+                                                        root.set-term-bg-image-opacity(next);
+                                                    }
+                                                }
+                                                Rectangle { horizontal-stretch: 1; }
+                                            }
+
+                                            HorizontalLayout {
+                                                spacing: 6px;
+                                                Text {
+                                                    text: root.lang-en ? "Mode" : "模式";
+                                                    color: Theme.text-secondary;
+                                                    font-size: Theme.fs-sm;
+                                                    vertical-alignment: center;
+                                                    width: 52px;
+                                                }
+                                                ComboBox {
+                                                    horizontal-stretch: 1;
+                                                    model: [
+                                                        root.lang-en ? "Cover" : "铺满裁切",
+                                                        root.lang-en ? "Contain" : "完整显示",
+                                                        root.lang-en ? "Fill" : "拉伸填满",
+                                                        root.lang-en ? "Preserve" : "原尺寸"
+                                                    ];
+                                                    current-index: root.term-bg-image-fit == "contain"
+                                                        ? 1
+                                                        : root.term-bg-image-fit == "fill"
+                                                            ? 2
+                                                            : root.term-bg-image-fit == "preserve"
+                                                                ? 3
+                                                                : 0;
+                                                    selected => {
+                                                        if (self.current-index == 1) {
+                                                            root.term-bg-image-fit = "contain";
+                                                            root.set-term-bg-image-fit("contain");
+                                                        } else if (self.current-index == 2) {
+                                                            root.term-bg-image-fit = "fill";
+                                                            root.set-term-bg-image-fit("fill");
+                                                        } else if (self.current-index == 3) {
+                                                            root.term-bg-image-fit = "preserve";
+                                                            root.set-term-bg-image-fit("preserve");
+                                                        } else {
+                                                            root.term-bg-image-fit = "cover";
+                                                            root.set-term-bg-image-fit("cover");
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    Rectangle {
+                                        width: parent.width - 36px;
+                                        height: 118px;
+                                        border-radius: Theme.radius-sm;
+                                        background: Theme.bg-panel-alt;
+                                        border-width: 1px;
+                                        border-color: Theme.border-subtle;
+
+                                        VerticalLayout {
+                                            padding: 14px;
+                                            spacing: 10px;
+
+                                            Text {
+                                                text: root.lang-en ? "Top title bar background" : "顶部标题栏背景";
+                                                color: Theme.text-primary;
+                                                font-size: Theme.fs-md;
+                                            }
+
+                                            HorizontalLayout {
+                                                spacing: 8px;
+                                                Rectangle { width: 54px; height: 26px; border-radius: Theme.radius-sm; border-width: 1px; border-color: Theme.border-strong; background: Theme.bg-panel-alt;
+                                                    Text { text: root.lang-en ? "Default" : "默认色"; color: Theme.text-primary; font-size: Theme.fs-xs; horizontal-alignment: center; vertical-alignment: center; width: parent.width; height: parent.height; }
+                                                    TouchArea { mouse-cursor: pointer; clicked => { root.top-bar-color-text = ""; root.set-top-bar-bg(""); } }
+                                                }
+                                                Rectangle { width: 26px; height: 26px; border-radius: Theme.radius-sm; border-width: 1px; border-color: Theme.border-strong; background: #2a2d35;
+                                                    TouchArea { mouse-cursor: pointer; clicked => { root.top-bar-color-text = "2A2D35"; root.set-top-bar-bg(root.top-bar-color-text); } }
+                                                }
+                                                Rectangle { width: 26px; height: 26px; border-radius: Theme.radius-sm; border-width: 1px; border-color: Theme.border-strong; background: #304457;
+                                                    TouchArea { mouse-cursor: pointer; clicked => { root.top-bar-color-text = "304457"; root.set-top-bar-bg(root.top-bar-color-text); } }
+                                                }
+                                                Rectangle { width: 26px; height: 26px; border-radius: Theme.radius-sm; border-width: 1px; border-color: Theme.border-strong; background: #3f384f;
+                                                    TouchArea { mouse-cursor: pointer; clicked => { root.top-bar-color-text = "3F384F"; root.set-top-bar-bg(root.top-bar-color-text); } }
+                                                }
+                                                Rectangle { width: 26px; height: 26px; border-radius: Theme.radius-sm; border-width: 1px; border-color: Theme.border-strong; background: #315040;
+                                                    TouchArea { mouse-cursor: pointer; clicked => { root.top-bar-color-text = "315040"; root.set-top-bar-bg(root.top-bar-color-text); } }
+                                                }
+                                                Rectangle { width: 26px; height: 26px; border-radius: Theme.radius-sm; border-width: 1px; border-color: Theme.border-strong; background: #5a4132;
+                                                    TouchArea { mouse-cursor: pointer; clicked => { root.top-bar-color-text = "5A4132"; root.set-top-bar-bg(root.top-bar-color-text); } }
+                                                }
+                                                Rectangle { width: 26px; height: 26px; border-radius: Theme.radius-sm; border-width: 1px; border-color: Theme.border-strong; background: #3e4a22;
+                                                    TouchArea { mouse-cursor: pointer; clicked => { root.top-bar-color-text = "3E4A22"; root.set-top-bar-bg(root.top-bar-color-text); } }
+                                                }
+                                                Rectangle { width: 26px; height: 26px; border-radius: Theme.radius-sm; border-width: 1px; border-color: Theme.border-strong; background: #3f3f3f;
+                                                    TouchArea { mouse-cursor: pointer; clicked => { root.top-bar-color-text = "3F3F3F"; root.set-top-bar-bg(root.top-bar-color-text); } }
+                                                }
+
+                                                Rectangle { horizontal-stretch: 1; }
+                                            }
+
+                                            HorizontalLayout {
+                                                spacing: 8px;
+                                                Text {
+                                                    text: "RGB";
+                                                    color: Theme.text-secondary;
+                                                    font-size: Theme.fs-sm;
+                                                    vertical-alignment: center;
+                                                    width: 28px;
+                                                }
+                                                top-color-input := LineEdit {
+                                                    width: 220px;
+                                                    text <=> root.top-bar-color-text;
+                                                    placeholder-text: root.lang-en ? "default / 3366FF" : "默认 / 3366FF";
+                                                    accepted => { root.set-top-bar-bg(self.text); }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    Rectangle {
+                                        width: parent.width - 36px;
+                                        height: 118px;
+                                        border-radius: Theme.radius-sm;
+                                        background: Theme.bg-panel-alt;
+                                        border-width: 1px;
+                                        border-color: Theme.border-subtle;
+
+                                        VerticalLayout {
+                                            padding: 14px;
+                                            spacing: 10px;
+
+                                            Text {
+                                                text: root.lang-en ? "Terminal background" : "终端区域背景";
+                                                color: Theme.text-primary;
+                                                font-size: Theme.fs-md;
+                                            }
+
+                                            HorizontalLayout {
+                                                spacing: 8px;
+                                                Rectangle { width: 54px; height: 26px; border-radius: Theme.radius-sm; border-width: 1px; border-color: Theme.border-strong; background: Theme.bg-panel-alt;
+                                                    Text { text: root.lang-en ? "Default" : "默认色"; color: Theme.text-primary; font-size: Theme.fs-xs; horizontal-alignment: center; vertical-alignment: center; width: parent.width; height: parent.height; }
+                                                    TouchArea { mouse-cursor: pointer; clicked => { root.term-bg-color-text = ""; root.set-term-bg(""); } }
+                                                }
+                                                Rectangle { width: 26px; height: 26px; border-radius: Theme.radius-sm; border-width: 1px; border-color: Theme.border-strong; background: #0e0f13;
+                                                    TouchArea { mouse-cursor: pointer; clicked => { root.term-bg-color-text = "0E0F13"; root.set-term-bg(root.term-bg-color-text); } }
+                                                }
+                                                Rectangle { width: 26px; height: 26px; border-radius: Theme.radius-sm; border-width: 1px; border-color: Theme.border-strong; background: #152238;
+                                                    TouchArea { mouse-cursor: pointer; clicked => { root.term-bg-color-text = "152238"; root.set-term-bg(root.term-bg-color-text); } }
+                                                }
+                                                Rectangle { width: 26px; height: 26px; border-radius: Theme.radius-sm; border-width: 1px; border-color: Theme.border-strong; background: #221b2f;
+                                                    TouchArea { mouse-cursor: pointer; clicked => { root.term-bg-color-text = "221B2F"; root.set-term-bg(root.term-bg-color-text); } }
+                                                }
+                                                Rectangle { width: 26px; height: 26px; border-radius: Theme.radius-sm; border-width: 1px; border-color: Theme.border-strong; background: #1c2a1f;
+                                                    TouchArea { mouse-cursor: pointer; clicked => { root.term-bg-color-text = "1C2A1F"; root.set-term-bg(root.term-bg-color-text); } }
+                                                }
+                                                Rectangle { width: 26px; height: 26px; border-radius: Theme.radius-sm; border-width: 1px; border-color: Theme.border-strong; background: #2d2118;
+                                                    TouchArea { mouse-cursor: pointer; clicked => { root.term-bg-color-text = "2D2118"; root.set-term-bg(root.term-bg-color-text); } }
+                                                }
+                                                Rectangle { width: 26px; height: 26px; border-radius: Theme.radius-sm; border-width: 1px; border-color: Theme.border-strong; background: #1d2414;
+                                                    TouchArea { mouse-cursor: pointer; clicked => { root.term-bg-color-text = "1D2414"; root.set-term-bg(root.term-bg-color-text); } }
+                                                }
+                                                Rectangle { width: 26px; height: 26px; border-radius: Theme.radius-sm; border-width: 1px; border-color: Theme.border-strong; background: #202020;
+                                                    TouchArea { mouse-cursor: pointer; clicked => { root.term-bg-color-text = "202020"; root.set-term-bg(root.term-bg-color-text); } }
+                                                }
+
+                                                Rectangle { horizontal-stretch: 1; }
+                                            }
+
+                                            HorizontalLayout {
+                                                spacing: 8px;
+                                                Text {
+                                                    text: "RGB";
+                                                    color: Theme.text-secondary;
+                                                    font-size: Theme.fs-sm;
+                                                    vertical-alignment: center;
+                                                    width: 28px;
+                                                }
+                                                term-bg-input := LineEdit {
+                                                    width: 220px;
+                                                    text <=> root.term-bg-color-text;
+                                                    placeholder-text: root.lang-en ? "default / 3366FF" : "默认 / 3366FF";
+                                                    accepted => { root.set-term-bg(self.text); }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if root.ifd-page == "sftp" : VerticalLayout {
+                                    width: parent.width;
+                                    padding: 18px;
+                                    spacing: 14px;
+                                    alignment: start;
+
+                                    CheckBox {
+                                        text: root.lang-en
+                                            ? "SFTP follows terminal cd"
+                                            : "SFTP 跟随 cd 更新";
+                                        checked <=> root.sftp-follow-cd;
+                                        toggled => { root.set-sftp-follow-cd(self.checked); }
                                     }
                                     Text {
-                                        text: (root.term-font-size / 1px) + " px";
+                                        text: root.lang-en
+                                            ? "When enabled, a cd in the terminal switches the SFTP panel to the same directory."
+                                            : "勾选后,终端里执行 cd 时,SFTP 面板会自动切换到相同目录。";
                                         color: Theme.text-muted;
                                         font-size: Theme.fs-sm;
-                                        vertical-alignment: center;
+                                        wrap: word-wrap;
                                     }
-                                    Rectangle { horizontal-stretch: 1; }
                                 }
-                            }
 
-                            // Live preview row.
-                            Rectangle {
-                                height: 56px;
-                                background: Theme.term-bg;
-                                border-radius: Theme.radius-sm;
-                                border-width: 1px;
-                                border-color: Theme.border-subtle;
-                                Text {
-                                    x: 10px;
-                                    text: "xiaoxingshell ~$ echo preview 0123";
-                                    font-family: Theme.term-font-family;
-                                    font-size: Theme.term-font-size;
-                                    color: Theme.term-fg;
-                                    vertical-alignment: center;
-                                    height: parent.height;
+                                if root.ifd-page == "sidebar" : VerticalLayout {
+                                    width: parent.width;
+                                    padding: 18px;
+                                    spacing: 14px;
+                                    alignment: start;
+
+                                    CheckBox {
+                                        text: root.lang-en
+                                            ? "Collapse the resource panel by default"
+                                            : "默认收起资源视图面板";
+                                        checked <=> root.collapse-sidebar-default;
+                                        toggled => { root.set-collapse-sidebar-default(self.checked); }
+                                    }
+                                    CheckBox {
+                                        text: root.lang-en
+                                            ? "Collapse the SFTP panel by default"
+                                            : "默认收起 SFTP 侧栏";
+                                        checked <=> root.collapse-sftp-default;
+                                        toggled => { root.set-collapse-sftp-default(self.checked); }
+                                    }
+                                    Text {
+                                        text: root.lang-en
+                                            ? "Takes effect on the next launch; useful on low-spec jump hosts where the always-on panels add overhead."
+                                            : "下次启动生效;在低配跳板机上可减少常驻面板的开销。";
+                                        color: Theme.text-muted;
+                                        font-size: Theme.fs-sm;
+                                        wrap: word-wrap;
+                                    }
                                 }
-                            }
-                        }
 
-                        // --- SFTP page -------------------------------------
-                        if root.ifd-page == "sftp" : VerticalLayout {
-                            padding: 18px;
-                            spacing: 14px;
-                            alignment: start;
+                                if root.ifd-page == "sync" : VerticalLayout {
+                                    width: parent.width;
+                                    padding: 18px;
+                                    spacing: 14px;
+                                    alignment: start;
 
-                            CheckBox {
-                                text: root.lang-en
-                                    ? "SFTP follows terminal cd"
-                                    : "SFTP 跟随 cd 更新";
-                                // Two-way so the property stays in sync — reopening
-                                // the dialog then shows the right state (#87).
-                                checked <=> root.sftp-follow-cd;
-                                toggled => { root.set-sftp-follow-cd(self.checked); }
-                            }
-                            Text {
-                                text: root.lang-en
-                                    ? "When enabled, a cd in the terminal switches the SFTP panel to the same directory."
-                                    : "勾选后,终端里执行 cd 时,SFTP 面板会自动切换到相同目录。";
-                                color: Theme.text-muted;
-                                font-size: Theme.fs-sm;
-                                wrap: word-wrap;
-                            }
-                        }
+                                    Text {
+                                        text: root.lang-en
+                                            ? "Session sync is toggled from the sync icon in the top-right bar. When on, keystrokes are mirrored to all online sessions."
+                                            : "会话同步从右上角的同步图标开关。开启后,输入会同步到所有在线会话。";
+                                        color: Theme.text-muted;
+                                        font-size: Theme.fs-sm;
+                                        wrap: word-wrap;
+                                    }
+                                    CheckBox {
+                                        text: root.lang-en
+                                            ? "Sync file uploads during session sync"
+                                            : "会话同步时文件上传同步";
+                                        checked <=> root.sync-upload-enabled;
+                                        toggled => { root.set-sync-upload-enabled(self.checked); }
+                                    }
+                                    Text {
+                                        text: root.lang-en
+                                            ? "An uploaded file goes to the same path on each session; if that path doesn't exist there, it goes to that session's current SFTP directory."
+                                            : "上传一个文件会默认上传到相应第一个会话的同样路径，若路径不存在则上传到当前sftp停留的路径";
+                                        color: Theme.text-muted;
+                                        font-size: Theme.fs-sm;
+                                        wrap: word-wrap;
+                                    }
+                                }
 
-                        // --- Sidebars page (#78) ---------------------------
-                        if root.ifd-page == "sidebar" : VerticalLayout {
-                            padding: 18px;
-                            spacing: 14px;
-                            alignment: start;
+                                if root.ifd-page == "download" : VerticalLayout {
+                                    width: parent.width;
+                                    padding: 18px;
+                                    spacing: 14px;
+                                    alignment: start;
 
-                            CheckBox {
-                                text: root.lang-en
-                                    ? "Collapse the resource panel by default"
-                                    : "默认收起资源视图面板";
-                                checked <=> root.collapse-sidebar-default;
-                                toggled => { root.set-collapse-sidebar-default(self.checked); }
-                            }
-                            CheckBox {
-                                text: root.lang-en
-                                    ? "Collapse the SFTP panel by default"
-                                    : "默认收起 SFTP 侧栏";
-                                checked <=> root.collapse-sftp-default;
-                                toggled => { root.set-collapse-sftp-default(self.checked); }
-                            }
-                            Text {
-                                text: root.lang-en
-                                    ? "Takes effect on the next launch; useful on low-spec jump hosts where the always-on panels add overhead."
-                                    : "下次启动生效;在低配跳板机上可减少常驻面板的开销。";
-                                color: Theme.text-muted;
-                                font-size: Theme.fs-sm;
-                                wrap: word-wrap;
-                            }
-                        }
-
-                        // --- Session sync page (#sync) ---------------------
-                        if root.ifd-page == "sync" : VerticalLayout {
-                            padding: 18px;
-                            spacing: 14px;
-                            alignment: start;
-
-                            Text {
-                                text: root.lang-en
-                                    ? "Session sync is toggled from the sync icon in the top-right bar. When on, keystrokes are mirrored to all online sessions."
-                                    : "会话同步从右上角的同步图标开关。开启后,输入会同步到所有在线会话。";
-                                color: Theme.text-muted;
-                                font-size: Theme.fs-sm;
-                                wrap: word-wrap;
-                            }
-                            CheckBox {
-                                text: root.lang-en
-                                    ? "Sync file uploads during session sync"
-                                    : "会话同步时文件上传同步";
-                                checked <=> root.sync-upload-enabled;
-                                toggled => { root.set-sync-upload-enabled(self.checked); }
-                            }
-                            Text {
-                                text: root.lang-en
-                                    ? "An uploaded file goes to the same path on each session; if that path doesn't exist there, it goes to that session's current SFTP directory."
-                                    : "上传一个文件会默认上传到相应第一个会话的同样路径，若路径不存在则上传到当前sftp停留的路径";
-                                color: Theme.text-muted;
-                                font-size: Theme.fs-sm;
-                                wrap: word-wrap;
-                            }
-                        }
-
-                        // --- Download page (#87) -----------------------
-                        if root.ifd-page == "download" : VerticalLayout {
-                            padding: 18px;
-                            spacing: 14px;
-                            alignment: start;
-
-                            CheckBox {
-                                text: root.lang-en
-                                    ? "Always ask where to save"
-                                    : "总是询问保存去何处";
-                                checked <=> root.download-always-ask;
-                                toggled => { root.set-download-always-ask(self.checked); }
-                            }
-                            Text {
-                                text: root.lang-en
-                                    ? "When enabled, every download prompts for a save location instead of using the preset download folder."
-                                    : "勾选后,每次下载都会询问保存位置,而不是直接保存到预设的下载目录。";
-                                color: Theme.text-muted;
-                                font-size: Theme.fs-sm;
-                                wrap: word-wrap;
+                                    CheckBox {
+                                        text: root.lang-en
+                                            ? "Always ask where to save"
+                                            : "总是询问保存去何处";
+                                        checked <=> root.download-always-ask;
+                                        toggled => { root.set-download-always-ask(self.checked); }
+                                    }
+                                    Text {
+                                        text: root.lang-en
+                                            ? "When enabled, every download prompts for a save location instead of using the preset download folder."
+                                            : "勾选后,每次下载都会询问保存位置,而不是直接保存到预设的下载目录。";
+                                        color: Theme.text-muted;
+                                        font-size: Theme.fs-sm;
+                                        wrap: word-wrap;
+                                    }
+                                }
                             }
                         }
                     }

@@ -1,6 +1,6 @@
 [package]
 name = "xiaoxingshell"
-version = "1.0.6"
+version = "1.0.7"
 edition = "2021"
 authors = ["xiaoxingshell contributors"]
 description = "A lightweight FinalShell-style SSH/terminal client written in Rust + Slint"
@@ -80,4 +80,16 @@ strip = "symbols"
 panic = "abort"
 
 [profile.dev]
-opt-level = 1
+opt-level = 0
+debug = 1
+incremental = true
+
+# Faster local packaging builds. Use this when you need a distributable binary
+# quickly during UI iteration; keep `--release` for final public builds.
+[profile.release-fast]
+inherits = "release"
+opt-level = 2
+lto = false
+codegen-units = 16
+strip = "none"
+incremental = true

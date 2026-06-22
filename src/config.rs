@@ -328,6 +328,24 @@ pub struct ConfigFile {
     /// Theme preference: "system" (default) | "dark" | "light".
     #[serde(default)]
     pub theme_pref: String,
+    /// Background color override for the narrow left nav rail. Empty = default.
+    #[serde(default)]
+    pub nav_rail_bg: String,
+    /// Background color override for the custom top title bar. Empty = default.
+    #[serde(default)]
+    pub top_bar_bg: String,
+    /// Background color override for the terminal viewport. Empty = default.
+    #[serde(default)]
+    pub term_bg: String,
+    /// Background image path for the terminal viewport. Empty = disabled.
+    #[serde(default)]
+    pub term_bg_image: String,
+    /// Overlay opacity above the terminal background image (0-100).
+    #[serde(default)]
+    pub term_bg_image_opacity: u32,
+    /// Terminal background image fit mode: cover | contain | fill | preserve.
+    #[serde(default)]
+    pub term_bg_image_fit: String,
     /// Terminal font family. Empty = the built-in default ("Meatshell Mono").
     #[serde(default)]
     pub font_family: String,
@@ -628,6 +646,64 @@ impl ConfigStore {
 
     pub fn set_theme_pref(&mut self, pref: String) {
         self.cache.theme_pref = pref;
+    }
+
+    pub fn nav_rail_bg(&self) -> &str {
+        &self.cache.nav_rail_bg
+    }
+
+    pub fn set_nav_rail_bg(&mut self, color: String) {
+        self.cache.nav_rail_bg = color;
+    }
+
+    pub fn top_bar_bg(&self) -> &str {
+        &self.cache.top_bar_bg
+    }
+
+    pub fn set_top_bar_bg(&mut self, color: String) {
+        self.cache.top_bar_bg = color;
+    }
+
+    pub fn term_bg(&self) -> &str {
+        &self.cache.term_bg
+    }
+
+    pub fn set_term_bg(&mut self, color: String) {
+        self.cache.term_bg = color;
+    }
+
+    pub fn term_bg_image(&self) -> &str {
+        &self.cache.term_bg_image
+    }
+
+    pub fn set_term_bg_image(&mut self, path: String) {
+        self.cache.term_bg_image = path;
+    }
+
+    pub fn term_bg_image_opacity(&self) -> u32 {
+        if self.cache.term_bg_image_opacity > 100 {
+            55
+        } else if self.cache.term_bg_image_opacity == 0 {
+            55
+        } else {
+            self.cache.term_bg_image_opacity
+        }
+    }
+
+    pub fn set_term_bg_image_opacity(&mut self, value: u32) {
+        self.cache.term_bg_image_opacity = value.min(100);
+    }
+
+    pub fn term_bg_image_fit(&self) -> &str {
+        if self.cache.term_bg_image_fit.is_empty() {
+            "cover"
+        } else {
+            &self.cache.term_bg_image_fit
+        }
+    }
+
+    pub fn set_term_bg_image_fit(&mut self, value: String) {
+        self.cache.term_bg_image_fit = value;
     }
 
     /// Terminal font family ("" = built-in default).

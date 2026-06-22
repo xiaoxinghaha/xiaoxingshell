@@ -86,6 +86,10 @@ export component TerminalView inherits Rectangle {
     in property <bool>   is-alt-screen;
     in property <[TermMatch]> find-matches; // search-highlight rectangles
     in property <[TermMatch]> selection;    // drag-selection highlight rectangles
+    in property <image> terminal-bg-image;
+    in property <bool> terminal-bg-image-enabled: false;
+    in property <float> terminal-bg-image-overlay-alpha: 0.55;
+    in property <int> terminal-bg-image-fit-mode: 0; // 0 cover, 1 contain, 2 fill, 3 preserve
 
     in property <string>  sftp-path: "/";
     in property <[SftpEntry]> sftp-entries;
@@ -122,6 +126,7 @@ export component TerminalView inherits Rectangle {
     callback delete-history(int /* index */);  // remove a history entry (#96)
 
     callback send-key(string, bool, bool, bool);
+    callback terminal-focused();
     callback terminal-resize(float, float);
     callback sftp-navigate(string);
     callback sftp-download(string);
@@ -253,6 +258,24 @@ export component TerminalView inherits Rectangle {
             // Re-sync the PTY size on return (it was frozen while hidden).
             root.terminal-resize(root.term-cols, root.term-rows);
         }
+    }
+
+    if root.terminal-bg-image-enabled : Image {
+        width: parent.width;
+        height: parent.height;
+        source: root.terminal-bg-image;
+        image-fit: root.terminal-bg-image-fit-mode == 1
+            ? ImageFit.contain
+            : root.terminal-bg-image-fit-mode == 2
+                ? ImageFit.fill
+                : root.terminal-bg-image-fit-mode == 3
+                    ? ImageFit.preserve
+                    : ImageFit.cover;
+    }
+    if root.terminal-bg-image-enabled : Rectangle {
+        width: parent.width;
+        height: parent.height;
+        background: Theme.bg-root.with-alpha(root.terminal-bg-image-overlay-alpha);
     }
 
     VerticalLayout {
@@ -589,7 +612,10 @@ export component TerminalView inherits Rectangle {
 
                 // Reset blink phase on focus gain so cursor appears immediately.
                 changed has-focus => {
-                    if (self.has-focus) { key-capture.cursor-blink = true; }
+                    if (self.has-focus) {
+                        key-capture.cursor-blink = true;
+                        root.terminal-focused();
+                    }
                 }
 
                 key-pressed(event) => {

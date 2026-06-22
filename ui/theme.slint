@@ -15,19 +15,21 @@ export global Theme {
     in-out property <bool> dark: true;
 
     // --- Palette -----------------------------------------------------------
-    out property <brush> bg-root:      dark ? #1b1d23 : #f5f5f7;
-    out property <brush> bg-panel:     dark ? #23262d : #ffffff;
-    out property <brush> bg-panel-alt: dark ? #2a2d35 : #f2f2f7;
-    out property <brush> bg-elevated:  dark ? #30333c : #e8e8ed;
-    out property <brush> bg-hover:     dark ? #373a44 : #e0e0e6;
-    out property <brush> bg-active:    dark ? #3f4350 : #d8d8de;
+    out property <brush> bg-root:      dark ? #18191d : #f5f5f7;
+    out property <brush> bg-panel:     dark ? #202125 : #ffffff;
+    out property <brush> bg-panel-alt: dark ? #25272c : #f2f2f7;
+    out property <brush> bg-elevated:  dark ? #2c2c2a : #e8e8ed;
+    out property <brush> bg-hover:     dark ? #343434 : #e0e0e6;
+    out property <brush> bg-active:    dark ? #444753 : #d8d8de;
+    in-out property <brush> nav-rail-bg: dark ? #25272c : #ececf1;
+    in-out property <brush> top-bar-bg:  dark ? #25272c : #f2f2f7;
 
-    out property <brush> border-subtle: dark ? #3a3d46 : #e2e2e8;
-    out property <brush> border-strong: dark ? #4a4e59 : #c7c7cc;
+    out property <brush> border-subtle: dark ? #33363d : #e2e2e8;
+    out property <brush> border-strong: dark ? #41454d : #c7c7cc;
 
-    out property <brush> text-primary:   dark ? #e6e8ee : #1d1d1f;
-    out property <brush> text-secondary: dark ? #b4b9c4 : #6e6e73;
-    out property <brush> text-muted:     dark ? #9196a3 : #aeaeb2;
+    out property <brush> text-primary:   dark ? #f0f2f6 : #1d1d1f;
+    out property <brush> text-secondary: dark ? #c9ced8 : #6e6e73;
+    out property <brush> text-muted:     dark ? #a9afba : #aeaeb2;
 
     out property <brush> accent:         dark ? #4a90e2 : #0071e3;
     out property <brush> accent-hover:   dark ? #5aa0f2 : #0077ed;
@@ -39,7 +41,7 @@ export global Theme {
 
     // Terminal uses its own background so it stays readable regardless of
     // what the shell / remote app outputs via ANSI colour codes.
-    out property <brush> term-bg: dark ? #0e0f13 : #fafafa;
+    in-out property <brush> term-bg: dark ? #0e0f13 : #fafafa;
     out property <brush> term-fg: dark ? #d4d4d4 : #2d2d2f;
 
     // --- Typography --------------------------------------------------------

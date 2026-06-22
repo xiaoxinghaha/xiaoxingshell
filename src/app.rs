@@ -117,6 +117,79 @@ type SftpHandles = Arc<Mutex<HashMap<String, SftpHandle>>>;
 /// not — snaps the panel back to the shell's cwd (cd-follow never goes stale).
 type SftpLastCwd = Arc<Mutex<HashMap<String, String>>>;
 
+fn parse_theme_override(input: &str, fallback: slint::Color) -> slint::Color {
+    let s = input.trim();
+    if s.is_empty() || s.eq_ignore_ascii_case("default") || s == "默认" {
+        return fallback;
+    }
+    let hex = s.strip_prefix('#').unwrap_or(s);
+    if hex.len() == 6 {
+        if let (Ok(r), Ok(g), Ok(b)) = (
+            u8::from_str_radix(&hex[0..2], 16),
+            u8::from_str_radix(&hex[2..4], 16),
+            u8::from_str_radix(&hex[4..6], 16),
+        ) {
+            return slint::Color::from_rgb_u8(r, g, b);
+        }
+    }
+    let lower = s.to_ascii_lowercase();
+    if lower.starts_with("rgb(") && lower.ends_with(')') {
+        let inner = &lower[4..lower.len() - 1];
+        let parts: Vec<&str> = inner.split(',').map(|p| p.trim()).collect();
+        if parts.len() == 3 {
+            if let (Ok(r), Ok(g), Ok(b)) = (
+                parts[0].parse::<u8>(),
+                parts[1].parse::<u8>(),
+                parts[2].parse::<u8>(),
+            ) {
+                return slint::Color::from_rgb_u8(r, g, b);
+            }
+        }
+    }
+    fallback
+}
+
+fn nav_rail_default_color(is_dark: bool) -> slint::Color {
+    if is_dark {
+        slint::Color::from_rgb_u8(0x2a, 0x2d, 0x35)
+    } else {
+        slint::Color::from_rgb_u8(0xec, 0xec, 0xf1)
+    }
+}
+
+fn top_bar_default_color(is_dark: bool) -> slint::Color {
+    if is_dark {
+        slint::Color::from_rgb_u8(0x2a, 0x2d, 0x35)
+    } else {
+        slint::Color::from_rgb_u8(0xf2, 0xf2, 0xf7)
+    }
+}
+
+fn term_bg_default_color(is_dark: bool) -> slint::Color {
+    if is_dark {
+        slint::Color::from_rgb_u8(0x0e, 0x0f, 0x13)
+    } else {
+        slint::Color::from_rgb_u8(0xfa, 0xfa, 0xfa)
+    }
+}
+
+fn load_image_from_path(path: &str) -> slint::Image {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return slint::Image::default();
+    }
+    slint::Image::load_from_path(std::path::Path::new(trimmed)).unwrap_or_default()
+}
+
+fn term_bg_image_fit_value(value: &str) -> SharedString {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "contain" => "contain".into(),
+        "fill" => "fill".into(),
+        "preserve" => "preserve".into(),
+        _ => "cover".into(),
+    }
+}
+
 /// Per-tab connection status + latest remote resource sample, used to drive the
 /// sidebar for whichever tab is active.  `Arc<Mutex>` because the SSH event-pump
 /// threads update it before bouncing to the UI thread.
@@ -437,6 +510,32 @@ pub fn run() -> Result<()> {
         window.set_dark_mode(is_dark);
     }
 
+    {
+        let s = store.borrow();
+        let nav_default = nav_rail_default_color(window.get_dark_mode());
+        let top_default = top_bar_default_color(window.get_dark_mode());
+        let term_default = term_bg_default_color(window.get_dark_mode());
+        window.set_nav_rail_bg(slint::Brush::SolidColor(parse_theme_override(
+            s.nav_rail_bg(),
+            nav_default,
+        )));
+        window.set_top_bar_bg(slint::Brush::SolidColor(parse_theme_override(
+            s.top_bar_bg(),
+            top_default,
+        )));
+        window.set_term_bg(slint::Brush::SolidColor(parse_theme_override(
+            s.term_bg(),
+            term_default,
+        )));
+        window.set_term_bg_image(load_image_from_path(s.term_bg_image()));
+        window.set_term_bg_image_opacity(s.term_bg_image_opacity() as i32);
+        window.set_term_bg_image_fit(term_bg_image_fit_value(s.term_bg_image_fit()));
+        window.set_nav_rail_color_text(s.nav_rail_bg().into());
+        window.set_top_bar_color_text(s.top_bar_bg().into());
+        window.set_term_bg_color_text(s.term_bg().into());
+        window.set_term_bg_image_path(s.term_bg_image().into());
+    }
+
     // Apply the saved terminal font (Interface settings). An empty family keeps
     // the built-in default; the size always applies (defaults to 13).
     {
@@ -451,7 +550,7 @@ pub fn run() -> Result<()> {
     // embedded mono font has no Chinese glyphs and native TextInput doesn't
     // glyph-fallback like Text does, so typed Chinese would render as tofu (#54).
     #[cfg(target_os = "windows")]
-    window.set_ui_font_family("Microsoft YaHei UI".into());
+    window.set_ui_font_family("Microsoft YaHei".into());
     #[cfg(target_os = "macos")]
     window.set_ui_font_family("PingFang SC".into());
     // Linux: leave the Slint default (Noto Sans CJK is typically installed).
@@ -763,6 +862,157 @@ pub fn run() -> Result<()> {
             let mut s = store.borrow_mut();
             s.set_theme_pref(pref.to_string());
             let _ = s.save();
+            let nav_default = nav_rail_default_color(next_dark);
+            let top_default = top_bar_default_color(next_dark);
+            let term_default = term_bg_default_color(next_dark);
+            w.set_nav_rail_bg(slint::Brush::SolidColor(parse_theme_override(
+                s.nav_rail_bg(),
+                nav_default,
+            )));
+            w.set_top_bar_bg(slint::Brush::SolidColor(parse_theme_override(
+                s.top_bar_bg(),
+                top_default,
+            )));
+            w.set_term_bg(slint::Brush::SolidColor(parse_theme_override(
+                s.term_bg(),
+                term_default,
+            )));
+            w.set_term_bg_image(load_image_from_path(s.term_bg_image()));
+            w.set_term_bg_image_opacity(s.term_bg_image_opacity() as i32);
+            w.set_term_bg_image_fit(term_bg_image_fit_value(s.term_bg_image_fit()));
+        });
+    }
+
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        window.on_set_nav_rail_bg(move |value: SharedString| {
+            let text = value.to_string();
+            {
+                let mut s = store.borrow_mut();
+                s.set_nav_rail_bg(text.clone());
+                let _ = s.save();
+            }
+            if let Some(w) = weak.upgrade() {
+                let fallback = nav_rail_default_color(w.get_dark_mode());
+                w.set_nav_rail_color_text(text.clone().into());
+                w.set_nav_rail_bg(slint::Brush::SolidColor(parse_theme_override(
+                    &text, fallback,
+                )));
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        window.on_pick_term_bg_image(move || {
+            let mut dialog = rfd::FileDialog::new()
+                .set_title(t("选择终端背景图片", "Choose terminal background image"))
+                .add_filter("Images", &["png", "jpg", "jpeg", "bmp", "webp"]);
+            let last = store.borrow().term_bg_image().to_string();
+            if !last.is_empty() {
+                let path = std::path::PathBuf::from(&last);
+                if let Some(parent) = path.parent() {
+                    if parent.is_dir() {
+                        dialog = dialog.set_directory(parent);
+                    }
+                }
+            }
+            if let Some(file) = dialog.pick_file() {
+                let path = file.to_string_lossy().replace('\\', "/");
+                {
+                    let mut s = store.borrow_mut();
+                    s.set_term_bg_image(path.clone());
+                    let _ = s.save();
+                }
+                if let Some(w) = weak.upgrade() {
+                    w.set_term_bg_image(load_image_from_path(&path));
+                    w.set_term_bg_image_path(path.into());
+                }
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        window.on_clear_term_bg_image(move || {
+            {
+                let mut s = store.borrow_mut();
+                s.set_term_bg_image(String::new());
+                let _ = s.save();
+            }
+            if let Some(w) = weak.upgrade() {
+                w.set_term_bg_image(slint::Image::default());
+                w.set_term_bg_image_path("".into());
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        window.on_set_term_bg_image_opacity(move |value: i32| {
+            let next = value.clamp(0, 100) as u32;
+            {
+                let mut s = store.borrow_mut();
+                s.set_term_bg_image_opacity(next);
+                let _ = s.save();
+            }
+            if let Some(w) = weak.upgrade() {
+                w.set_term_bg_image_opacity(next as i32);
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        window.on_set_term_bg_image_fit(move |value: SharedString| {
+            let normalized = term_bg_image_fit_value(value.as_str());
+            {
+                let mut s = store.borrow_mut();
+                s.set_term_bg_image_fit(normalized.to_string());
+                let _ = s.save();
+            }
+            if let Some(w) = weak.upgrade() {
+                w.set_term_bg_image_fit(normalized);
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        window.on_set_top_bar_bg(move |value: SharedString| {
+            let text = value.to_string();
+            {
+                let mut s = store.borrow_mut();
+                s.set_top_bar_bg(text.clone());
+                let _ = s.save();
+            }
+            if let Some(w) = weak.upgrade() {
+                let fallback = top_bar_default_color(w.get_dark_mode());
+                w.set_top_bar_color_text(text.clone().into());
+                w.set_top_bar_bg(slint::Brush::SolidColor(parse_theme_override(
+                    &text, fallback,
+                )));
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        window.on_set_term_bg(move |value: SharedString| {
+            let text = value.to_string();
+            {
+                let mut s = store.borrow_mut();
+                s.set_term_bg(text.clone());
+                let _ = s.save();
+            }
+            if let Some(w) = weak.upgrade() {
+                let fallback = term_bg_default_color(w.get_dark_mode());
+                w.set_term_bg_color_text(text.clone().into());
+                w.set_term_bg(slint::Brush::SolidColor(parse_theme_override(
+                    &text, fallback,
+                )));
+            }
         });
     }
 
@@ -1485,6 +1735,38 @@ fn center_window(win: &AppWindow) {
 
 #[cfg(not(windows))]
 fn center_window(_win: &AppWindow) {}
+
+#[cfg(windows)]
+fn prefer_terminal_english_input_mode() {
+    type Hwnd = isize;
+    type Himc = isize;
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetForegroundWindow() -> Hwnd;
+    }
+    #[link(name = "imm32")]
+    extern "system" {
+        fn ImmGetContext(hwnd: Hwnd) -> Himc;
+        fn ImmSetOpenStatus(himc: Himc, open: i32) -> i32;
+        fn ImmReleaseContext(hwnd: Hwnd, himc: Himc) -> i32;
+    }
+
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd == 0 {
+        return;
+    }
+    let himc = unsafe { ImmGetContext(hwnd) };
+    if himc == 0 {
+        return;
+    }
+    unsafe {
+        ImmSetOpenStatus(himc, 0);
+        ImmReleaseContext(hwnd, himc);
+    }
+}
+
+#[cfg(not(windows))]
+fn prefer_terminal_english_input_mode() {}
 
 /// The active terminal tab's current SFTP directory ("" if unknown).
 fn active_sftp_path(win: &AppWindow, tab_id: &str) -> String {
@@ -5022,6 +5304,12 @@ fn wire_key_input(
             }
         });
     }
+
+    // Terminal focus policy: on Windows, close the current IME open state when
+    // the terminal regains focus. Users can still switch to Chinese manually.
+    window.on_terminal_focused(move |_tab_id: SharedString| {
+        prefer_terminal_english_input_mode();
+    });
 
     // Ctrl+Shift+C: copy current terminal screen to clipboard.
     {
