@@ -15,6 +15,9 @@ component StatRow inherits HorizontalLayout {
     in property <float> percent; // 0.0 .. 1.0
     in property <string> detail;
     in property <brush> bar-color: Theme.accent;
+    in property <brush> track-color: Theme.dark ? #eef0f4 : #f4f4f4;
+    in property <brush> value-color: #35383f;
+    in property <brush> detail-color: #4f535a;
 
     spacing: 6px;
     padding-left: 8px;
@@ -32,25 +35,27 @@ component StatRow inherits HorizontalLayout {
 
     // Progress bar — stretches to fill the row, with a floor so it stays usable.
     Rectangle {
-        background: Theme.bg-root;
-        border-radius: 2px;
+        background: root.track-color;
+        border-radius: 0px;
+        border-width: 1px;
+        border-color: #cfd3d8;
         horizontal-stretch: 1;
         min-width: 108px;
 
         Rectangle {
-            x: 0;
-            y: 0;
-            height: parent.height;
+            x: 1px;
+            y: 1px;
+            height: parent.height - 2px;
             width: parent.width * clamp(percent, 0.0, 1.0);
             background: bar-color;
-            border-radius: 2px;
+            border-radius: 0px;
             animate width { duration: 500ms; easing: ease-out; }
         }
 
         Text {
             x: 6px;
             text: Math.round(percent * 100) + "%";
-            color: Theme.text-primary;
+            color: root.value-color;
             font-size: Theme.fs-xs;
             vertical-alignment: center;
             height: parent.height;
@@ -60,7 +65,7 @@ component StatRow inherits HorizontalLayout {
             x: 0px;
             width: parent.width - 6px;
             text: detail;
-            color: Theme.text-muted;
+            color: root.detail-color;
             font-size: Theme.fs-xs;
             horizontal-alignment: right;
             vertical-alignment: center;
@@ -384,19 +389,19 @@ export component Sidebar inherits Rectangle {
                 label: "CPU";
                 percent: root.cpu-percent;
                 detail: "";
-                bar-color: Theme.accent;
+                bar-color: #a8d8a8;
             }
             StatRow {
                 label: @tr("Memory");
                 percent: root.mem-percent;
                 detail: root.mem-detail;
-                bar-color: Theme.success;
+                bar-color: #f2c59e;
             }
             StatRow {
                 label: @tr("Swap");
                 percent: root.swap-percent;
                 detail: root.swap-detail;
-                bar-color: Theme.warning;
+                bar-color: #f2c59e;
             }
         }
 

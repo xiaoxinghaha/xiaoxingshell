@@ -77,6 +77,8 @@ export component SftpPanel inherits Rectangle {
     property <int>    menu-target-mode;     // permission bits for the chmod dialog
     property <int> menu-selection-start: -1;
     property <int> menu-selection-end: -1;
+    property <bool> rename-selected-requested: false;
+    property <int> pending-rename-row: -1;
     in-out property <length> tree-width: 160px;
     in-out property <length> col-name-width: 180px;
     in-out property <length> col-size-width: 72px;
@@ -151,6 +153,18 @@ export component SftpPanel inherits Rectangle {
             root.selection-anchor-row = -1;
             root.selection-start-row = -1;
             root.selection-end-row = -1;
+        }
+    }
+
+    changed rename-selected-requested => {
+        if (root.rename-selected-requested) {
+            root.rename-selected-requested = false;
+            if (root.selected-row >= 0 && root.selected-row < root.entries.length) {
+                root.rename-request(
+                    root.entries[root.selected-row].full-path,
+                    root.entries[root.selected-row].name
+                );
+            }
         }
     }
 
@@ -855,6 +869,14 @@ export component SftpPanel inherits Rectangle {
                                     pointer-event(ev) => {
                                         if (ev.kind == PointerEventKind.down
                                                 && ev.button == PointerEventButton.left) {
+                                            if (!ev.modifiers.shift
+                                                    && root.selected-row == i
+                                                    && root.selection-start-row == i
+                                                    && root.selection-end-row == i) {
+                                                root.pending-rename-row = i;
+                                            } else {
+                                                root.pending-rename-row = -1;
+                                            }
                                             if (ev.modifiers.shift && root.selection-anchor-row >= 0) {
                                                 root.selected-row = i;
                                                 root.selection-start-row = root.selection-anchor-row;
@@ -889,6 +911,7 @@ export component SftpPanel inherits Rectangle {
                                         }
                                     }
                                     double-clicked => {
+                                        root.pending-rename-row = -1;
                                         if (entry.is-dir) {
                                             root.navigate(entry.full-path);
                                         } else {
@@ -968,6 +991,20 @@ export component SftpPanel inherits Rectangle {
                         }
                     }
 
+                    Timer {
+                        running: root.pending-rename-row >= 0;
+                        interval: 450ms;
+                        triggered => {
+                            if (root.pending-rename-row >= 0
+                                    && root.pending-rename-row == root.selected-row
+                                    && root.selection-start-row == root.pending-rename-row
+                                    && root.selection-end-row == root.pending-rename-row) {
+                                root.rename-selected-requested = true;
+                            }
+                            root.pending-rename-row = -1;
+                        }
+                    }
+
                     file-list-focus := FocusScope {
                         width: 0px;
                         height: 0px;
@@ -1015,6 +1052,21 @@ export component SftpPanel inherits Rectangle {
                             if (e.text == Key.Backspace) {
                                 root.navigate("..");
                                 return accept;
+                            }
+                            if (e.modifiers.control && !e.modifiers.shift
+                                    && !e.modifiers.alt && e.text == "c") {
+                                if (root.selected-row >= 0 && root.selected-row < root.entries.length) {
+                                    root.pending-rename-row = -1;
+                                    root.copy-path(root.entries[root.selected-row].full-path);
+                                    return accept;
+                                }
+                            }
+                            if (e.text == "\u{F705}") {
+                                if (root.selected-row >= 0 && root.selected-row < root.entries.length) {
+                                    root.pending-rename-row = -1;
+                                    root.rename-selected-requested = true;
+                                    return accept;
+                                }
                             }
                             if (e.text == "\n" || e.text == "\u{000d}") {
                                 if (root.selected-row >= 0 && root.selected-row < root.entries.length) {
