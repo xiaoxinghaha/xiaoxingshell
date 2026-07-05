@@ -2547,7 +2547,7 @@ fn wire_session_callbacks(
                 22
             };
             let new_session = Session {
-                id,
+                id: id.clone(),
                 name: if draft.name.is_empty() {
                     auto_name
                 } else {
@@ -2592,6 +2592,7 @@ fn wire_session_callbacks(
                     tracing::warn!("failed to save config: {err:#}");
                 }
             }
+            clear_credential_cache_for_session(&id);
             sync_sessions_to_model(&store.borrow(), &sessions_model);
             if let Some(w) = weak.upgrade() {
                 w.set_group_options(group_options_model(&store.borrow()));
@@ -3849,6 +3850,7 @@ fn apply_session_event_to_window(
             user,
             need_user,
             secret_kind,
+            force_prompt,
             responder,
         } => {
             enqueue_cred_prompt(
@@ -3858,6 +3860,7 @@ fn apply_session_event_to_window(
                 user,
                 need_user,
                 secret_kind,
+                force_prompt,
                 responder,
             );
         }
@@ -4080,6 +4083,7 @@ fn enqueue_cred_prompt(
     user: String,
     need_user: bool,
     secret_kind: Option<crate::ssh::CredentialSecretKind>,
+    force_prompt: bool,
     responder: crate::ssh::CredentialResponder,
 ) {
     let key = PendingCredKey {
@@ -4087,6 +4091,11 @@ fn enqueue_cred_prompt(
         need_user,
         secret_kind,
     };
+    if force_prompt {
+        CRED_DECIDED.with(|d| {
+            d.borrow_mut().remove(&key);
+        });
+    }
     if let Some(reply) = CRED_DECIDED.with(|d| d.borrow().get(&key).cloned()) {
         responder.respond(reply);
         return;
@@ -4111,6 +4120,12 @@ fn enqueue_cred_prompt(
     if show_now {
         show_front_cred(win);
     }
+}
+
+fn clear_credential_cache_for_session(session_id: &str) {
+    CRED_DECIDED.with(|d| {
+        d.borrow_mut().retain(|key, _| key.session_id != session_id);
+    });
 }
 
 /// Populate the credential dialog from the front prompt and open it.

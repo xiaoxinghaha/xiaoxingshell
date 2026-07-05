@@ -284,14 +284,38 @@ async fn run_sftp(
     // --- Authenticate (same method as the shell session) -------------------
     let authed = match session.auth {
         AuthMethod::Password => {
-            let (user, password) = match crate::ssh::resolve_credentials(&session, &events).await {
-                Some(c) => c,
-                None => return Err(anyhow!(t("已取消登录", "login cancelled"))),
-            };
-            handle
-                .authenticate_password(&user, password.as_str())
+            let (mut user, mut password) =
+                match crate::ssh::resolve_credentials(&session, &events).await {
+                    Some(c) => c,
+                    None => return Err(anyhow!(t("已取消登录", "login cancelled"))),
+                };
+            let allow_user_retry = session.user.trim().is_empty();
+            loop {
+                let authed = handle
+                    .authenticate_password(&user, password.as_str())
+                    .await
+                    .context("sftp password auth failed")?;
+                if authed {
+                    break true;
+                }
+                match crate::ssh::reprompt_credentials(
+                    &session,
+                    &events,
+                    user.clone(),
+                    allow_user_retry,
+                    Some(crate::ssh::CredentialSecretKind::Password),
+                )
                 .await
-                .context("sftp password auth failed")?
+                {
+                    Some((u, p, _remember)) => {
+                        if allow_user_retry {
+                            user = u.trim().to_string();
+                        }
+                        password = p;
+                    }
+                    None => return Err(anyhow!(t("已取消登录", "login cancelled"))),
+                }
+            }
         }
         AuthMethod::Key => {
             let Some((user, key_with_hash)) =

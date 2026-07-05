@@ -353,6 +353,7 @@ pub enum SessionEvent {
         user: String,
         need_user: bool,
         secret_kind: Option<CredentialSecretKind>,
+        force_prompt: bool,
         responder: CredentialResponder,
     },
     /// Remote machine resource sample (from the monitor channel).
@@ -568,10 +569,46 @@ async fn run_session(
 
     // --- Auth ----------------------------------------------------------
     let authed = match session.auth {
-        AuthMethod::Password => handle
-            .authenticate_password(&user, password.as_str())
-            .await
-            .context("password auth failed")?,
+        AuthMethod::Password => {
+            let mut current_user = user.clone();
+            let mut current_password = password;
+            let allow_user_retry = session.user.trim().is_empty();
+            loop {
+                let authed = handle
+                    .authenticate_password(&current_user, current_password.as_str())
+                    .await
+                    .context("password auth failed")?;
+                if authed {
+                    user = current_user;
+                    break true;
+                }
+                match reprompt_credentials(
+                    &session,
+                    &events,
+                    current_user.clone(),
+                    allow_user_retry,
+                    Some(CredentialSecretKind::Password),
+                )
+                .await
+                {
+                    Some((u, p, _remember)) => {
+                        if allow_user_retry {
+                            current_user = u.trim().to_string();
+                        }
+                        current_password = p;
+                    }
+                    None => {
+                        let _ = events.send(SessionEvent::Closed(
+                            t("已取消登录", "login cancelled").into(),
+                        ));
+                        let _ = handle
+                            .disconnect(Disconnect::ByApplication, "cancelled", "")
+                            .await;
+                        return Ok(());
+                    }
+                }
+            }
+        }
         AuthMethod::Key => {
             let Some((resolved_user, key_with_hash)) = resolve_key_auth(&session, &events).await?
             else {
@@ -1235,6 +1272,7 @@ async fn prompt_for_credentials(
     user: String,
     need_user: bool,
     secret_kind: Option<CredentialSecretKind>,
+    force_prompt: bool,
 ) -> Option<CredentialReply> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let sent = events.send(SessionEvent::CredentialPrompt {
@@ -1243,6 +1281,7 @@ async fn prompt_for_credentials(
         user: user.clone(),
         need_user,
         secret_kind,
+        force_prompt,
         responder: CredentialResponder::new(tx),
     });
     if sent.is_err() {
@@ -1266,7 +1305,8 @@ pub(crate) async fn resolve_credentials(
     if !(need_user || secret_kind.is_some()) {
         return Some((user, password));
     }
-    match prompt_for_credentials(session, events, user.clone(), need_user, secret_kind).await {
+    match prompt_for_credentials(session, events, user.clone(), need_user, secret_kind, false).await
+    {
         Some((u, p, _remember)) => {
             if need_user {
                 user = u.trim().to_string();
@@ -1280,10 +1320,21 @@ pub(crate) async fn resolve_credentials(
     }
 }
 
+pub(crate) async fn reprompt_credentials(
+    session: &Session,
+    events: &UnboundedSender<SessionEvent>,
+    user: String,
+    need_user: bool,
+    secret_kind: Option<CredentialSecretKind>,
+) -> Option<CredentialReply> {
+    prompt_for_credentials(session, events, user, need_user, secret_kind, true).await
+}
+
 fn key_load_error_needs_passphrase(err: &anyhow::Error) -> bool {
     let msg = format!("{err:#}").to_ascii_lowercase();
     msg.contains("encrypted")
         || (msg.contains("passphrase") && (msg.contains("required") || msg.contains("missing")))
+        || msg.contains("cryptographic error")
 }
 
 pub(crate) async fn resolve_key_auth(
@@ -1292,7 +1343,7 @@ pub(crate) async fn resolve_key_auth(
 ) -> Result<Option<(String, PrivateKeyWithHashAlg)>> {
     let mut user = session.user.trim().to_string();
     if user.is_empty() {
-        match prompt_for_credentials(session, events, user.clone(), true, None).await {
+        match prompt_for_credentials(session, events, user.clone(), true, None, false).await {
             Some((u, _secret, _remember)) => user = u.trim().to_string(),
             None => return Ok(None),
         }
@@ -1316,34 +1367,35 @@ pub(crate) async fn resolve_key_auth(
     };
 
     let stored_pass = session.key_passphrase.as_str();
-    match load_key(if stored_pass.is_empty() {
+    let mut current_pass = if stored_pass.is_empty() {
         None
     } else {
-        Some(stored_pass)
-    }) {
-        Ok(key) => Ok(Some((user, key))),
-        Err(err) if stored_pass.is_empty() && key_load_error_needs_passphrase(&err) => {
-            match prompt_for_credentials(
-                session,
-                events,
-                user.clone(),
-                false,
-                Some(CredentialSecretKind::KeyPassphrase),
-            )
-            .await
-            {
-                Some((_u, secret, _remember)) => {
-                    let key = load_key(if secret.is_empty() {
-                        None
-                    } else {
-                        Some(secret.as_str())
-                    })?;
-                    Ok(Some((user, key)))
+        Some(stored_pass.to_string())
+    };
+    let mut force_prompt = false;
+    loop {
+        match load_key(current_pass.as_deref()) {
+            Ok(key) => return Ok(Some((user, key))),
+            Err(err) if key_load_error_needs_passphrase(&err) => {
+                let reply = prompt_for_credentials(
+                    session,
+                    events,
+                    user.clone(),
+                    false,
+                    Some(CredentialSecretKind::KeyPassphrase),
+                    force_prompt,
+                )
+                .await;
+                match reply {
+                    Some((_u, secret, _remember)) => {
+                        current_pass = Some(secret);
+                        force_prompt = true;
+                    }
+                    None => return Ok(None),
                 }
-                None => Ok(None),
             }
+            Err(err) => return Err(err),
         }
-        Err(err) => Err(err),
     }
 }
 
