@@ -38,6 +38,11 @@ export struct QuickCmd {
     command: string,
 }
 
+export struct CommandHistoryEntry {
+    command: string,
+    preview: string,
+}
+
 // --- MenuItem --------------------------------------------------------------
 // One row of the terminal right-click context menu (MDL2 icon + label).
 component MenuItem inherits Rectangle {
@@ -115,7 +120,7 @@ export component TerminalView inherits Rectangle {
     // Command bar (#55): quick commands + input box + history (all shared/global,
     // fed from Rust); send-to-all is a per-tab toggle.
     in property <[QuickCmd]> quick-commands;
-    in property <[string]> command-history;   // oldest first (newest last, #113)
+    in property <[CommandHistoryEntry]> command-history;   // oldest first (newest last, #113)
     property <bool> send-to-all: false;
     property <bool> quick-open: false;         // quick-command popup visibility
     property <bool> history-open: false;       // history dropdown visibility
@@ -806,7 +811,7 @@ export component TerminalView inherits Rectangle {
                                     root.history-cursor = root.history-cursor == -1
                                         ? root.command-history.length - 1
                                         : max(root.history-cursor - 1, 0);
-                                    self.text = root.command-history[root.history-cursor];
+                                    self.text = root.command-history[root.history-cursor].command;
                                 }
                                 accept
                             } else if (e.text == Key.DownArrow) {
@@ -814,7 +819,7 @@ export component TerminalView inherits Rectangle {
                                 if (root.history-cursor != -1) {
                                     if (root.history-cursor < root.command-history.length - 1) {
                                         root.history-cursor += 1;
-                                        self.text = root.command-history[root.history-cursor];
+                                        self.text = root.command-history[root.history-cursor].command;
                                     } else {
                                         root.history-cursor = -1;
                                         self.text = "";
@@ -951,8 +956,8 @@ export component TerminalView inherits Rectangle {
 
             // --- History popup (opens upward) -------------------------------
             if root.history-open : Rectangle {
-                x: parent.width - 308px;
-                width: 300px;
+                x: parent.width - 388px;
+                width: 380px;
                 height: min(260px, max(40px, h-col.preferred-height + 8px));
                 y: -self.height - 2px;
                 background: Theme.bg-panel;
@@ -982,7 +987,7 @@ export component TerminalView inherits Rectangle {
                             h-item-ta := TouchArea {
                                 mouse-cursor: pointer;
                                 clicked => {
-                                    cmd-input.text = h;
+                                    cmd-input.text = h.command;
                                     root.history-open = false;
                                     cmd-input.focus();
                                 }
@@ -990,12 +995,13 @@ export component TerminalView inherits Rectangle {
                             HorizontalLayout {
                                 padding-left: 8px; padding-right: 4px; spacing: 1px;
                                 Text {
-                                    text: h;
+                                    text: h.preview;
                                     color: Theme.text-secondary;
                                     font-size: Theme.fs-sm;
                                     font-family: Theme.ui-font-family;
                                     vertical-alignment: center;
                                     horizontal-stretch: 1;
+                                    wrap: no-wrap;
                                     overflow: elide;
                                 }
                                 // Run (▶) — execute immediately, on this tab.
@@ -1006,7 +1012,7 @@ export component TerminalView inherits Rectangle {
                                     hrun := TouchArea {
                                         mouse-cursor: pointer;
                                         clicked => {
-                                            root.run-command(h, root.send-to-all);
+                                            root.run-command(h.command, root.send-to-all);
                                             root.history-open = false;
                                         }
                                     }
@@ -1021,7 +1027,7 @@ export component TerminalView inherits Rectangle {
                                     background: hcopy.has-hover ? Theme.bg-elevated : transparent;
                                     hcopy := TouchArea {
                                         mouse-cursor: pointer;
-                                        clicked => { root.copy-text(h); }
+                                        clicked => { root.copy-text(h.command); }
                                     }
                                     Text { text: "\u{E14D}"; font-family: "Material Icons";
                                            color: Theme.text-secondary; font-size: Theme.fs-sm;

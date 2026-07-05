@@ -23,7 +23,7 @@ component SessionRow inherits Rectangle {
     callback edit();
     callback duplicate();
     callback move-to-group(string);
-    callback remove();
+    callback remove(string, string);
     // Full session list — group-header is non-empty once per group, so the
     // "move to group" submenu can iterate it to list each group exactly once.
     in property <[SessionInfo]> all-sessions;
@@ -111,7 +111,7 @@ component SessionRow inherits Rectangle {
                     background: del-ta.has-hover ? #cc333320 : transparent;
                     del-ta := TouchArea {
                         mouse-cursor: pointer;
-                        clicked => { root.remove(); }
+                        clicked => { root.remove(root.session.id, root.session.name); }
                     }
                     HorizontalLayout {
                         padding-left: 10px;
@@ -126,30 +126,31 @@ component SessionRow inherits Rectangle {
                 // "Move to" hint — labels the group list below so the user knows
                 // these entries move the session into that folder.
                 HorizontalLayout {
-                    padding-left: 10px;
-                    padding-top: 2px;
-                    spacing: 6px;
-                    Text { text: "\u{E2C7}"; font-family: "Material Icons"; color: Theme.text-muted; font-size: Theme.fs-xs; vertical-alignment: center; }
-                    Text { text: @tr("Move to"); color: Theme.text-muted; font-size: Theme.fs-xs; vertical-alignment: center; horizontal-stretch: 1; }
+                    padding-left: 14px;
+                    padding-top: 4px;
+                    padding-bottom: 2px;
+                    Text { text: @tr("Move to"); color: Theme.text-muted; font-size: Theme.fs-sm; vertical-alignment: center; horizontal-stretch: 1; }
                 }
 
-                // Move to another group (#41). group-header is non-empty once
-                // per group (incl. empty folders), so iterating the full list
-                // yields each group once; the current group is skipped.
-                for s[i] in root.all-sessions : Rectangle {
-                    visible: s.group-header != "" && s.group-header != root.session.group;
-                    height: self.visible ? 28px : 0px;
-                    border-radius: Theme.radius-sm;
-                    background: mv-ta.has-hover ? Theme.bg-hover : transparent;
-                    mv-ta := TouchArea {
-                        mouse-cursor: pointer;
-                        clicked => { root.move-to-group(s.group-header); }
-                    }
-                    HorizontalLayout {
-                        padding-left: 10px;
-                        spacing: 8px;
-                        Text { text: "\u{E2C7}"; font-family: "Material Icons"; color: Theme.text-secondary; font-size: Theme.fs-sm; vertical-alignment: center; }
-                        Text { text: s.group-header; color: Theme.text-primary; font-size: Theme.fs-md; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                // Move to another group (#41). Keep these rows in their own
+                // zero-spacing layout so hidden entries don't leave phantom gaps.
+                VerticalLayout {
+                    spacing: 0px;
+                    for s[i] in root.all-sessions : Rectangle {
+                        visible: s.group-header != "" && s.group-header != root.session.group;
+                        height: self.visible ? 28px : 0px;
+                        border-radius: Theme.radius-sm;
+                        background: mv-ta.has-hover ? Theme.bg-hover : transparent;
+                        mv-ta := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.move-to-group(s.group-header); }
+                        }
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            spacing: 8px;
+                            Text { text: "\u{E2C7}"; font-family: "Material Icons"; color: Theme.text-secondary; font-size: Theme.fs-sm; vertical-alignment: center; }
+                            Text { text: s.group-header; color: Theme.text-primary; font-size: Theme.fs-md; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                        }
                     }
                 }
             }
@@ -243,7 +244,7 @@ export component SessionBrowser inherits Rectangle {
     callback new-group();
     callback edit-group(string /* current-name */);
     callback delete-group(string /* name */);
-    callback remove-session(string);
+    callback remove-session(string, string);
 
     background: Theme.bg-panel;
     border-radius: Theme.radius-md;
@@ -426,7 +427,7 @@ export component SessionBrowser inherits Rectangle {
                                 edit => { root.edit-session(session.id); }
                                 duplicate => { root.duplicate-session(session.id); }
                                 move-to-group(g) => { root.move-session(session.id, g); }
-                                remove => { root.remove-session(session.id); }
+                                remove(id, name) => { root.remove-session(id, name); }
                             }
                         }
                     }
@@ -451,7 +452,7 @@ export component Welcome inherits Rectangle {
     callback new-group();
     callback edit-group(string /* current-name */);
     callback delete-group(string /* name */);
-    callback remove-session(string);
+    callback remove-session(string, string);
 
     background: Theme.bg-root;
 
@@ -493,7 +494,7 @@ export component Welcome inherits Rectangle {
             new-group => { root.new-group(); }
             edit-group(name) => { root.edit-group(name); }
             delete-group(name) => { root.delete-group(name); }
-            remove-session(id) => { root.remove-session(id); }
+            remove-session(id, name) => { root.remove-session(id, name); }
         }
     }
 }

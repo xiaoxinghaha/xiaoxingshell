@@ -289,6 +289,15 @@ pub struct QuickCommand {
     pub command: String,
 }
 
+/// One suffix -> editor executable rule for "Edit externally".
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ExternalEditorRule {
+    #[serde(default)]
+    pub suffix: String,
+    #[serde(default)]
+    pub program: String,
+}
+
 /// Last non-minimized top-level window placement. Size is the client area
 /// (inner size) in physical pixels; position is the outer top-left in physical
 /// screen coordinates. On platforms that don't expose window positioning (for
@@ -319,6 +328,9 @@ pub struct ConfigFile {
     /// Preferred external editor executable path for "Edit externally".
     #[serde(default)]
     pub external_editor: String,
+    /// Optional suffix-specific editor overrides, e.g. `.py` -> Code.
+    #[serde(default)]
+    pub external_editor_rules: Vec<ExternalEditorRule>,
     /// Last directory used by the private-key file picker in the session dialog.
     #[serde(default)]
     pub last_key_dir: String,
@@ -352,6 +364,9 @@ pub struct ConfigFile {
     /// Terminal font size in px. 0 = the built-in default.
     #[serde(default)]
     pub font_size: u32,
+    /// Maximum terminal scrollback lines kept in memory. 0 = built-in default.
+    #[serde(default)]
+    pub terminal_scrollback_lines: u32,
     /// Explicit session groups/folders (#41), including empty ones so a folder
     /// can exist before any session is moved into it. "default" is implicit and
     /// not stored here.
@@ -362,6 +377,15 @@ pub struct ConfigFile {
     /// terminal's cd (OSC 7) unless the user opts out in Interface settings.
     #[serde(default)]
     pub sftp_no_follow_cd: bool,
+    /// SSH/SFTP protocol keepalive interval in seconds. 0 = built-in default
+    /// (120s); kept as a global setting because both shell and SFTP channels
+    /// need the same idle-connection protection.
+    #[serde(default)]
+    pub keepalive_interval_secs: u32,
+    /// Number of unanswered keepalive probes tolerated before russh considers
+    /// the SSH/SFTP connection dead. Defaults to 5.
+    #[serde(default)]
+    pub disconnect_retry_count: u32,
     /// Always prompt for the save location on each download instead of using the
     /// preset download dir. Defaults to false (#87).
     #[serde(default)]
@@ -427,6 +451,27 @@ fn dedup_keep_last(items: &mut Vec<String>) {
             i += 1;
         }
     }
+}
+
+fn normalize_editor_suffix(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    Some(if lower.starts_with('.') {
+        lower
+    } else {
+        format!(".{lower}")
+    })
+}
+
+fn matches_editor_suffix(path: &str, suffix: &str) -> bool {
+    let file_name = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path);
+    file_name.to_ascii_lowercase().ends_with(suffix)
 }
 
 impl ConfigStore {
@@ -619,7 +664,65 @@ impl ConfigStore {
     }
 
     pub fn set_external_editor(&mut self, path: String) {
-        self.cache.external_editor = path;
+        self.cache.external_editor = path.trim().to_string();
+    }
+
+    pub fn external_editor_rules(&self) -> &[ExternalEditorRule] {
+        &self.cache.external_editor_rules
+    }
+
+    pub fn upsert_external_editor_rule(&mut self, suffix: String, program: String) {
+        let Some(suffix) = normalize_editor_suffix(&suffix) else {
+            return;
+        };
+        let program = program.trim().to_string();
+        if program.is_empty() {
+            return;
+        }
+        if let Some(rule) =
+            self.cache.external_editor_rules.iter_mut().find(|rule| {
+                normalize_editor_suffix(&rule.suffix).as_deref() == Some(suffix.as_str())
+            })
+        {
+            rule.suffix = suffix;
+            rule.program = program;
+            return;
+        }
+        self.cache
+            .external_editor_rules
+            .push(ExternalEditorRule { suffix, program });
+    }
+
+    pub fn remove_external_editor_rule(&mut self, index: usize) {
+        if index < self.cache.external_editor_rules.len() {
+            self.cache.external_editor_rules.remove(index);
+        }
+    }
+
+    /// Longest matching suffix wins; otherwise fall back to the default editor.
+    pub fn editor_for_path(&self, path: &str) -> Option<String> {
+        let best = self
+            .cache
+            .external_editor_rules
+            .iter()
+            .filter_map(|rule| {
+                let suffix = normalize_editor_suffix(&rule.suffix)?;
+                let program = rule.program.trim();
+                if program.is_empty() || !matches_editor_suffix(path, &suffix) {
+                    return None;
+                }
+                Some((suffix.len(), program.to_string()))
+            })
+            .max_by_key(|(len, _)| *len)
+            .map(|(_, program)| program);
+        best.or_else(|| {
+            let fallback = self.cache.external_editor.trim();
+            if fallback.is_empty() {
+                None
+            } else {
+                Some(fallback.to_string())
+            }
+        })
     }
 
     /// UI language code ("zh" default / "en").
@@ -728,6 +831,19 @@ impl ConfigStore {
         self.cache.font_size = size.clamp(8, 32);
     }
 
+    /// Maximum terminal scrollback lines kept in memory (default 9999).
+    pub fn terminal_scrollback_lines(&self) -> u32 {
+        if self.cache.terminal_scrollback_lines == 0 {
+            9_999
+        } else {
+            self.cache.terminal_scrollback_lines.clamp(100, 200_000)
+        }
+    }
+
+    pub fn set_terminal_scrollback_lines(&mut self, lines: u32) {
+        self.cache.terminal_scrollback_lines = lines.clamp(100, 200_000);
+    }
+
     /// Whether the SFTP panel follows the terminal's cd (default true).
     pub fn sftp_follow_cd(&self) -> bool {
         !self.cache.sftp_no_follow_cd
@@ -735,6 +851,32 @@ impl ConfigStore {
 
     pub fn set_sftp_follow_cd(&mut self, follow: bool) {
         self.cache.sftp_no_follow_cd = !follow;
+    }
+
+    /// SSH/SFTP protocol keepalive interval in seconds (default 120).
+    pub fn keepalive_interval_secs(&self) -> u32 {
+        if self.cache.keepalive_interval_secs == 0 {
+            120
+        } else {
+            self.cache.keepalive_interval_secs.clamp(30, 3600)
+        }
+    }
+
+    pub fn set_keepalive_interval_secs(&mut self, secs: u32) {
+        self.cache.keepalive_interval_secs = secs.clamp(30, 3600);
+    }
+
+    /// Unanswered keepalive probes tolerated before disconnect (default 5).
+    pub fn disconnect_retry_count(&self) -> u32 {
+        if self.cache.disconnect_retry_count == 0 {
+            5
+        } else {
+            self.cache.disconnect_retry_count.clamp(1, 20)
+        }
+    }
+
+    pub fn set_disconnect_retry_count(&mut self, retries: u32) {
+        self.cache.disconnect_retry_count = retries.clamp(1, 20);
     }
 
     /// Saved quick commands (#55).
@@ -862,13 +1004,7 @@ impl ConfigStore {
         self.cache.window_state.maximized
     }
 
-    pub fn set_window_geometry(
-        &mut self,
-        x: Option<i32>,
-        y: Option<i32>,
-        width: u32,
-        height: u32,
-    ) {
+    pub fn set_window_geometry(&mut self, x: Option<i32>, y: Option<i32>, width: u32, height: u32) {
         let ws = &mut self.cache.window_state;
         if let Some(x) = x {
             ws.x = Some(x);
@@ -955,7 +1091,10 @@ impl ConfigStore {
                 session.password = Secret::new(enc);
             }
             if !session.key_passphrase.is_empty()
-                && !session.key_passphrase.as_str().starts_with(Self::ENC_PREFIX)
+                && !session
+                    .key_passphrase
+                    .as_str()
+                    .starts_with(Self::ENC_PREFIX)
             {
                 let enc = Self::encrypt(&self.key, session.key_passphrase.as_str())?;
                 session.key_passphrase = Secret::new(enc);
@@ -1174,5 +1313,30 @@ mod tests {
         assert_eq!(cfg.sessions.len(), 1);
         assert_eq!(cfg.sessions[0].password.as_str(), "");
         assert_eq!(cfg.sessions[0].key_passphrase.as_str(), "legacy-pass");
+    }
+
+    #[test]
+    fn terminal_scrollback_lines_defaults_and_clamps() {
+        let mut store = temp_store();
+
+        assert_eq!(store.terminal_scrollback_lines(), 9_999);
+
+        store.set_terminal_scrollback_lines(50);
+        assert_eq!(store.terminal_scrollback_lines(), 100);
+
+        store.set_terminal_scrollback_lines(500_000);
+        assert_eq!(store.terminal_scrollback_lines(), 200_000);
+    }
+
+    #[test]
+    fn editor_for_path_prefers_suffix_rules_and_falls_back() {
+        let mut store = temp_store();
+        store.set_external_editor("notepad.exe".into());
+        store.upsert_external_editor_rule("py".into(), "code.exe".into());
+        store.upsert_external_editor_rule(".xlsx".into(), "wps.exe".into());
+
+        assert_eq!(store.editor_for_path("README"), Some("notepad.exe".into()));
+        assert_eq!(store.editor_for_path("script.PY"), Some("code.exe".into()));
+        assert_eq!(store.editor_for_path("report.xlsx"), Some("wps.exe".into()));
     }
 }

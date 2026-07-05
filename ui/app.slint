@@ -21,11 +21,11 @@ import { Welcome, SessionBrowser, SessionInfo } from "welcome.slint";
 import { SessionDialog, SessionDraft, PortFwd } from "session_dialog.slint";
 import { ConfirmDialog } from "confirm_dialog.slint";
 import { LabeledInput, PrimaryButton, GhostButton } from "widgets.slint";
-import { TerminalView, TermSpan, TermMatch, QuickCmd } from "terminal_view.slint";
+import { TerminalView, TermSpan, TermMatch, QuickCmd, CommandHistoryEntry } from "terminal_view.slint";
 import { SftpEntry, SftpTreeNode } from "sftp_panel.slint";
 import { ComboBox, SpinBox, LineEdit, Button, ScrollView, CheckBox, Palette } from "std-widgets.slint";
 
-export { SessionInfo, SessionDraft, TabInfo, SftpEntry, SftpTreeNode, QuickCmd, PortFwd }
+export { SessionInfo, SessionDraft, TabInfo, SftpEntry, SftpTreeNode, QuickCmd, CommandHistoryEntry, PortFwd }
 
 // --- TerminalState ---------------------------------------------------------
 // Per-terminal view-model exposed to Rust. A TabInfo has the metadata; the
@@ -44,6 +44,11 @@ export struct TransferInfo {
     percent: float,   // 0.0..1.0
     state: int,       // 0 active / 1 done / 2 error
     is-upload: bool,
+}
+
+export struct EditorRuleItem {
+    suffix: string,
+    program: string,
 }
 
 // One row in the process-monitor popup (#23).
@@ -255,7 +260,7 @@ export component AppWindow inherits Window {
     in property <string> download-dir;      // preset SFTP download folder ("" = ask)
     // Command bar (#55): quick commands + history, fed from Rust.
     in property <[QuickCmd]> quick-commands;
-    in property <[string]> command-history;          // oldest first (newest last, #113)
+    in property <[CommandHistoryEntry]> command-history;          // oldest first (newest last, #113)
     callback run-command(string /* tab-id */, string /* cmd */, bool /* to-all */);
     callback copy-text(string);                 // copy a history command (#96)
     callback delete-history(int /* index */);   // remove a history entry (#96)
@@ -264,6 +269,15 @@ export component AppWindow inherits Window {
     property <string> qcm-command;                    // manage form: command field
     callback add-quick-command(string /* name */, string /* command */);
     callback delete-quick-command(int /* index */);
+    in property <[EditorRuleItem]> external-editor-rules;
+    in-out property <string> default-external-editor;
+    in-out property <string> editor-rule-suffix;
+    in-out property <string> editor-rule-program;
+    callback set-external-editor(string);
+    callback pick-external-editor();
+    callback add-external-editor-rule(string /* suffix */, string /* program */);
+    callback delete-external-editor-rule(int /* index */);
+    callback pick-external-editor-rule-program();
     in property <[TransferInfo]> transfers; // download/upload records (newest first)
     in property <[string]> about-libs;      // open-source libraries used
     in-out property <bool> lang-en: false;  // current UI language (false = 中文)
@@ -294,9 +308,11 @@ export component AppWindow inherits Window {
     property <length> ifd-base-y;
     property <length> ifd-grab-x;
     property <length> ifd-grab-y;
-    property <string> ifd-page: "font";   // active Interface page: "font" | "color" | "sftp" | "sidebar" | "sync" | "download"
+    in-out property <string> ifd-page: "font";   // active Interface page: "font" | "editor" | "color" | "sftp" | "sidebar" | "sync" | "download"
     callback set-term-font(string);                // apply + persist font family
     callback set-term-font-size(int);              // apply + persist font size (px)
+    in-out property <int> terminal-scrollback-lines: 9999;
+    callback set-terminal-scrollback-lines(int);   // apply + persist terminal scrollback cap
     in-out property <string> nav-rail-color-text: "";
     in-out property <string> top-bar-color-text: "";
     in-out property <string> term-bg-color-text: "";
@@ -313,6 +329,12 @@ export component AppWindow inherits Window {
     // SFTP follows the terminal's cd; opt out in Interface settings.
     in-out property <bool> sftp-follow-cd: true;
     callback set-sftp-follow-cd(bool);             // apply + persist
+    // SSH/SFTP protocol keepalive interval in seconds; applies to new connections.
+    in-out property <int> keepalive-interval-secs: 120;
+    callback set-keepalive-interval(int);          // apply + persist
+    // Unanswered keepalive probes tolerated before considering the connection dead.
+    in-out property <int> disconnect-retry-count: 5;
+    callback set-disconnect-retry-count(int);      // apply + persist
     // Always ask where to save on each download (#87); default off.
     in-out property <bool> download-always-ask: false;
     callback set-download-always-ask(bool);        // apply + persist
@@ -455,6 +477,9 @@ export component AppWindow inherits Window {
     in-out property <bool> confirm-delete-open: false;
     in-out property <string> confirm-delete-tab;
     in-out property <string> confirm-delete-path;
+    in-out property <bool> confirm-session-delete-open: false;
+    in-out property <string> confirm-session-delete-id;
+    in-out property <string> confirm-session-delete-name;
 
     // --- Callbacks up to Rust ---------------------------------------------
     callback new-session-clicked();
@@ -808,7 +833,11 @@ export component AppWindow inherits Window {
                                 root.group-dialog-open = true;
                             }
                             delete-group(name) => { root.delete-group(name); }
-                            remove-session(id) => { root.remove-session(id); }
+                            remove-session(id, name) => {
+                                root.confirm-session-delete-id = id;
+                                root.confirm-session-delete-name = name;
+                                root.confirm-session-delete-open = true;
+                            }
                         }
 
                         // Terminal tabs — one TerminalView per terminal state. Only
@@ -986,7 +1015,11 @@ export component AppWindow inherits Window {
                         root.group-dialog-open = true;
                     }
                     delete-group(name) => { root.delete-group(name); }
-                    remove-session(id) => { root.remove-session(id); }
+                    remove-session(id, name) => {
+                        root.confirm-session-delete-id = id;
+                        root.confirm-session-delete-name = name;
+                        root.confirm-session-delete-open = true;
+                    }
                 }
             }
         }
@@ -2267,6 +2300,26 @@ export component AppWindow inherits Window {
                             Rectangle {
                                 height: 30px;
                                 border-radius: Theme.radius-sm;
+                                background: root.ifd-page == "editor"
+                                    ? Theme.bg-active
+                                    : (nav-editor-ta.has-hover ? Theme.bg-hover : transparent);
+                                nav-editor-ta := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { root.ifd-page = "editor"; }
+                                }
+                                HorizontalLayout {
+                                    padding-left: 10px; spacing: 8px;
+                                    Text { text: "\u{E24D}"; font-family: "Material Icons";
+                                           color: Theme.text-primary; font-size: Theme.fs-sm; vertical-alignment: center; }
+                                    Text { text: root.lang-en ? "Editors" : "编辑器";
+                                           color: Theme.text-primary; font-size: Theme.fs-md;
+                                           font-weight: 600;
+                                           vertical-alignment: center; horizontal-stretch: 1; }
+                                }
+                            }
+                            Rectangle {
+                                height: 30px;
+                                border-radius: Theme.radius-sm;
                                 background: root.ifd-page == "sftp"
                                     ? Theme.bg-active
                                     : (nav-sftp-ta.has-hover ? Theme.bg-hover : transparent);
@@ -2402,6 +2455,37 @@ export component AppWindow inherits Window {
                                             }
                                             Rectangle { horizontal-stretch: 1; }
                                         }
+                                    }
+
+                                    VerticalLayout {
+                                        spacing: 6px;
+                                        Text { text: root.lang-en ? "Max cached lines" : "最大缓存行数";
+                                               color: Theme.text-secondary; font-size: Theme.fs-sm; }
+                                        HorizontalLayout {
+                                            spacing: 10px;
+                                            SpinBox {
+                                                width: 120px;
+                                                value: root.terminal-scrollback-lines;
+                                                minimum: 100;
+                                                maximum: 200000;
+                                                edited => { root.set-terminal-scrollback-lines(self.value); }
+                                            }
+                                            Text {
+                                                text: root.terminal-scrollback-lines + "";
+                                                color: Theme.text-muted;
+                                                font-size: Theme.fs-sm;
+                                                vertical-alignment: center;
+                                            }
+                                            Rectangle { horizontal-stretch: 1; }
+                                        }
+                                    }
+                                    Text {
+                                        text: root.lang-en
+                                            ? "Controls how many terminal scrollback lines stay in memory per session."
+                                            : "控制每个会话在内存中保留多少行终端滚动缓存。";
+                                        color: Theme.text-muted;
+                                        font-size: Theme.fs-sm;
+                                        wrap: word-wrap;
                                     }
 
                                     Rectangle {
@@ -2695,6 +2779,153 @@ export component AppWindow inherits Window {
                                     }
                                 }
 
+                                if root.ifd-page == "editor" : VerticalLayout {
+                                    width: parent.width;
+                                    padding: 18px;
+                                    spacing: 14px;
+                                    alignment: start;
+
+                                    VerticalLayout {
+                                        spacing: 6px;
+                                        Text {
+                                            text: root.lang-en ? "Default editor (used when no suffix rule matches)" : "默认编辑器（没有匹配后缀时使用）";
+                                            color: Theme.text-secondary;
+                                            font-size: Theme.fs-sm;
+                                        }
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            de-editor := LineEdit {
+                                                horizontal-stretch: 1;
+                                                text <=> root.default-external-editor;
+                                                placeholder-text: root.lang-en ? "e.g. C:/Program Files/Notepad++/notepad++.exe" : "例如 C:/Program Files/Notepad++/notepad++.exe";
+                                                accepted => { root.set-external-editor(self.text); }
+                                            }
+                                            Button {
+                                                text: root.lang-en ? "Save" : "保存";
+                                                clicked => { root.set-external-editor(root.default-external-editor); }
+                                            }
+                                            Button {
+                                                text: root.lang-en ? "Choose" : "选择";
+                                                clicked => { root.pick-external-editor(); }
+                                            }
+                                        }
+                                    }
+
+                                    Rectangle { height: 1px; background: Theme.border-subtle; }
+
+                                    VerticalLayout {
+                                        spacing: 6px;
+                                        Text {
+                                            text: root.lang-en ? "Suffix rule" : "后缀规则";
+                                            color: Theme.text-secondary;
+                                            font-size: Theme.fs-sm;
+                                        }
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            suffix-input := LineEdit {
+                                                width: 120px;
+                                                text <=> root.editor-rule-suffix;
+                                                placeholder-text: ".py";
+                                            }
+                                            program-input := LineEdit {
+                                                horizontal-stretch: 1;
+                                                text <=> root.editor-rule-program;
+                                                placeholder-text: root.lang-en ? "Editor executable path" : "编辑器程序路径";
+                                                accepted => {
+                                                    if (root.editor-rule-suffix != "" && root.editor-rule-program != "") {
+                                                        root.add-external-editor-rule(root.editor-rule-suffix, root.editor-rule-program);
+                                                        root.editor-rule-suffix = "";
+                                                        root.editor-rule-program = "";
+                                                    }
+                                                }
+                                            }
+                                            Button {
+                                                text: root.lang-en ? "Choose" : "选择";
+                                                clicked => { root.pick-external-editor-rule-program(); }
+                                            }
+                                            Button {
+                                                text: root.lang-en ? "Add" : "添加";
+                                                primary: true;
+                                                enabled: root.editor-rule-suffix != "" && root.editor-rule-program != "";
+                                                clicked => {
+                                                    root.add-external-editor-rule(root.editor-rule-suffix, root.editor-rule-program);
+                                                    root.editor-rule-suffix = "";
+                                                    root.editor-rule-program = "";
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Text {
+                                        text: root.lang-en
+                                            ? "Examples: .py -> VS Code, .xls/.xlsx -> WPS. Suffix matching is case-insensitive."
+                                            : "示例：.py -> VS Code，.xls/.xlsx -> WPS。后缀匹配不区分大小写。";
+                                        color: Theme.text-muted;
+                                        font-size: Theme.fs-sm;
+                                        wrap: word-wrap;
+                                    }
+
+                                    Rectangle { height: 1px; background: Theme.border-subtle; }
+
+                                    Flickable {
+                                        vertical-stretch: 1;
+                                        viewport-width: self.width;
+                                        viewport-height: max(self.height, editor-rule-list.preferred-height);
+                                        editor-rule-list := VerticalLayout {
+                                            alignment: start;
+                                            spacing: 2px;
+                                            if root.external-editor-rules.length == 0 : Text {
+                                                text: root.lang-en ? "No suffix rules yet" : "还没有后缀规则";
+                                                color: Theme.text-muted;
+                                                font-size: Theme.fs-xs;
+                                            }
+                                            for rule[i] in root.external-editor-rules : Rectangle {
+                                                height: 40px;
+                                                border-radius: Theme.radius-sm;
+                                                background: Theme.bg-root;
+                                                HorizontalLayout {
+                                                    padding-left: 10px;
+                                                    padding-right: 6px;
+                                                    spacing: 8px;
+                                                    Text {
+                                                        width: 96px;
+                                                        text: rule.suffix;
+                                                        color: Theme.accent;
+                                                        font-size: Theme.fs-sm;
+                                                        vertical-alignment: center;
+                                                    }
+                                                    Text {
+                                                        horizontal-stretch: 1;
+                                                        text: rule.program;
+                                                        color: Theme.text-primary;
+                                                        font-size: Theme.fs-sm;
+                                                        vertical-alignment: center;
+                                                        overflow: elide;
+                                                    }
+                                                    Rectangle {
+                                                        width: 28px;
+                                                        height: 28px;
+                                                        y: (parent.height - self.height) / 2;
+                                                        border-radius: Theme.radius-sm;
+                                                        background: del-editor-ta.has-hover ? Theme.danger.with-alpha(0.18) : transparent;
+                                                        del-editor-ta := TouchArea {
+                                                            mouse-cursor: pointer;
+                                                            clicked => { root.delete-external-editor-rule(i); }
+                                                        }
+                                                        Text {
+                                                            text: "\u{E872}";
+                                                            font-family: "Material Icons";
+                                                            color: Theme.danger;
+                                                            font-size: Theme.fs-md;
+                                                            horizontal-alignment: center;
+                                                            vertical-alignment: center;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
                                 if root.ifd-page == "sftp" : VerticalLayout {
                                     width: parent.width;
                                     padding: 18px;
@@ -2712,6 +2943,74 @@ export component AppWindow inherits Window {
                                         text: root.lang-en
                                             ? "When enabled, a cd in the terminal switches the SFTP panel to the same directory."
                                             : "勾选后,终端里执行 cd 时,SFTP 面板会自动切换到相同目录。";
+                                        color: Theme.text-muted;
+                                        font-size: Theme.fs-sm;
+                                        wrap: word-wrap;
+                                    }
+
+                                    VerticalLayout {
+                                        spacing: 6px;
+                                        Text {
+                                            text: root.lang-en ? "Keepalive interval" : "保持连接间隔";
+                                            color: Theme.text-secondary;
+                                            font-size: Theme.fs-sm;
+                                        }
+                                        HorizontalLayout {
+                                            spacing: 10px;
+                                            SpinBox {
+                                                width: 120px;
+                                                value: root.keepalive-interval-secs;
+                                                minimum: 30;
+                                                maximum: 3600;
+                                                edited => { root.set-keepalive-interval(self.value); }
+                                            }
+                                            Text {
+                                                text: root.keepalive-interval-secs + " s";
+                                                color: Theme.text-muted;
+                                                font-size: Theme.fs-sm;
+                                                vertical-alignment: center;
+                                            }
+                                            Rectangle { horizontal-stretch: 1; }
+                                        }
+                                    }
+                                    Text {
+                                        text: root.lang-en
+                                            ? "Used by new SSH and SFTP connections to keep idle sessions alive."
+                                            : "用于新的 SSH 和 SFTP 连接，避免空闲连接被中断。";
+                                        color: Theme.text-muted;
+                                        font-size: Theme.fs-sm;
+                                        wrap: word-wrap;
+                                    }
+
+                                    VerticalLayout {
+                                        spacing: 6px;
+                                        Text {
+                                            text: root.lang-en ? "Disconnect retry count" : "断线重试次数";
+                                            color: Theme.text-secondary;
+                                            font-size: Theme.fs-sm;
+                                        }
+                                        HorizontalLayout {
+                                            spacing: 10px;
+                                            SpinBox {
+                                                width: 120px;
+                                                value: root.disconnect-retry-count;
+                                                minimum: 1;
+                                                maximum: 20;
+                                                edited => { root.set-disconnect-retry-count(self.value); }
+                                            }
+                                            Text {
+                                                text: root.disconnect-retry-count + "";
+                                                color: Theme.text-muted;
+                                                font-size: Theme.fs-sm;
+                                                vertical-alignment: center;
+                                            }
+                                            Rectangle { horizontal-stretch: 1; }
+                                        }
+                                    }
+                                    Text {
+                                        text: root.lang-en
+                                            ? "After this many unanswered keepalives, the connection is treated as disconnected."
+                                            : "连续这么多次保持连接探测无响应后，才判定连接已断开。";
                                         color: Theme.text-muted;
                                         font-size: Theme.fs-sm;
                                         wrap: word-wrap;
@@ -2947,6 +3246,21 @@ export component AppWindow inherits Window {
             root.confirm-delete-open = false;
         }
         cancel => { root.confirm-delete-open = false; }
+    }
+
+    ConfirmDialog {
+        width: parent.width;
+        height: parent.height;
+        is-open <=> root.confirm-session-delete-open;
+        title: @tr("Confirm delete");
+        message: @tr("Delete this item? This cannot be undone.");
+        detail: root.confirm-session-delete-name;
+        confirm-label: @tr("Delete");
+        confirm => {
+            root.remove-session(root.confirm-session-delete-id);
+            root.confirm-session-delete-open = false;
+        }
+        cancel => { root.confirm-session-delete-open = false; }
     }
 
     // Host-key confirmation (#109-5). Reuses the confirm-dialog card; the

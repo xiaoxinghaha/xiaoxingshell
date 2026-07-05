@@ -22,8 +22,10 @@ component SingleTab inherits Rectangle {
     horizontal-stretch: 0;
     clip: true;
     border-radius: Theme.radius-sm;
-    background: active ? Theme.bg-panel
+    background: active ? Theme.bg-active
         : (touch.has-hover ? Theme.bg-hover : transparent);
+    border-width: active ? 1px : 0px;
+    border-color: active ? Theme.accent : transparent;
     animate background { duration: 120ms; }
 
     // Declared FIRST so the HorizontalLayout's children (close button) are at
@@ -31,6 +33,15 @@ component SingleTab inherits Rectangle {
     touch := TouchArea {
         mouse-cursor: default;
         clicked => { root.selected(); }
+    }
+
+    if active : Rectangle {
+        x: 8px;
+        y: parent.height - 3px;
+        width: parent.width - 16px;
+        height: 2px;
+        border-radius: 1px;
+        background: Theme.accent;
     }
 
     Rectangle {

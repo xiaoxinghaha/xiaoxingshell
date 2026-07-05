@@ -38,6 +38,8 @@ struct TermBuffer {
     sel_focus: Option<(usize, u16)>,
     /// Session scrollback: lines that have scrolled off the top (oldest first).
     history: Vec<Line>,
+    /// Per-session cap for `history`, configurable from Interface settings.
+    max_history_lines: usize,
     /// Previous frame's grid lines, for scroll-off detection.
     prev: Vec<Line>,
     /// Scrollback view offset in lines (0 = live bottom).
@@ -109,12 +111,8 @@ use crate::ssh::{
 use crate::system::{format_bytes_per_sec, format_mem, SystemSampler, SystemSnapshot};
 
 type SftpHandles = Arc<Mutex<HashMap<String, SftpHandle>>>;
-/// Per-tab flag: once the user explicitly navigates via the SFTP tree or
-/// toolbar, stop auto-syncing to the terminal's `cd` path.
 /// Per-tab last cwd the SFTP panel followed (from OSC 7). Used to ignore the
-/// OSC 7 every prompt re-emits at an unchanged directory; manual SFTP
-/// navigation REMOVES the entry so the very next OSC 7 — same directory or
-/// not — snaps the panel back to the shell's cwd (cd-follow never goes stale).
+/// OSC 7 every prompt re-emits at an unchanged directory.
 type SftpLastCwd = Arc<Mutex<HashMap<String, String>>>;
 
 fn parse_theme_override(input: &str, fallback: slint::Color) -> slint::Color {
@@ -147,6 +145,23 @@ fn parse_theme_override(input: &str, fallback: slint::Color) -> slint::Color {
         }
     }
     fallback
+}
+
+fn restored_window_geometry(
+    geom: Option<(Option<i32>, Option<i32>, u32, u32)>,
+) -> Option<(Option<i32>, Option<i32>, u32, u32)> {
+    let (x, y, width, height) = geom?;
+    // Windows reports minimized top-level windows with the sentinel position
+    // (-32000, -32000), often alongside a tiny title-bar-sized rectangle.
+    // Restoring that verbatim makes the app appear "hung" after packaging,
+    // while the process is actually alive but effectively invisible.
+    if x == Some(-32000) || y == Some(-32000) {
+        return None;
+    }
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some((x, y, width, height))
 }
 
 fn nav_rail_default_color(is_dark: bool) -> slint::Color {
@@ -545,6 +560,7 @@ pub fn run() -> Result<()> {
             window.set_term_font_family(fam.into());
         }
         window.set_term_font_size(s.font_size() as f32);
+        window.set_terminal_scrollback_lines(s.terminal_scrollback_lines() as i32);
     }
     // Editable inputs (e.g. the SFTP path bar) need a CJK-capable font: the
     // embedded mono font has no Chinese glyphs and native TextInput doesn't
@@ -564,7 +580,8 @@ pub fn run() -> Result<()> {
     // the window once it has a real size.
     {
         let s = store.borrow();
-        if let Some((x, y, width, height)) = s.window_geometry() {
+        let restored_geometry = restored_window_geometry(s.window_geometry());
+        if let Some((x, y, width, height)) = restored_geometry {
             window
                 .window()
                 .set_size(slint::PhysicalSize::new(width, height));
@@ -583,6 +600,8 @@ pub fn run() -> Result<()> {
     // Command bar (#55): seed quick commands + history from the config.
     window.set_quick_commands(quick_cmd_model(&store.borrow()));
     window.set_command_history(history_model(&store.borrow()));
+    window.set_default_external_editor(store.borrow().external_editor().into());
+    window.set_external_editor_rules(editor_rule_model(&store.borrow()));
 
     // Interface setting: SFTP follows the terminal's cd. The shell event pumps
     // read this AtomicBool on every CwdChanged, so toggling applies live to
@@ -599,6 +618,42 @@ pub fn run() -> Result<()> {
             let mut s = store.borrow_mut();
             s.set_sftp_follow_cd(follow);
             let _ = s.save();
+        });
+    }
+    window.set_keepalive_interval_secs(store.borrow().keepalive_interval_secs() as i32);
+    {
+        let store = store.clone();
+        let weak = window.as_weak();
+        window.on_set_keepalive_interval(move |secs| {
+            let secs = secs.max(30) as u32;
+            let saved = {
+                let mut s = store.borrow_mut();
+                s.set_keepalive_interval_secs(secs);
+                let saved = s.keepalive_interval_secs();
+                let _ = s.save();
+                saved
+            };
+            if let Some(w) = weak.upgrade() {
+                w.set_keepalive_interval_secs(saved as i32);
+            }
+        });
+    }
+    window.set_disconnect_retry_count(store.borrow().disconnect_retry_count() as i32);
+    {
+        let store = store.clone();
+        let weak = window.as_weak();
+        window.on_set_disconnect_retry_count(move |retries| {
+            let retries = retries.max(1) as u32;
+            let saved = {
+                let mut s = store.borrow_mut();
+                s.set_disconnect_retry_count(retries);
+                let saved = s.disconnect_retry_count();
+                let _ = s.save();
+                saved
+            };
+            if let Some(w) = weak.upgrade() {
+                w.set_disconnect_retry_count(saved as i32);
+            }
         });
     }
 
@@ -689,6 +744,101 @@ pub fn run() -> Result<()> {
             }
             if let Some(w) = weak.upgrade() {
                 w.set_term_font_size(size as f32);
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        let bufs = bufs.clone();
+        window.on_set_terminal_scrollback_lines(move |lines: i32| {
+            let saved = {
+                let mut s = store.borrow_mut();
+                s.set_terminal_scrollback_lines(lines.max(100) as u32);
+                let saved = s.terminal_scrollback_lines();
+                let _ = s.save();
+                saved
+            };
+            {
+                let mut map = bufs.lock().unwrap();
+                for buf in map.values_mut() {
+                    buf.set_max_history_lines(saved as usize);
+                }
+            }
+            if let Some(w) = weak.upgrade() {
+                w.set_terminal_scrollback_lines(saved as i32);
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        window.on_set_external_editor(move |path: SharedString| {
+            let saved = {
+                let mut s = store.borrow_mut();
+                s.set_external_editor(path.to_string());
+                let saved = s.external_editor().to_string();
+                let _ = s.save();
+                saved
+            };
+            if let Some(w) = weak.upgrade() {
+                w.set_default_external_editor(saved.into());
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        window.on_pick_external_editor(move || {
+            let Some(selected) = pick_editor_executable() else {
+                return;
+            };
+            {
+                let mut s = store.borrow_mut();
+                s.set_external_editor(selected.clone());
+                let _ = s.save();
+            }
+            if let Some(w) = weak.upgrade() {
+                w.set_default_external_editor(selected.into());
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        window.on_add_external_editor_rule(move |suffix: SharedString, program: SharedString| {
+            {
+                let mut s = store.borrow_mut();
+                s.upsert_external_editor_rule(suffix.to_string(), program.to_string());
+                let _ = s.save();
+            }
+            if let Some(w) = weak.upgrade() {
+                w.set_external_editor_rules(editor_rule_model(&store.borrow()));
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        window.on_delete_external_editor_rule(move |index: i32| {
+            {
+                let mut s = store.borrow_mut();
+                s.remove_external_editor_rule(index as usize);
+                let _ = s.save();
+            }
+            if let Some(w) = weak.upgrade() {
+                w.set_external_editor_rules(editor_rule_model(&store.borrow()));
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        window.on_pick_external_editor_rule_program(move || {
+            let Some(selected) = pick_editor_executable() else {
+                return;
+            };
+            if let Some(w) = weak.upgrade() {
+                w.set_editor_rule_program(selected.into());
             }
         });
     }
@@ -1270,14 +1420,9 @@ pub fn run() -> Result<()> {
             let remote_path = row.remote_path.to_string();
             let tab_id = row.tab_id.to_string();
             if !remote_path.trim().is_empty() && !tab_id.trim().is_empty() {
-                let editor = store.borrow().external_editor().to_string();
                 if let Ok(handles) = sftp_handles.lock() {
                     if let Some(h) = handles.get(tab_id.as_str()) {
-                        let program = if editor.trim().is_empty() {
-                            None
-                        } else {
-                            Some(editor)
-                        };
+                        let program = store.borrow().editor_for_path(&remote_path);
                         h.open_temp(remote_path, true, program);
                         return;
                     }
@@ -1285,10 +1430,11 @@ pub fn run() -> Result<()> {
             }
             let p = std::path::Path::new(&local_path);
             if p.exists() {
-                let editor = store.borrow().external_editor().to_string();
-                if editor.trim().is_empty()
-                    || crate::sftp::open_with_program(&editor, &local_path).is_err()
-                {
+                if let Some(editor) = store.borrow().editor_for_path(&local_path) {
+                    if crate::sftp::open_with_program(&editor, &local_path).is_err() {
+                        crate::sftp::open_with_os(&local_path);
+                    }
+                } else {
                     crate::sftp::open_with_os(&local_path);
                 }
             }
@@ -1414,7 +1560,6 @@ pub fn run() -> Result<()> {
         &window,
         store.clone(),
         sftp_handles.clone(),
-        sftp_last_cwd.clone(),
         sftp_entry_cache.clone(),
         sftp_sort_states.clone(),
     );
@@ -1440,6 +1585,8 @@ pub fn run() -> Result<()> {
             local_net_hist: local_net_hist.clone(),
             last_term_size: last_term_size.clone(),
             sftp_follow_cd: sftp_follow_cd.clone(),
+            keepalive_interval_secs: store.borrow().keepalive_interval_secs(),
+            disconnect_retry_count: store.borrow().disconnect_retry_count(),
         },
     );
 
@@ -1515,7 +1662,8 @@ pub fn run() -> Result<()> {
             let pos = w.window().position();
             let mut s = store.borrow_mut();
             s.set_window_maximized(is_max);
-            if !is_max && size.width > 0 && size.height > 0 {
+            let minimized_pos = pos.x == -32000 || pos.y == -32000;
+            if !is_max && !minimized_pos && size.width > 0 && size.height > 0 {
                 s.set_window_geometry(Some(pos.x), Some(pos.y), size.width, size.height);
             }
             let _ = s.save();
@@ -1526,10 +1674,9 @@ pub fn run() -> Result<()> {
         let timer = geometry_save_timer.clone();
         let save_window_geometry = save_window_geometry.clone();
         move || {
-            timer.borrow_mut().start(
-                slint::TimerMode::SingleShot,
-                Duration::from_millis(500),
-                {
+            timer
+                .borrow_mut()
+                .start(slint::TimerMode::SingleShot, Duration::from_millis(500), {
                     let weak = weak.clone();
                     let save = save_window_geometry.clone();
                     move || {
@@ -1537,8 +1684,7 @@ pub fn run() -> Result<()> {
                             save(&w);
                         }
                     }
-                },
-            );
+                });
         }
     };
 
@@ -1672,7 +1818,9 @@ pub fn run() -> Result<()> {
     }
 
     // First launch (no saved geometry yet) still starts centered.
-    if store.borrow().window_geometry().is_none() && !store.borrow().window_maximized() {
+    if restored_window_geometry(store.borrow().window_geometry()).is_none()
+        && !store.borrow().window_maximized()
+    {
         let weak = window.as_weak();
         slint::Timer::single_shot(Duration::from_millis(30), move || {
             if let Some(w) = weak.upgrade() {
@@ -2589,8 +2737,8 @@ fn wire_session_callbacks(
             // Serial / Telnet have no SFTP side-channel.
             let has_sftp = session.kind == SessionKind::Ssh;
             let local_buffer_enabled = session.kind == SessionKind::Ssh;
-            let local_buffer_preferred = local_buffer_enabled
-                && session.ui_state.local_input_optimization;
+            let local_buffer_preferred =
+                local_buffer_enabled && session.ui_state.local_input_optimization;
 
             // Seed the per-tab status so the sidebar shows "连接中 host" the
             // moment this tab becomes active (the `changed active-tab-id`
@@ -2639,18 +2787,20 @@ fn wire_session_callbacks(
                 )),
             });
             // Create vt100 parser for this tab (default 24×80; resized on first
-            // terminal-resize callback). 5000-line scrollback is stored for
-            // future scroll-navigation support.
+            // terminal-resize callback). Scrollback retention is capped by the
+            // user's Interface setting.
             let is_dark_now = weak.upgrade().map(|w| w.get_dark_mode()).unwrap_or(true);
+            let scrollback_lines = store.borrow().terminal_scrollback_lines() as usize;
             bufs.lock().unwrap().insert(
                 tab_id.clone(),
                 TermBuffer {
-                    parser: vt100::Parser::new(24, 80, 5000),
+                    parser: vt100::Parser::new(24, 80, scrollback_lines),
                     find_query: String::new(),
                     is_dark: is_dark_now,
                     sel_anchor: None,
                     sel_focus: None,
                     history: Vec::new(),
+                    max_history_lines: scrollback_lines,
                     prev: Vec::new(),
                     view_offset: 0,
                     displayed_text: Vec::new(),
@@ -2690,6 +2840,8 @@ fn wire_session_callbacks(
                 local_net_hist: local_net_hist.clone(),
                 last_term_size: last_term_size.clone(),
                 sftp_follow_cd: sftp_follow_cd.clone(),
+                keepalive_interval_secs: store.borrow().keepalive_interval_secs(),
+                disconnect_retry_count: store.borrow().disconnect_retry_count(),
             };
             start_session_in_tab(&tab_id, session, &ctx);
         });
@@ -2717,6 +2869,11 @@ struct ConnectCtx {
     last_term_size: Arc<Mutex<(u32, u32)>>,
     /// Interface setting: SFTP panel follows the terminal's cd (OSC 7).
     sftp_follow_cd: Arc<std::sync::atomic::AtomicBool>,
+    /// SSH/SFTP protocol keepalive interval in seconds for newly opened
+    /// connections.
+    keepalive_interval_secs: u32,
+    /// Unanswered keepalive probes tolerated before disconnect.
+    disconnect_retry_count: u32,
 }
 
 /// Spawn the shell (+ SFTP) workers and their event-pump threads for an
@@ -2732,6 +2889,8 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
             session.clone(),
             initial_cols,
             initial_rows,
+            ctx.keepalive_interval_secs,
+            ctx.disconnect_retry_count,
         ),
         SessionKind::Serial => crate::serial::spawn_serial_session(
             ctx.runtime.handle(),
@@ -2751,7 +2910,14 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
     // Separate SFTP connection for the same session (SSH only).
     let sftp_evt_tx = if has_sftp {
         let (sftp_tx, sftp_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
-        let sftp_handle = spawn_sftp(ctx.runtime.handle(), tab_id.to_string(), session, sftp_tx);
+        let sftp_handle = spawn_sftp(
+            ctx.runtime.handle(),
+            tab_id.to_string(),
+            session,
+            sftp_tx,
+            ctx.keepalive_interval_secs,
+            ctx.disconnect_retry_count,
+        );
         ctx.sftp_handles
             .lock()
             .unwrap()
@@ -2779,32 +2945,57 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
         std::thread::spawn(move || {
             let mut shell_rx = rx;
             let mut cwd_debounce: Option<tokio::task::JoinHandle<()>> = None;
+            let mut cwd_follow_pending = false;
+            let mut last_cwd_reported: Option<String> = None;
+            let mut cwd_reported_since_last_command = false;
             loop {
                 match shell_rx.blocking_recv() {
                     None => break,
                     Some(shell_evt) => {
+                        if let SessionEvent::CommandRan(ref cmd) = shell_evt {
+                            let is_cd = is_cd_command(cmd);
+                            cwd_follow_pending = is_cd && !cwd_reported_since_last_command;
+                            if is_cd && cwd_reported_since_last_command {
+                                if let Some(cwd) = last_cwd_reported.clone() {
+                                    if follow_cd_pump.load(std::sync::atomic::Ordering::Relaxed) {
+                                        if let Some(prev) = cwd_debounce.take() {
+                                            prev.abort();
+                                        }
+                                        let sftp_h = sftp_handles_pump.clone();
+                                        let tid = tab_id_pump.clone();
+                                        cwd_debounce = Some(rt_pump.spawn(async move {
+                                            tokio::time::sleep(std::time::Duration::from_millis(
+                                                500,
+                                            ))
+                                            .await;
+                                            if let Ok(handles) = sftp_h.lock() {
+                                                if let Some(h) = handles.get(&tid) {
+                                                    h.list_dir(cwd);
+                                                }
+                                            }
+                                        }));
+                                    }
+                                }
+                            }
+                            cwd_reported_since_last_command = false;
+                        }
                         if let SessionEvent::CwdChanged(ref cwd) = shell_evt {
+                            last_cwd_reported = Some(cwd.clone());
+                            cwd_reported_since_last_command = true;
                             if let Ok(mut map) = bufs_thread.lock() {
                                 if let Some(buf) = map.get_mut(tab_id_pump.as_str()) {
                                     buf.unlock_local_input_at_prompt();
                                 }
                             }
-                            // Shared map (not a thread-local) so manual SFTP
-                            // navigation can clear the entry — then the very
-                            // next OSC 7, same directory or not, snaps the
-                            // panel back to the shell's cwd. Unchanged repeats
-                            // (every prompt re-emits OSC 7) are ignored (#59).
-                            let changed = match sftp_last_cwd_pump.lock() {
-                                Ok(mut m) => {
-                                    m.insert(tab_id_pump.clone(), cwd.clone()).as_deref()
-                                        != Some(cwd.as_str())
-                                }
-                                Err(_) => false,
-                            };
+                            let should_follow = cwd_follow_pending;
+                            cwd_follow_pending = false;
+                            if let Ok(mut m) = sftp_last_cwd_pump.lock() {
+                                m.insert(tab_id_pump.clone(), cwd.clone());
+                            }
                             // Swallow the event entirely when follow-cd is off:
                             // forwarding it would set sftp_loading without any
                             // ListDir to clear it (the #59 stuck-"loading" trap).
-                            if !changed
+                            if !should_follow
                                 || !follow_cd_pump.load(std::sync::atomic::Ordering::Relaxed)
                             {
                                 continue;
@@ -2971,6 +3162,41 @@ fn quick_cmd_model(store: &ConfigStore) -> ModelRc<QuickCmd> {
     ModelRc::from(Rc::new(VecModel::from(rows)))
 }
 
+fn editor_rule_model(store: &ConfigStore) -> ModelRc<EditorRuleItem> {
+    let rows: Vec<EditorRuleItem> = store
+        .external_editor_rules()
+        .iter()
+        .map(|rule| EditorRuleItem {
+            suffix: rule.suffix.clone().into(),
+            program: rule.program.clone().into(),
+        })
+        .collect();
+    ModelRc::from(Rc::new(VecModel::from(rows)))
+}
+
+fn pick_editor_executable() -> Option<String> {
+    rfd::FileDialog::new()
+        .set_title(t("选择外部编辑器", "Choose external editor"))
+        .pick_file()
+        .map(|file| file.to_string_lossy().to_string())
+}
+
+fn resolve_external_editor_for_path(
+    store: &Rc<RefCell<ConfigStore>>,
+    path: &str,
+) -> Option<String> {
+    if let Some(editor) = store.borrow().editor_for_path(path) {
+        return Some(editor);
+    }
+    let selected = pick_editor_executable()?;
+    {
+        let mut s = store.borrow_mut();
+        s.set_external_editor(selected.clone());
+        let _ = s.save();
+    }
+    Some(selected)
+}
+
 /// Build the port-forward list model for the session dialog (#56). Each row is
 /// a one-line human summary (`-L 127.0.0.1:8080 → host:80`).
 fn forward_model(forwards: &[crate::config::PortForward]) -> ModelRc<PortFwd> {
@@ -2997,14 +3223,21 @@ fn forward_model(forwards: &[crate::config::PortForward]) -> ModelRc<PortFwd> {
     ModelRc::from(Rc::new(VecModel::from(rows)))
 }
 
+fn history_preview(command: &str) -> String {
+    command.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Build the command-history model in storage order (oldest first, newest
 /// last). The dropdown shows the most-recently-used command at the bottom
 /// (nearest the input) and ↑ recalls it first (#55, #113).
-fn history_model(store: &ConfigStore) -> ModelRc<SharedString> {
-    let rows: Vec<SharedString> = store
+fn history_model(store: &ConfigStore) -> ModelRc<CommandHistoryEntry> {
+    let rows: Vec<CommandHistoryEntry> = store
         .command_history()
         .iter()
-        .map(|s| s.clone().into())
+        .map(|s| CommandHistoryEntry {
+            command: s.clone().into(),
+            preview: history_preview(s).into(),
+        })
         .collect();
     ModelRc::from(Rc::new(VecModel::from(rows)))
 }
@@ -4127,7 +4360,6 @@ fn wire_sftp_callbacks(
     window: &AppWindow,
     store: Rc<RefCell<ConfigStore>>,
     sftp_handles: SftpHandles,
-    sftp_last_cwd: SftpLastCwd,
     sftp_entry_cache: SftpEntryCache,
     sftp_sort_states: SftpSortStates,
 ) {
@@ -4183,7 +4415,6 @@ fn wire_sftp_callbacks(
 
     {
         let sftp_handles = sftp_handles.clone();
-        let sftp_last_cwd = sftp_last_cwd.clone();
         let weak = window.as_weak();
         window.on_sftp_navigate(move |tab_id: SharedString, path: SharedString| {
             let tab_id = tab_id.to_string();
@@ -4208,10 +4439,6 @@ fn wire_sftp_callbacks(
             } else {
                 path.to_string()
             };
-            // Forget the followed cwd so the next OSC 7 — even at an unchanged
-            // directory — snaps the panel back to the shell's cwd; manual
-            // navigation never permanently disables cd-follow.
-            sftp_last_cwd.lock().unwrap().remove(&tab_id);
             if let Ok(handles) = sftp_handles.lock() {
                 if let Some(h) = handles.get(&tab_id) {
                     h.list_dir(resolved);
@@ -4321,7 +4548,9 @@ fn wire_sftp_callbacks(
                     let terminals = terminals_rc
                         .as_any()
                         .downcast_ref::<VecModel<TerminalState>>();
-                    let Some(terminals) = terminals else { return Vec::new(); };
+                    let Some(terminals) = terminals else {
+                        return Vec::new();
+                    };
                     for i in 0..terminals.row_count() {
                         if let Some(row) = terminals.row_data(i) {
                             if row.id.as_str() == tab_id {
@@ -4477,13 +4706,9 @@ fn wire_sftp_callbacks(
     // Toggle tree node expand/collapse and navigate to that directory.
     {
         let sftp_handles = sftp_handles.clone();
-        let sftp_last_cwd = sftp_last_cwd.clone();
         window.on_sftp_tree_expand(move |tab_id: SharedString, path: SharedString| {
             let tab_id = tab_id.to_string();
             let path = path.to_string();
-            // Forget the followed cwd (see on_sftp_navigate): tree navigation
-            // must never permanently disable cd-follow.
-            sftp_last_cwd.lock().unwrap().remove(&tab_id);
             if let Ok(handles) = sftp_handles.lock() {
                 if let Some(h) = handles.get(&tab_id) {
                     h.toggle_tree_node(path.clone());
@@ -4546,25 +4771,8 @@ fn wire_sftp_callbacks(
         let store = store.clone();
         let sftp_handles = sftp_handles.clone();
         window.on_sftp_edit_external(move |tab_id: SharedString, path: SharedString| {
-            let editor = {
-                let current = store.borrow().external_editor().to_string();
-                if current.trim().is_empty() {
-                    let Some(file) = rfd::FileDialog::new()
-                        .set_title(t("选择外部编辑器", "Choose external editor"))
-                        .pick_file()
-                    else {
-                        return;
-                    };
-                    let selected = file.to_string_lossy().to_string();
-                    {
-                        let mut s = store.borrow_mut();
-                        s.set_external_editor(selected.clone());
-                        let _ = s.save();
-                    }
-                    selected
-                } else {
-                    current
-                }
+            let Some(editor) = resolve_external_editor_for_path(&store, path.as_str()) else {
+                return;
             };
             if let Ok(handles) = sftp_handles.lock() {
                 if let Some(h) = handles.get(tab_id.as_str()) {
@@ -4574,16 +4782,11 @@ fn wire_sftp_callbacks(
         });
     }
     {
-        let store = store.clone();
+        let weak = window.as_weak();
         window.on_sftp_configure_external_editor(move || {
-            if let Some(file) = rfd::FileDialog::new()
-                .set_title(t("选择外部编辑器", "Choose external editor"))
-                .pick_file()
-            {
-                let selected = file.to_string_lossy().to_string();
-                let mut s = store.borrow_mut();
-                s.set_external_editor(selected);
-                let _ = s.save();
+            if let Some(w) = weak.upgrade() {
+                w.set_interface_open(true);
+                w.set_ifd_page("editor".into());
             }
         });
     }
@@ -4900,7 +5103,7 @@ fn wire_key_input(
                         let mut map = ctx.bufs.lock().unwrap();
                         if let Some(b) = map.get_mut(tab_id.as_str()) {
                             let (rows, cols) = b.parser.screen().size();
-                            b.parser = vt100::Parser::new(rows, cols, 5000);
+                            b.parser = vt100::Parser::new(rows, cols, b.max_history_lines);
                             b.history.clear();
                             b.prev.clear();
                             b.displayed_text.clear();
@@ -5158,6 +5361,11 @@ fn wire_key_input(
                                 repaint_after_local = true;
                                 consume_locally = true;
                             }
+                        } else if matches!(key.as_str(), "\u{F728}" | "\u{007f}") && !ctrl && !alt {
+                            if buf.delete_local_char() {
+                                repaint_after_local = true;
+                                consume_locally = true;
+                            }
                         } else if key.as_str() == "\u{F702}" && !ctrl && !alt {
                             if buf.move_local_cursor_left() {
                                 repaint_after_local = true;
@@ -5289,10 +5497,7 @@ fn wire_key_input(
                         for line in saved {
                             buf.history.push(line);
                         }
-                        if buf.history.len() > MAX_HISTORY {
-                            let drop = buf.history.len() - MAX_HISTORY;
-                            buf.history.drain(0..drop);
-                        }
+                        buf.trim_history_to_limit();
                         buf.parser.process(format!("\x1b[{scroll}S").as_bytes());
                     }
                 }
@@ -5469,7 +5674,7 @@ fn wire_key_input(
             let tid = tab_id.to_string();
             if let Some(buf) = bufs_clear.lock().unwrap().get_mut(&tid) {
                 let (rows, cols) = buf.parser.screen().size();
-                buf.parser = vt100::Parser::new(rows, cols, 5000);
+                buf.parser = vt100::Parser::new(rows, cols, buf.max_history_lines);
                 buf.find_query.clear();
                 buf.history = Vec::new(); // recycle the session scrollback
                 buf.prev = Vec::new();
@@ -5537,9 +5742,13 @@ fn wire_key_input(
                 let Some(buf) = map.get_mut(&tid) else { return };
                 // Scroll within our own session scrollback (history lines above
                 // the live screen).  Offset 0 = live bottom.
-                let max_off = buf.history.len() as i64;
-                let cur = buf.view_offset as i64;
-                buf.view_offset = (cur + delta as i64).clamp(0, max_off) as usize;
+                if buf.parser.screen().alternate_screen() {
+                    buf.view_offset = 0;
+                } else {
+                    let max_off = buf.history.len() as i64;
+                    let cur = buf.view_offset as i64;
+                    buf.view_offset = (cur + delta as i64).clamp(0, max_off) as usize;
+                }
             }
             if let Some(win) = weak.upgrade() {
                 rebuild_tab_display(&win, &bufs_scroll, &tid);
@@ -5885,7 +6094,7 @@ fn locally_bufferable_paste(text: &str) -> Option<&str> {
 }
 
 fn key_to_pty_bytes(key: &str, ctrl: bool, alt: bool, app_cursor: bool) -> Vec<u8> {
-    // --- Special keys (Slint PUA code points) ------------------------------
+    // --- Special keys (Slint PUA code points, plus Windows Delete) ---------
     // Arrow keys: respect DECCKM application-cursor mode.
     let special: Option<&[u8]> = match key {
         "\u{F700}" => Some(if app_cursor { b"\x1bOA" } else { b"\x1b[A" }), // Up
@@ -5896,7 +6105,7 @@ fn key_to_pty_bytes(key: &str, ctrl: bool, alt: bool, app_cursor: bool) -> Vec<u
         "\u{F72B}" => Some(b"\x1b[F"),                                      // End
         "\u{F72C}" => Some(b"\x1b[5~"),                                     // PageUp
         "\u{F72D}" => Some(b"\x1b[6~"),                                     // PageDown
-        "\u{F728}" => Some(b"\x1b[3~"),                                     // Delete (forward)
+        "\u{F728}" | "\u{007f}" => Some(b"\x1b[3~"),                        // Delete (forward)
         "\u{F704}" => Some(b"\x1bOP"),                                      // F1
         "\u{F705}" => Some(b"\x1bOQ"),                                      // F2
         "\u{F706}" => Some(b"\x1bOR"),                                      // F3
@@ -6085,9 +6294,6 @@ struct HistSpan {
 /// A rendered line: plain text (one char per cell, for find/selection) + runs.
 type Line = (String, Vec<HistSpan>);
 
-/// Per-session scrollback cap (recycled on clear / tab close).
-const MAX_HISTORY: usize = 100_000;
-
 /// Build one screen row into `(plain_text, coloured_runs)`.  `plain` carries one
 /// char per cell (space for blanks) so a char index equals the grid column.
 /// Effective (contents, fg, bg, bold) for one grid cell, applying reverse-video.
@@ -6267,6 +6473,17 @@ fn should_force_passthrough_for_command(cmd: &str) -> bool {
     )
 }
 
+fn is_cd_command(cmd: &str) -> bool {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let Some(first) = trimmed.split_whitespace().next() else {
+        return false;
+    };
+    first.trim_matches(|c: char| c == '\'' || c == '"' || c == '`') == "cd"
+}
+
 impl TermBuffer {
     fn clear_local_input(&mut self) {
         self.local_line.clear();
@@ -6295,6 +6512,28 @@ impl TermBuffer {
     fn lock_local_input_until_prompt(&mut self) {
         self.local_prompt_ready = false;
         self.local_passthrough_until_prompt = true;
+    }
+
+    fn trim_history_to_limit(&mut self) {
+        if self.history.len() > self.max_history_lines {
+            let drop = self.history.len() - self.max_history_lines;
+            self.history.drain(0..drop);
+        }
+        self.clamp_view_offset();
+    }
+
+    fn clamp_view_offset(&mut self) {
+        let max_offset = if self.parser.screen().alternate_screen() {
+            0
+        } else {
+            self.history.len()
+        };
+        self.view_offset = self.view_offset.min(max_offset);
+    }
+
+    fn set_max_history_lines(&mut self, lines: usize) {
+        self.max_history_lines = lines.max(100);
+        self.trim_history_to_limit();
     }
 
     fn unlock_local_input_at_prompt(&mut self) {
@@ -6380,6 +6619,17 @@ impl TermBuffer {
         let end = self.local_byte_index(self.local_cursor_chars);
         self.local_line.drain(start..end);
         self.local_cursor_chars -= 1;
+        self.recompute_local_metrics();
+        true
+    }
+
+    fn delete_local_char(&mut self) -> bool {
+        if self.local_cursor_chars >= self.local_chars_len() {
+            return false;
+        }
+        let start = self.local_byte_index(self.local_cursor_chars);
+        let end = self.local_byte_index(self.local_cursor_chars + 1);
+        self.local_line.drain(start..end);
         self.recompute_local_metrics();
         true
     }
@@ -6488,7 +6738,8 @@ impl TermBuffer {
     fn view_top_abs(&self, _live_used: usize) -> usize {
         let rows = self.parser.screen().size().0 as usize;
         let hist_len = self.history.len();
-        if self.view_offset == 0 {
+        let view_offset = self.view_offset.min(hist_len);
+        if view_offset == 0 {
             // Live view: visible row 0 is live screen row 0 = combined[hist_len].
             hist_len
         } else {
@@ -6496,7 +6747,7 @@ impl TermBuffer {
             // mapping matches render()'s scroll window — keeping the live and
             // scrolled views continuous after a shrink/grow (#119-followup).
             let combined_len = hist_len + rows;
-            combined_len.saturating_sub(rows + self.view_offset)
+            combined_len.saturating_sub(rows + view_offset)
         }
     }
 
@@ -6774,10 +7025,7 @@ impl TermBuffer {
             for line in self.prev.iter().take(k) {
                 self.history.push(line.clone());
             }
-            if self.history.len() > MAX_HISTORY {
-                let drop = self.history.len() - MAX_HISTORY;
-                self.history.drain(0..drop);
-            }
+            self.trim_history_to_limit();
         }
         self.prev = curr;
     }
@@ -6785,6 +7033,7 @@ impl TermBuffer {
     /// Render the terminal grid for the current scrollback `view_offset`
     /// (0 = live).  Caches the displayed plain text for find/selection.
     fn render(&mut self) -> BuiltScreen {
+        self.clamp_view_offset();
         let (is_alt, rows, cols, cur_row, cur_col) = {
             let s = self.parser.screen();
             let (r, c) = s.size();
@@ -7251,6 +7500,22 @@ mod key_tests {
     }
 
     #[test]
+    fn history_preview_collapses_multiline_commands() {
+        assert_eq!(
+            history_preview("query:{\n  \"source\": \"x\",\r\n  \"params\": {}}\n"),
+            "query:{ \"source\": \"x\", \"params\": {}}"
+        );
+    }
+
+    #[test]
+    fn delete_ascii_del_still_sends_forward_delete_sequence() {
+        assert_eq!(
+            key_to_pty_bytes("\u{007f}", false, false, false),
+            b"\x1b[3~".to_vec()
+        );
+    }
+
+    #[test]
     fn split_proxy_recognises_schemes() {
         assert_eq!(split_proxy(""), ("none".into(), "".into()));
         assert_eq!(
@@ -7287,6 +7552,17 @@ mod key_tests {
         // No newlines → unchanged.
         assert_eq!(normalize_pasted_newlines("echo hi"), "echo hi");
     }
+
+    #[test]
+    fn sftp_follow_only_treats_cd_as_cd() {
+        assert!(is_cd_command("cd"));
+        assert!(is_cd_command(" cd /var/log "));
+        assert!(is_cd_command("\"cd\" /tmp"));
+        assert!(!is_cd_command(""));
+        assert!(!is_cd_command("ls"));
+        assert!(!is_cd_command("echo cd /tmp"));
+        assert!(!is_cd_command("cdx /tmp"));
+    }
 }
 
 #[cfg(test)]
@@ -7315,6 +7591,7 @@ mod selection_tests {
             sel_anchor: None,
             sel_focus: None,
             history: history.iter().map(|s| hist_line(s)).collect(),
+            max_history_lines: 9_999,
             prev: Vec::new(),
             view_offset,
             displayed_text: Vec::new(),
@@ -7343,6 +7620,14 @@ mod selection_tests {
         assert_eq!(top.vis_to_abs(0), 0, "top row 0 is oldest history line");
         assert_eq!(top.vis_to_abs(2), 2);
         assert_eq!(top.vis_to_abs(3), 3, "row 3 crosses into live content");
+    }
+
+    #[test]
+    fn render_clamps_stale_view_offset() {
+        let mut buf = make_buf(5, 20, &["H0", "H1"], &["LIVE0"], 99);
+        let built = buf.render();
+        assert_eq!(buf.view_offset, 2);
+        assert_eq!(built.rows_used, 5);
     }
 
     #[test]
@@ -7442,5 +7727,33 @@ mod selection_tests {
 
         assert!(buf.local_line.is_empty());
         assert_eq!(buf.suppress_echo, "pwd\r");
+    }
+
+    #[test]
+    fn delete_local_char_removes_character_at_cursor() {
+        let mut buf = make_buf(5, 40, &[], &["root@host:~# "], 0);
+        buf.local_prompt_ready = true;
+        for ch in "abcd".chars() {
+            buf.insert_local_char(ch);
+        }
+        assert!(buf.move_local_cursor_left());
+        assert!(buf.move_local_cursor_left());
+
+        assert!(buf.delete_local_char());
+        assert_eq!(buf.local_line, "abd");
+        assert_eq!(buf.local_cursor_chars, 2);
+    }
+
+    #[test]
+    fn delete_local_char_at_end_is_noop() {
+        let mut buf = make_buf(5, 40, &[], &["root@host:~# "], 0);
+        buf.local_prompt_ready = true;
+        for ch in "ab".chars() {
+            buf.insert_local_char(ch);
+        }
+
+        assert!(!buf.delete_local_char());
+        assert_eq!(buf.local_line, "ab");
+        assert_eq!(buf.local_cursor_chars, 2);
     }
 }

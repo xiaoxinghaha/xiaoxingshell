@@ -104,6 +104,23 @@ pub fn extract_osc7_path(text: &str) -> Option<String> {
     extract_osc7_end(text).map(|(path, _)| path)
 }
 
+/// SSH client defaults shared by the interactive shell and the dedicated SFTP
+/// connection. Keepalives are important for long-lived idle SFTP browsing:
+/// without them, NATs/servers can drop the quiet side-channel while the shell
+/// tab still looks healthy.
+pub fn client_config(keepalive_interval_secs: u32, disconnect_retry_count: u32) -> client::Config {
+    let keepalive_interval_secs = keepalive_interval_secs.clamp(30, 3600);
+    let disconnect_retry_count = disconnect_retry_count.clamp(1, 20);
+    client::Config {
+        inactivity_timeout: Some(std::time::Duration::from_secs(60 * 60 * 2)),
+        keepalive_interval: Some(std::time::Duration::from_secs(
+            keepalive_interval_secs as u64,
+        )),
+        keepalive_max: disconnect_retry_count as usize,
+        ..<_>::default()
+    }
+}
+
 /// Like [`extract_osc7_path`] but also returns the byte index just past the OSC
 /// sequence's terminator, so the caller can cut everything up to and including
 /// it — used to discard the echoed setup line (which may wrap) at connect (#98).
@@ -428,6 +445,8 @@ pub fn spawn_session(
     session: Session,
     initial_cols: u32,
     initial_rows: u32,
+    keepalive_interval_secs: u32,
+    disconnect_retry_count: u32,
 ) -> (SessionHandle, UnboundedReceiver<SessionEvent>) {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<SessionCommand>();
     let (evt_tx, evt_rx) = mpsc::unbounded_channel::<SessionEvent>();
@@ -440,6 +459,8 @@ pub fn spawn_session(
             evt_tx_for_task.clone(),
             initial_cols,
             initial_rows,
+            keepalive_interval_secs,
+            disconnect_retry_count,
         )
         .await
         {
@@ -464,6 +485,8 @@ async fn run_session(
     events: UnboundedSender<SessionEvent>,
     initial_cols: u32,
     initial_rows: u32,
+    keepalive_interval_secs: u32,
+    disconnect_retry_count: u32,
 ) -> Result<()> {
     let _ = events.send(SessionEvent::Status(format!(
         "{} {}@{}:{} ...",
@@ -473,10 +496,10 @@ async fn run_session(
         session.port
     )));
 
-    let config = Arc::new(client::Config {
-        inactivity_timeout: Some(std::time::Duration::from_secs(60 * 10)),
-        ..<_>::default()
-    });
+    let config = Arc::new(client_config(
+        keepalive_interval_secs,
+        disconnect_retry_count,
+    ));
 
     // Remote (-R) forwards are serviced inside the handler when the server
     // opens channels back, so it needs the bind-port → local-target map up
@@ -612,6 +635,10 @@ async fn run_session(
     // True from injecting PROMPT_SETUP until the echoed setup line has been
     // received and stripped; output is buffered (not shown) during that window.
     let mut suppress_echo = false;
+    // Keystrokes sent while the setup line is being echoed can appear before
+    // the setup's OSC 7 marker and be swallowed with that echo. Queue them
+    // until the hook is installed, then replay them in order.
+    let mut pending_input_while_suppress: Vec<u8> = Vec::new();
     // Buffers output while `suppress_echo` so the (long) echoed setup line can be
     // stripped even when it splits across reads (#98).
     let mut echo_buf = String::new();
@@ -635,9 +662,11 @@ async fn run_session(
     // outer single-quoted string needs no escaping; printf turns \033/\007 into
     // ESC/BEL at prompt time. No array syntax → safe to *parse* in dash/ash too.
     //
-    // The leading space keeps the line out of shell history (HISTCONTROL=
-    // ignorespace, the default on most distros); its echo is stripped locally
-    // (the needle below) so the bookkeeping command never shows up.
+    // The leading space keeps the line out of shell history when HISTCONTROL=
+    // ignorespace is enabled. Some root/server profiles don't enable it, so
+    // bash also deletes the last history entry after the line has been accepted.
+    // Its echo is stripped locally (the needle below), so the bookkeeping
+    // command never shows up.
     //
     // Besides OSC 7 (cwd), the hook also captures the command the user just ran
     // and reports it via a private `OSC 697 ; <cmd> BEL` so it can join the
@@ -651,7 +680,7 @@ async fn run_session(
     // The echoed setup line is discarded by anchoring on the OSC 7 it produces
     // (see the suppress block below), so it doesn't matter that the long line
     // wraps — we never substring-match it.
-    const PROMPT_BODY: &str = "test -z \"$FISH_VERSION\" && eval '__msc(){ __c=\"$(fc -ln -1 2>/dev/null)\"; [ -n \"$__c\" ] && [ \"$__c\" != \"$__cl\" ] && { __cl=\"$__c\"; printf \"\\033]697;%s\\007\" \"$__c\"; }; }; __ms7(){ printf \"\\033]7;file://%s%s\\007\" \"$HOSTNAME\" \"$PWD\"; __msc; }; __cl=\"$(fc -ln -1 2>/dev/null)\"; if [ -n \"$ZSH_VERSION\" ]; then autoload -Uz add-zsh-hook 2>/dev/null; add-zsh-hook precmd __ms7; else PROMPT_COMMAND=\"__ms7${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"; fi; __ms7'";
+    const PROMPT_BODY: &str = "test -z \"$FISH_VERSION\" && eval '__msc(){ __c=\"$(fc -ln -1 2>/dev/null)\"; [ -n \"$__c\" ] && [ \"$__c\" != \"$__cl\" ] && { __cl=\"$__c\"; printf \"\\033]697;%s\\007\" \"$__c\"; }; }; __ms7(){ __msc; printf \"\\033]7;file://%s%s\\007\" \"$HOSTNAME\" \"$PWD\"; }; __h=\"$(history 1 2>/dev/null)\"; __h=\"${__h#\"${__h%%[! ]*}\"}\"; __h=\"${__h%%[!0-9]*}\"; [ -n \"$BASH_VERSION\" ] && [ -n \"$__h\" ] && history -d \"$__h\" 2>/dev/null; unset __h; __cl=\"$(fc -ln -1 2>/dev/null)\"; if [ -n \"$ZSH_VERSION\" ]; then autoload -Uz add-zsh-hook 2>/dev/null; add-zsh-hook precmd __ms7; else PROMPT_COMMAND=\"__ms7${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"; fi; __ms7'";
     let prompt_setup = format!(" {}\r", PROMPT_BODY);
 
     // --- Remote resource monitor (separate exec channel) ----------------
@@ -745,6 +774,10 @@ async fn run_session(
                         // Only log the byte count — never the bytes themselves,
                         // which are raw keystrokes and may contain passwords (#15).
                         tracing::debug!("ssh channel.data len={} bytes", bytes.len());
+                        if suppress_echo {
+                            pending_input_while_suppress.extend_from_slice(&bytes);
+                            continue;
+                        }
                         if let Err(err) = channel.data(&bytes[..]).await {
                             let _ = events.send(SessionEvent::Closed(format!("{}: {err}", t("写入失败", "write failed"))));
                             break;
@@ -818,11 +851,13 @@ async fn run_session(
                         // follows the OSC 7 is the fresh prompt, which we keep (#98).
                         // A size cap is the safety valve for a shell that never
                         // reports back (e.g. dash without PROMPT_COMMAND).
+                        let mut flush_pending_input = false;
                         let mut text = if suppress_echo {
                             echo_buf.push_str(&chunk);
                             const ECHO_BUF_CAP: usize = 1 << 14; // 16 KiB
                             if let Some((cwd, seq_end)) = extract_osc7_end(&echo_buf) {
                                 suppress_echo = false;
+                                flush_pending_input = true;
                                 tracing::debug!("OSC7 cwd={:?}", cwd);
                                 let _ = events.send(SessionEvent::CwdChanged(cwd));
                                 let rest = echo_buf[seq_end..].to_string();
@@ -830,16 +865,12 @@ async fn run_session(
                                 rest
                             } else if echo_buf.len() >= ECHO_BUF_CAP {
                                 suppress_echo = false;
+                                flush_pending_input = true;
                                 std::mem::take(&mut echo_buf)
                             } else {
                                 continue; // keep buffering; show nothing yet
                             }
                         } else {
-                            // Scan for the OSC 7 CWD notification (cd-follow).
-                            if let Some(cwd) = extract_osc7_path(&chunk) {
-                                tracing::debug!("OSC7 cwd={:?}", cwd);
-                                let _ = events.send(SessionEvent::CwdChanged(cwd));
-                            }
                             chunk
                         };
 
@@ -855,7 +886,22 @@ async fn run_session(
                             }
                         }
 
+                        // Scan after command capture so prompt hooks that emit
+                        // both OSC 697 and OSC 7 let the UI decide cd-follow
+                        // using the command that caused this prompt.
+                        if let Some(cwd) = extract_osc7_path(&text) {
+                            tracing::debug!("OSC7 cwd={:?}", cwd);
+                            let _ = events.send(SessionEvent::CwdChanged(cwd));
+                        }
+
                         let _ = events.send(SessionEvent::Output(text));
+                        if flush_pending_input && !pending_input_while_suppress.is_empty() {
+                            let queued = std::mem::take(&mut pending_input_while_suppress);
+                            if let Err(err) = channel.data(&queued[..]).await {
+                                let _ = events.send(SessionEvent::Closed(format!("{}: {err}", t("写入失败", "write failed"))));
+                                break;
+                            }
+                        }
                     }
                     Some(ChannelMsg::ExtendedData { data, ext: _ }) => {
                         let text = String::from_utf8_lossy(&data).into_owned();

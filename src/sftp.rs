@@ -20,9 +20,9 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
 use russh::client::{self, Handler};
-use russh::ChannelMsg;
 use russh::keys::key::PrivateKeyWithHashAlg;
 use russh::keys::load_secret_key;
+use russh::ChannelMsg;
 use russh::Disconnect;
 use russh_sftp::client::{RawSftpSession, SftpSession};
 use russh_sftp::protocol::{FileAttributes, OpenFlags};
@@ -170,6 +170,8 @@ pub fn spawn_sftp(
     ui_tab_id: String,
     session: Session,
     events: UnboundedSender<SessionEvent>,
+    keepalive_interval_secs: u32,
+    disconnect_retry_count: u32,
 ) -> SftpHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let self_tx = cmd_tx.clone();
@@ -177,8 +179,17 @@ pub fn spawn_sftp(
     let cancelled_transfers = Arc::new(Mutex::new(HashSet::new()));
     let cancelled_for_task = cancelled_transfers.clone();
     let join = runtime.spawn(async move {
-        if let Err(err) =
-            run_sftp(ui_tab_id, session, cmd_rx, self_tx, events, cancelled_for_task).await
+        if let Err(err) = run_sftp(
+            ui_tab_id,
+            session,
+            cmd_rx,
+            self_tx,
+            events,
+            cancelled_for_task,
+            keepalive_interval_secs,
+            disconnect_retry_count,
+        )
+        .await
         {
             let _ = events_err.send(SessionEvent::SftpStatus(format!(
                 "{}: {err:#}",
@@ -244,16 +255,18 @@ async fn run_sftp(
     self_tx: UnboundedSender<SftpCommand>,
     events: UnboundedSender<SessionEvent>,
     cancelled_transfers: Arc<Mutex<HashSet<String>>>,
+    keepalive_interval_secs: u32,
+    disconnect_retry_count: u32,
 ) -> Result<()> {
     let _ = events.send(SessionEvent::SftpStatus(
         t("SFTP 连接中...", "SFTP connecting...").into(),
     ));
 
     // Open a dedicated SSH connection for SFTP.
-    let config = Arc::new(client::Config {
-        inactivity_timeout: Some(std::time::Duration::from_secs(60 * 30)),
-        ..<_>::default()
-    });
+    let config = Arc::new(crate::ssh::client_config(
+        keepalive_interval_secs,
+        disconnect_retry_count,
+    ));
 
     let addr = format!("{}:{}", session.host, session.port);
     // Tunnel through the same proxy as the shell session, if configured.
@@ -299,7 +312,7 @@ async fn run_sftp(
                 Path::new(&key_path),
                 if pass.is_empty() { None } else { Some(pass) },
             )
-                .with_context(|| format!("failed to load key {key_path}"))?;
+            .with_context(|| format!("failed to load key {key_path}"))?;
             // RSA keys need an explicit SHA-2 hash; other key types don't.
             let hash = keypair.algorithm().is_rsa().then_some(HashAlg::Sha256);
             let key_with_hash = PrivateKeyWithHashAlg::new(Arc::new(keypair), hash)
@@ -2229,9 +2242,6 @@ mod sanitize_tests {
             remote_zip_error_message(3, "zip I/O error: No space left on device")
                 .contains("磁盘空间不足")
         );
-        assert!(
-            remote_zip_error_message(3, "Disk quota exceeded")
-                .contains("磁盘空间不足")
-        );
+        assert!(remote_zip_error_message(3, "Disk quota exceeded").contains("磁盘空间不足"));
     }
 }
