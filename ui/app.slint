@@ -361,13 +361,16 @@ export component AppWindow inherits Window {
     callback hostkey-accept();                     // trust (and remember) the key
     callback hostkey-reject();                      // abort the connection
     // Connect-time credential prompt (#110). Rust opens this when a session is
-    // missing its username and/or password; the answer flows back via accept.
+    // missing its username and/or connect-time secret; the answer flows back
+    // via accept.
     in-out property <bool> cred-prompt-open: false;
     in-out property <string> cred-host;            // host shown in the dialog title
     in-out property <bool> cred-need-user: false;
-    in-out property <bool> cred-need-password: false;
+    in-out property <bool> cred-need-secret: false;
     in-out property <string> cred-user;            // username field value
-    in-out property <string> cred-password;        // password field value
+    in-out property <string> cred-secret;          // password / key-passphrase value
+    in-out property <string> cred-secret-label: "Password";
+    in-out property <string> cred-secret-placeholder: "••••••••";
     in-out property <bool> cred-remember: false;   // persist to the saved session
     callback cred-accept();                        // use the entered credentials
     callback cred-reject();                        // cancel the connection
@@ -3315,11 +3318,11 @@ export component AppWindow inherits Window {
                     placeholder: "root";
                     value <=> root.cred-user;
                 }
-                if root.cred-need-password : LabeledInput {
-                    label: @tr("Password");
-                    placeholder: "••••••••";
+                if root.cred-need-secret : LabeledInput {
+                    label: root.cred-secret-label;
+                    placeholder: root.cred-secret-placeholder;
                     password: true;
-                    value <=> root.cred-password;
+                    value <=> root.cred-secret;
                 }
                 CheckBox {
                     text: @tr("Remember for this session");

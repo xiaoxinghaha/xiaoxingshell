@@ -117,6 +117,15 @@ msgstr "选择私钥本身（不是 .pub 公钥文件）"
 msgid "Cancel"
 msgstr "取消"
 
+msgid "Login"
+msgstr "登录"
+
+msgid "Remember for this session"
+msgstr "记住本次会话"
+
+msgid "Connect"
+msgstr "连接"
+
 msgid "Save"
 msgstr "保存"
 
@@ -230,6 +239,9 @@ msgstr "请输入主机名或 IP 地址。"
 
 msgid "Prompted on connect if blank"
 msgstr "留空则在连接时再输入"
+
+msgid "Prompted on connect if needed"
+msgstr "需要时在连接时再输入"
 
 msgid "e.g. /home/you/.ssh/id_ed25519"
 msgstr "例如：/home/you/.ssh/id_ed25519"

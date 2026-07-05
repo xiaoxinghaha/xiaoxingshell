@@ -397,7 +397,7 @@ export component SessionDialog inherits Rectangle {
 
             if root.draft-kind == "ssh" && root.draft-auth == "password" : LabeledInput {
                 label: @tr("Password");
-                placeholder: "••••••••";
+                placeholder: @tr("Prompted on connect if blank");
                 password: true;
                 value <=> root.draft-password;
             }
@@ -464,12 +464,12 @@ export component SessionDialog inherits Rectangle {
                 }
             }
 
-            // Passphrase for an *encrypted* private key (#90). Reuses the
-            // password field; blank means the key isn't encrypted (or, when
-            // editing, keep the saved passphrase).
+            // Passphrase for an encrypted private key (#90). Reuses the
+            // password field; leaving it blank saves an empty value and lets
+            // connect-time auth prompt only if the key actually needs one.
             if root.draft-kind == "ssh" && root.draft-auth == "key" : LabeledInput {
                 label: @tr("Key passphrase");
-                placeholder: @tr("Leave blank if the key isn't encrypted");
+                placeholder: @tr("Prompted on connect if needed");
                 password: true;
                 value <=> root.draft-key-passphrase;
             }

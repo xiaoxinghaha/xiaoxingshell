@@ -99,6 +99,12 @@ msgstr "Leave blank to keep the current password"
 msgid "Key passphrase"
 msgstr "Key passphrase"
 
+msgid "Prompted on connect if blank"
+msgstr "Prompted on connect if blank"
+
+msgid "Prompted on connect if needed"
+msgstr "Prompted on connect if needed"
+
 msgid "Leave blank if the key isn't encrypted"
 msgstr "Leave blank if the key isn't encrypted"
 
@@ -116,6 +122,15 @@ msgstr "Pick the private key itself (not the .pub public key)"
 
 msgid "Cancel"
 msgstr "Cancel"
+
+msgid "Login"
+msgstr "Login"
+
+msgid "Remember for this session"
+msgstr "Remember for this session"
+
+msgid "Connect"
+msgstr "Connect"
 
 msgid "Save"
 msgstr "Save"

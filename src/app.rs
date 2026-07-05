@@ -3848,7 +3848,7 @@ fn apply_session_event_to_window(
             host,
             user,
             need_user,
-            need_password,
+            secret_kind,
             responder,
         } => {
             enqueue_cred_prompt(
@@ -3857,7 +3857,7 @@ fn apply_session_event_to_window(
                 host,
                 user,
                 need_user,
-                need_password,
+                secret_kind,
                 responder,
             );
         }
@@ -4047,19 +4047,26 @@ fn resolve_front_hostkey(win: &AppWindow, accept: bool) {
 /// SFTP channel) collapse into a single dialog whose answer fans out to each
 /// waiting responder.
 struct PendingCred {
-    session_id: String,
+    key: PendingCredKey,
     host: String,
     user: String,
     need_user: bool,
-    need_password: bool,
+    secret_kind: Option<crate::ssh::CredentialSecretKind>,
     responders: Vec<crate::ssh::CredentialResponder>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct PendingCredKey {
+    session_id: String,
+    need_user: bool,
+    secret_kind: Option<crate::ssh::CredentialSecretKind>,
 }
 
 thread_local! {
     static CRED_QUEUE: RefCell<VecDeque<PendingCred>> = RefCell::new(VecDeque::new());
-    /// session id → the answer given this run (`None` = cancelled), so a second
-    /// connection for the same session is answered without re-prompting.
-    static CRED_DECIDED: RefCell<HashMap<String, Option<crate::ssh::CredentialReply>>> =
+    /// prompt key → the answer given this run (`None` = cancelled), so a second
+    /// identical connection prompt is answered without re-prompting.
+    static CRED_DECIDED: RefCell<HashMap<PendingCredKey, Option<crate::ssh::CredentialReply>>> =
         RefCell::new(HashMap::new());
 }
 
@@ -4072,26 +4079,31 @@ fn enqueue_cred_prompt(
     host: String,
     user: String,
     need_user: bool,
-    need_password: bool,
+    secret_kind: Option<crate::ssh::CredentialSecretKind>,
     responder: crate::ssh::CredentialResponder,
 ) {
-    if let Some(reply) = CRED_DECIDED.with(|d| d.borrow().get(&session_id).cloned()) {
+    let key = PendingCredKey {
+        session_id,
+        need_user,
+        secret_kind,
+    };
+    if let Some(reply) = CRED_DECIDED.with(|d| d.borrow().get(&key).cloned()) {
         responder.respond(reply);
         return;
     }
     let show_now = CRED_QUEUE.with(|q| {
         let mut q = q.borrow_mut();
-        if let Some(p) = q.iter_mut().find(|p| p.session_id == session_id) {
+        if let Some(p) = q.iter_mut().find(|p| p.key == key) {
             p.responders.push(responder);
             return false;
         }
         let was_empty = q.is_empty();
         q.push_back(PendingCred {
-            session_id,
+            key,
             host,
             user,
             need_user,
-            need_password,
+            secret_kind,
             responders: vec![responder],
         });
         was_empty
@@ -4107,9 +4119,22 @@ fn show_front_cred(win: &AppWindow) {
         if let Some(p) = q.borrow().front() {
             win.set_cred_host(p.host.clone().into());
             win.set_cred_need_user(p.need_user);
-            win.set_cred_need_password(p.need_password);
+            win.set_cred_need_secret(p.secret_kind.is_some());
             win.set_cred_user(p.user.clone().into());
-            win.set_cred_password("".into());
+            let (label, placeholder) = match p.secret_kind {
+                Some(crate::ssh::CredentialSecretKind::KeyPassphrase) => (
+                    t("私钥密码", "Key passphrase"),
+                    t("需要时连接时输入", "Prompted on connect if needed"),
+                ),
+                Some(crate::ssh::CredentialSecretKind::Password) => (
+                    t("密码", "Password"),
+                    t("留空时连接时输入", "Prompted on connect if blank"),
+                ),
+                None => ("", ""),
+            };
+            win.set_cred_secret_label(label.into());
+            win.set_cred_secret_placeholder(placeholder.into());
+            win.set_cred_secret("".into());
             win.set_cred_remember(false);
             win.set_cred_prompt_open(true);
         }
@@ -4122,7 +4147,7 @@ fn resolve_front_cred(win: &AppWindow, accept: bool) {
     let reply: Option<crate::ssh::CredentialReply> = if accept {
         Some((
             win.get_cred_user().to_string(),
-            win.get_cred_password().to_string(),
+            win.get_cred_secret().to_string(),
             win.get_cred_remember(),
         ))
     } else {
@@ -4132,10 +4157,10 @@ fn resolve_front_cred(win: &AppWindow, accept: bool) {
         let mut q = q.borrow_mut();
         if let Some(p) = q.pop_front() {
             CRED_DECIDED.with(|d| {
-                d.borrow_mut().insert(p.session_id.clone(), reply.clone());
+                d.borrow_mut().insert(p.key.clone(), reply.clone());
             });
-            if let Some((ref u, ref pw, true)) = reply {
-                persist_credentials(&p.session_id, u, pw, p.need_user, p.need_password);
+            if let Some((ref u, ref secret, true)) = reply {
+                persist_credentials(&p.key.session_id, u, secret, p.need_user, p.secret_kind);
             }
             for r in &p.responders {
                 r.respond(reply.clone());
@@ -4143,8 +4168,8 @@ fn resolve_front_cred(win: &AppWindow, accept: bool) {
         }
         !q.is_empty()
     });
-    // Don't leave the typed password lingering in the UI property.
-    win.set_cred_password("".into());
+    // Don't leave the typed secret lingering in the UI property.
+    win.set_cred_secret("".into());
     if has_next {
         show_front_cred(win);
     } else {
@@ -4156,9 +4181,9 @@ fn resolve_front_cred(win: &AppWindow, accept: bool) {
 fn persist_credentials(
     session_id: &str,
     user: &str,
-    password: &str,
+    secret: &str,
     set_user: bool,
-    set_password: bool,
+    secret_kind: Option<crate::ssh::CredentialSecretKind>,
 ) {
     HISTORY_STORE.with(|s| {
         if let Some(store) = s.borrow().as_ref() {
@@ -4167,8 +4192,14 @@ fn persist_credentials(
                 if set_user && !user.trim().is_empty() {
                     sess.user = user.trim().to_string();
                 }
-                if set_password {
-                    sess.password = crate::config::Secret::new(password.to_string());
+                match secret_kind {
+                    Some(crate::ssh::CredentialSecretKind::Password) => {
+                        sess.password = crate::config::Secret::new(secret.to_string());
+                    }
+                    Some(crate::ssh::CredentialSecretKind::KeyPassphrase) => {
+                        sess.key_passphrase = crate::config::Secret::new(secret.to_string());
+                    }
+                    None => {}
                 }
                 st.upsert(sess);
                 let _ = st.save();

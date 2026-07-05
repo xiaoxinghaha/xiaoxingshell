@@ -99,6 +99,12 @@ msgstr "留空则不修改密码"
 msgid "Key passphrase"
 msgstr "私钥密码"
 
+msgid "Prompted on connect if blank"
+msgstr "留空则在连接时再输入"
+
+msgid "Prompted on connect if needed"
+msgstr "需要时在连接时再输入"
+
 msgid "Leave blank if the key isn't encrypted"
 msgstr "若私钥未加密则留空"
 
@@ -116,6 +122,15 @@ msgstr "选择私钥本身（不是 .pub 公钥文件）"
 
 msgid "Cancel"
 msgstr "取消"
+
+msgid "Login"
+msgstr "登录"
+
+msgid "Remember for this session"
+msgstr "记住本次会话"
+
+msgid "Connect"
+msgstr "连接"
 
 msgid "Save"
 msgstr "保存"

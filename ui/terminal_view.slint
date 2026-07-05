@@ -1138,8 +1138,8 @@ export component TerminalView inherits Rectangle {
             delete(path)        => { root.sftp-delete(path); }
             view(path)          => { root.sftp-view(path); }
             edit(path)          => { root.sftp-edit(path); }
-            open-external(path) => { root.sftp-open-external(path); }
-            edit-external(path) => { root.sftp-edit-external(path); }
+            open-external(path) => { root.sftp-open-external(path); ime-input.focus(); }
+            edit-external(path) => { root.sftp-edit-external(path); ime-input.focus(); }
             configure-external-editor() => { root.sftp-configure-external-editor(); }
             sort-request(column) => {
                 root.sftp-sort-column = self.sort-column;

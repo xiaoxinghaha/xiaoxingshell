@@ -285,6 +285,12 @@ impl std::fmt::Debug for HostKeyResponder {
 /// remember)`, or `None` if they cancelled.
 pub type CredentialReply = (String, String, bool);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CredentialSecretKind {
+    Password,
+    KeyPassphrase,
+}
+
 /// Carries the credential prompt's answer back to the blocked auth flow (#110).
 /// `Arc<Mutex<Option<…>>>` so the enclosing [`SessionEvent`] stays `Clone`.
 #[derive(Clone)]
@@ -338,14 +344,15 @@ pub enum SessionEvent {
         changed: bool,
         responder: HostKeyResponder,
     },
-    /// The session is missing a username and/or password; the UI must prompt for
-    /// them and answer via `responder`. The auth flow is blocked meanwhile (#110).
+    /// The session is missing a username and/or connect-time secret (password or
+    /// key passphrase); the UI must prompt for them and answer via `responder`.
+    /// The auth flow is blocked meanwhile (#110).
     CredentialPrompt {
         session_id: String,
         host: String,
         user: String,
         need_user: bool,
-        need_password: bool,
+        secret_kind: Option<CredentialSecretKind>,
         responder: CredentialResponder,
     },
     /// Remote machine resource sample (from the monitor channel).
@@ -538,18 +545,25 @@ async fn run_session(
             .with_context(|| format!("connect {} failed", addr))?,
     };
 
-    // Resolve missing username/password by prompting the user (#110).
-    let (user, password) = match resolve_credentials(&session, &events).await {
-        Some(c) => c,
-        None => {
-            let _ = events.send(SessionEvent::Closed(
-                t("已取消登录", "login cancelled").into(),
-            ));
-            let _ = handle
-                .disconnect(Disconnect::ByApplication, "cancelled", "")
-                .await;
-            return Ok(());
+    let mut user = session.user.trim().to_string();
+    let password = if matches!(session.auth, AuthMethod::Password) {
+        match resolve_credentials(&session, &events).await {
+            Some((resolved_user, resolved_password)) => {
+                user = resolved_user;
+                resolved_password
+            }
+            None => {
+                let _ = events.send(SessionEvent::Closed(
+                    t("已取消登录", "login cancelled").into(),
+                ));
+                let _ = handle
+                    .disconnect(Disconnect::ByApplication, "cancelled", "")
+                    .await;
+                return Ok(());
+            }
         }
+    } else {
+        String::new()
     };
 
     // --- Auth ----------------------------------------------------------
@@ -559,29 +573,17 @@ async fn run_session(
             .await
             .context("password auth failed")?,
         AuthMethod::Key => {
-            let raw = session.private_key_path.trim();
-            if raw.is_empty() {
-                return Err(anyhow!(t("私钥路径为空", "private key path is empty")));
-            }
-            // Normalise separators (we store `/` everywhere) and be forgiving if
-            // the user pointed at the `.pub` *public* key — the private key is the
-            // same path without that suffix.
-            let normalised = raw.replace('\\', "/");
-            let key_path = normalised
-                .strip_suffix(".pub")
-                .map(str::to_string)
-                .unwrap_or(normalised);
-            let pass = session.key_passphrase.as_str();
-            let keypair = load_secret_key(
-                Path::new(&key_path),
-                if pass.is_empty() { None } else { Some(pass) },
-            )
-            .with_context(|| format!("failed to load key {key_path}"))?;
-            // RSA keys must be signed with an explicit SHA-2 hash; every other
-            // key type carries its own algorithm, so no override is needed.
-            let hash = keypair.algorithm().is_rsa().then_some(HashAlg::Sha256);
-            let key_with_hash = PrivateKeyWithHashAlg::new(Arc::new(keypair), hash)
-                .context("invalid private key / hash algorithm combination")?;
+            let Some((resolved_user, key_with_hash)) = resolve_key_auth(&session, &events).await?
+            else {
+                let _ = events.send(SessionEvent::Closed(
+                    t("已取消登录", "login cancelled").into(),
+                ));
+                let _ = handle
+                    .disconnect(Disconnect::ByApplication, "cancelled", "")
+                    .await;
+                return Ok(());
+            };
+            user = resolved_user;
             handle
                 .authenticate_publickey(&user, key_with_hash)
                 .await
@@ -1227,6 +1229,28 @@ pub(crate) async fn verify_host_key(
 /// user cancelled. Both the shell and SFTP connections call this; the UI
 /// de-duplicates by session id so a single dialog serves both. A dropped reply
 /// channel (no UI) falls through with the stored values so auth fails normally.
+async fn prompt_for_credentials(
+    session: &Session,
+    events: &UnboundedSender<SessionEvent>,
+    user: String,
+    need_user: bool,
+    secret_kind: Option<CredentialSecretKind>,
+) -> Option<CredentialReply> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let sent = events.send(SessionEvent::CredentialPrompt {
+        session_id: session.id.clone(),
+        host: session.host.clone(),
+        user: user.clone(),
+        need_user,
+        secret_kind,
+        responder: CredentialResponder::new(tx),
+    });
+    if sent.is_err() {
+        return Some((user, String::new(), false));
+    }
+    rx.await.ok().flatten()
+}
+
 pub(crate) async fn resolve_credentials(
     session: &Session,
     events: &UnboundedSender<SessionEvent>,
@@ -1234,33 +1258,92 @@ pub(crate) async fn resolve_credentials(
     let mut user = session.user.trim().to_string();
     let mut password = session.password.as_str().to_string();
     let need_user = user.is_empty();
-    let need_password = matches!(session.auth, AuthMethod::Password) && password.is_empty();
-    if !(need_user || need_password) {
+    let secret_kind = if matches!(session.auth, AuthMethod::Password) && password.is_empty() {
+        Some(CredentialSecretKind::Password)
+    } else {
+        None
+    };
+    if !(need_user || secret_kind.is_some()) {
         return Some((user, password));
     }
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let sent = events.send(SessionEvent::CredentialPrompt {
-        session_id: session.id.clone(),
-        host: session.host.clone(),
-        user: user.clone(),
-        need_user,
-        need_password,
-        responder: CredentialResponder::new(tx),
-    });
-    if sent.is_err() {
-        return Some((user, password));
-    }
-    match rx.await {
-        Ok(Some((u, p, _remember))) => {
+    match prompt_for_credentials(session, events, user.clone(), need_user, secret_kind).await {
+        Some((u, p, _remember)) => {
             if need_user {
                 user = u.trim().to_string();
             }
-            if need_password {
+            if secret_kind.is_some() {
                 password = p;
             }
             Some((user, password))
         }
         _ => None,
+    }
+}
+
+fn key_load_error_needs_passphrase(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}").to_ascii_lowercase();
+    msg.contains("encrypted")
+        || (msg.contains("passphrase") && (msg.contains("required") || msg.contains("missing")))
+}
+
+pub(crate) async fn resolve_key_auth(
+    session: &Session,
+    events: &UnboundedSender<SessionEvent>,
+) -> Result<Option<(String, PrivateKeyWithHashAlg)>> {
+    let mut user = session.user.trim().to_string();
+    if user.is_empty() {
+        match prompt_for_credentials(session, events, user.clone(), true, None).await {
+            Some((u, _secret, _remember)) => user = u.trim().to_string(),
+            None => return Ok(None),
+        }
+    }
+
+    let raw = session.private_key_path.trim();
+    if raw.is_empty() {
+        return Err(anyhow!(t("私钥路径为空", "private key path is empty")));
+    }
+    let normalised = raw.replace('\\', "/");
+    let key_path = normalised
+        .strip_suffix(".pub")
+        .map(str::to_string)
+        .unwrap_or(normalised);
+
+    let load_key = |pass: Option<&str>| -> Result<PrivateKeyWithHashAlg> {
+        let keypair = load_secret_key(Path::new(&key_path), pass)
+            .with_context(|| format!("failed to load key {key_path}"))?;
+        let hash = keypair.algorithm().is_rsa().then_some(HashAlg::Sha256);
+        PrivateKeyWithHashAlg::new(Arc::new(keypair), hash).context("invalid private key")
+    };
+
+    let stored_pass = session.key_passphrase.as_str();
+    match load_key(if stored_pass.is_empty() {
+        None
+    } else {
+        Some(stored_pass)
+    }) {
+        Ok(key) => Ok(Some((user, key))),
+        Err(err) if stored_pass.is_empty() && key_load_error_needs_passphrase(&err) => {
+            match prompt_for_credentials(
+                session,
+                events,
+                user.clone(),
+                false,
+                Some(CredentialSecretKind::KeyPassphrase),
+            )
+            .await
+            {
+                Some((_u, secret, _remember)) => {
+                    let key = load_key(if secret.is_empty() {
+                        None
+                    } else {
+                        Some(secret.as_str())
+                    })?;
+                    Ok(Some((user, key)))
+                }
+                None => Ok(None),
+            }
+        }
+        Err(err) => Err(err),
     }
 }
 
@@ -1398,5 +1481,22 @@ mod monitor_hardening_tests {
         assert!(parse_monitor_block(&block, &mut prev, &mut prev_net, &mut at).is_some());
         // The remembered interface set is capped, not 500.
         assert!(prev_net.len() <= 64, "prev_net held {}", prev_net.len());
+    }
+}
+
+#[cfg(test)]
+mod credential_prompt_tests {
+    use super::key_load_error_needs_passphrase;
+
+    #[test]
+    fn encrypted_key_error_requests_passphrase_prompt() {
+        let err = anyhow::anyhow!("failed to load key: The key is encrypted");
+        assert!(key_load_error_needs_passphrase(&err));
+    }
+
+    #[test]
+    fn unrelated_key_error_does_not_force_prompt() {
+        let err = anyhow::anyhow!("failed to load key: no such file or directory");
+        assert!(!key_load_error_needs_passphrase(&err));
     }
 }

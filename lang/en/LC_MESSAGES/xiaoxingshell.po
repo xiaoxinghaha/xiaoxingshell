@@ -117,6 +117,15 @@ msgstr "Pick the private key itself (not the .pub public key)"
 msgid "Cancel"
 msgstr "Cancel"
 
+msgid "Login"
+msgstr "Login"
+
+msgid "Remember for this session"
+msgstr "Remember for this session"
+
+msgid "Connect"
+msgstr "Connect"
+
 msgid "Save"
 msgstr "Save"
 
@@ -230,6 +239,9 @@ msgstr "Please enter a host / IP address."
 
 msgid "Prompted on connect if blank"
 msgstr "Prompted on connect if blank"
+
+msgid "Prompted on connect if needed"
+msgstr "Prompted on connect if needed"
 
 msgid "e.g. /home/you/.ssh/id_ed25519"
 msgstr "e.g. /home/you/.ssh/id_ed25519"

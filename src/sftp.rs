@@ -10,7 +10,6 @@
 //! terminal tab.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -20,13 +19,11 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
 use russh::client::{self, Handler};
-use russh::keys::key::PrivateKeyWithHashAlg;
-use russh::keys::load_secret_key;
 use russh::ChannelMsg;
 use russh::Disconnect;
 use russh_sftp::client::{RawSftpSession, SftpSession};
 use russh_sftp::protocol::{FileAttributes, OpenFlags};
-use ssh_key::{HashAlg, PublicKey};
+use ssh_key::PublicKey;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
@@ -284,39 +281,24 @@ async fn run_sftp(
             .with_context(|| format!("sftp connect {} failed", addr))?,
     };
 
-    // Resolve missing username/password (shares the shell's prompt; the UI
-    // de-dupes by session id so SFTP doesn't prompt a second time) (#110).
-    let (user, password) = match crate::ssh::resolve_credentials(&session, &events).await {
-        Some(c) => c,
-        None => return Err(anyhow!(t("已取消登录", "login cancelled"))),
-    };
-
     // --- Authenticate (same method as the shell session) -------------------
     let authed = match session.auth {
-        AuthMethod::Password => handle
-            .authenticate_password(&user, password.as_str())
-            .await
-            .context("sftp password auth failed")?,
+        AuthMethod::Password => {
+            let (user, password) = match crate::ssh::resolve_credentials(&session, &events).await {
+                Some(c) => c,
+                None => return Err(anyhow!(t("已取消登录", "login cancelled"))),
+            };
+            handle
+                .authenticate_password(&user, password.as_str())
+                .await
+                .context("sftp password auth failed")?
+        }
         AuthMethod::Key => {
-            let raw = session.private_key_path.trim();
-            if raw.is_empty() {
-                return Err(anyhow!(t("私钥路径为空", "private key path is empty")));
-            }
-            let normalised = raw.replace('\\', "/");
-            let key_path = normalised
-                .strip_suffix(".pub")
-                .map(str::to_string)
-                .unwrap_or(normalised);
-            let pass = session.key_passphrase.as_str();
-            let keypair = load_secret_key(
-                Path::new(&key_path),
-                if pass.is_empty() { None } else { Some(pass) },
-            )
-            .with_context(|| format!("failed to load key {key_path}"))?;
-            // RSA keys need an explicit SHA-2 hash; other key types don't.
-            let hash = keypair.algorithm().is_rsa().then_some(HashAlg::Sha256);
-            let key_with_hash = PrivateKeyWithHashAlg::new(Arc::new(keypair), hash)
-                .context("invalid private key")?;
+            let Some((user, key_with_hash)) =
+                crate::ssh::resolve_key_auth(&session, &events).await?
+            else {
+                return Err(anyhow!(t("已取消登录", "login cancelled")));
+            };
             handle
                 .authenticate_publickey(&user, key_with_hash)
                 .await
