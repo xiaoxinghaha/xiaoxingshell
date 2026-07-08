@@ -141,6 +141,7 @@ export component TerminalView inherits Rectangle {
     callback sftp-refresh(string);
     callback sftp-tree-expand(string);
     callback sftp-delete(string);
+    callback sftp-delete-range(int, int);
     callback sftp-view(string);
     callback sftp-edit(string);
     callback sftp-open-external(string);
@@ -222,17 +223,21 @@ export component TerminalView inherits Rectangle {
     // Usable text box = root.width minus the 10px left/right padding of
     // output-text; usable height = key-capture height minus the 8px top pad
     // and the 16px bottom focus-recovery strip.
-    property <float> term-cols: max(10, floor((root.width - 20px) / cell-w));
-    property <float> term-rows: max(5,  floor((key-capture.height - 24px) / cell-h));
+    property <float> term-cols-raw: floor((root.width - 20px) / cell-w);
+    property <float> term-rows-raw: floor((key-capture.height - 24px) / cell-h);
+    property <float> term-cols: max(10, term-cols-raw);
+    property <float> term-rows: max(5, term-rows-raw);
+    property <bool> term-size-valid: root.visible && term-cols-raw >= 10 && term-rows-raw >= 5;
     // Only resize the PTY while this tab is visible.  Inactive tabs are laid
     // out at width 0 (→ term-cols collapses to 10); resizing the remote to 10
     // columns reflows the vt100 screen and destroys the scrollback, so when you
     // switch back the output is gone.  Guarding on `visible` keeps each hidden
     // session frozen at its real size; `changed visible` re-syncs on return.
-    changed term-cols => { if (root.visible) { root.terminal-resize(root.term-cols, root.term-rows); } }
-    changed term-rows => { if (root.visible) { root.terminal-resize(root.term-cols, root.term-rows); } }
+    changed term-cols => { if (root.term-size-valid) { root.terminal-resize(root.term-cols, root.term-rows); } }
+    changed term-rows => { if (root.term-size-valid) { root.terminal-resize(root.term-cols, root.term-rows); } }
+    changed term-size-valid => { if (root.term-size-valid) { root.terminal-resize(root.term-cols, root.term-rows); } }
 
-    init => { root.terminal-resize(root.term-cols, root.term-rows); }
+    init => { if (root.term-size-valid) { root.terminal-resize(root.term-cols, root.term-rows); } }
 
     changed spans => {
         // Bash: keep the latest output pinned to the bottom.
@@ -261,7 +266,9 @@ export component TerminalView inherits Rectangle {
         if (self.visible) {
             ime-input.focus();
             // Re-sync the PTY size on return (it was frozen while hidden).
-            root.terminal-resize(root.term-cols, root.term-rows);
+            if (root.term-size-valid) {
+                root.terminal-resize(root.term-cols, root.term-rows);
+            }
         }
     }
 
@@ -424,6 +431,7 @@ export component TerminalView inherits Rectangle {
                                         root.selecting = false;
                                         root.autoscroll-dir = 0;
                                         root.select-end();
+                                        ime-input.focus();
                                     }
                                 }
                             }
@@ -536,7 +544,7 @@ export component TerminalView inherits Rectangle {
                             width: root.cell-w;
                             height: root.cell-h;
                             background: Theme.term-fg;
-                            visible: ime-input.has-focus && key-capture.cursor-blink;
+                            visible: root.cursor-row >= 0 && ime-input.has-focus && key-capture.cursor-blink;
                         }
 
                         // --- Right-click context menu ---------------------
@@ -1136,6 +1144,7 @@ export component TerminalView inherits Rectangle {
             refresh(path)       => { root.sftp-refresh(path); }
             tree-expand(path)   => { root.sftp-tree-expand(path); }
             delete(path)        => { root.sftp-delete(path); }
+            delete-range(start, end) => { root.sftp-delete-range(start, end); }
             view(path)          => { root.sftp-view(path); }
             edit(path)          => { root.sftp-edit(path); }
             open-external(path) => { root.sftp-open-external(path); ime-input.focus(); }

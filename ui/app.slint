@@ -444,12 +444,14 @@ export component AppWindow inherits Window {
 
     // --- Session list ------------------------------------------------------
     in property <[SessionInfo]> sessions;
+    in-out property <string> selected-session-id;
 
     // --- Tabs --------------------------------------------------------------
     in property <[TabInfo]> tabs;
     in-out property <string> active-tab-id: "welcome";
     in property <[TerminalState]> terminals;
     in-out property <length> welcome-scroll-y: 0px;
+    in-out property <length> session-manager-scroll-y: 0px;
     property <length> top-toolbar-reserve: 146px;
 
     // --- Dialog state ------------------------------------------------------
@@ -480,6 +482,9 @@ export component AppWindow inherits Window {
     in-out property <bool> confirm-delete-open: false;
     in-out property <string> confirm-delete-tab;
     in-out property <string> confirm-delete-path;
+    in-out property <int> confirm-delete-range-start: -1;
+    in-out property <int> confirm-delete-range-end: -1;
+    in-out property <int> confirm-delete-count: 1;
     in-out property <bool> confirm-session-delete-open: false;
     in-out property <string> confirm-session-delete-id;
     in-out property <string> confirm-session-delete-name;
@@ -534,6 +539,7 @@ export component AppWindow inherits Window {
     // Toggle expand/collapse of a tree node (also navigates to that directory).
     callback sftp-tree-expand(string /* tab-id */, string /* path */);
     callback sftp-delete(string /* tab-id */, string /* path */);
+    callback sftp-delete-range(string /* tab-id */, int /* start */, int /* end */);
     callback sftp-view(string /* tab-id */, string /* path */);
     callback sftp-edit(string /* tab-id */, string /* path */);
     callback sftp-open-external(string /* tab-id */, string /* path */);
@@ -816,6 +822,7 @@ export component AppWindow inherits Window {
                         // Welcome tab
                         if root.active-tab-id == "welcome" : Welcome {
                             sessions: root.sessions;
+                            selected-session-id: root.selected-session-id;
                             import-hint: root.ssh-import-hint;
                             scroll-y <=> root.welcome-scroll-y;
                             new-session => { root.new-session-clicked(); }
@@ -910,6 +917,17 @@ export component AppWindow inherits Window {
                             sftp-delete(path) => {
                                 root.confirm-delete-tab = term.id;
                                 root.confirm-delete-path = path;
+                                root.confirm-delete-range-start = -1;
+                                root.confirm-delete-range-end = -1;
+                                root.confirm-delete-count = 1;
+                                root.confirm-delete-open = true;
+                            }
+                            sftp-delete-range(start, end) => {
+                                root.confirm-delete-tab = term.id;
+                                root.confirm-delete-path = "";
+                                root.confirm-delete-range-start = start;
+                                root.confirm-delete-range-end = end;
+                                root.confirm-delete-count = (start > end ? start - end : end - start) + 1;
                                 root.confirm-delete-open = true;
                             }
                             sftp-view(path) => { root.sftp-view(term.id, path); }
@@ -995,11 +1013,13 @@ export component AppWindow inherits Window {
                     background: transparent;
                     border-width: 0px;
                     sessions: root.sessions;
+                    selected-session-id: root.selected-session-id;
                     import-hint: "";
                     panel-title: root.lang-en ? "Session manager" : "会话管理器";
                     show-import-hint: false;
                     show-new-session: false;
                     compact-rows: true;
+                    scroll-y <=> root.session-manager-scroll-y;
                     new-session => { root.new-session-clicked(); }
                     import-ssh-config => { root.import-ssh-config(); }
                     connect-session(id) => { root.connect-session(id); }
@@ -3241,11 +3261,23 @@ export component AppWindow inherits Window {
         height: parent.height;
         is-open <=> root.confirm-delete-open;
         title: @tr("Confirm delete");
-        message: @tr("Delete this item? This cannot be undone.");
-        detail: root.confirm-delete-path;
+        message: root.confirm-delete-count > 1
+            ? (root.lang-en
+                ? "Delete these " + root.confirm-delete-count + " items? This cannot be undone."
+                : "确定要删除这 " + root.confirm-delete-count + " 个项目吗？此操作无法撤销。")
+            : @tr("Delete this item? This cannot be undone.");
+        detail: root.confirm-delete-count > 1 ? "" : root.confirm-delete-path;
         confirm-label: @tr("Delete");
         confirm => {
-            root.sftp-delete(root.confirm-delete-tab, root.confirm-delete-path);
+            if (root.confirm-delete-count > 1) {
+                root.sftp-delete-range(
+                    root.confirm-delete-tab,
+                    root.confirm-delete-range-start,
+                    root.confirm-delete-range-end
+                );
+            } else {
+                root.sftp-delete(root.confirm-delete-tab, root.confirm-delete-path);
+            }
             root.confirm-delete-open = false;
         }
         cancel => { root.confirm-delete-open = false; }

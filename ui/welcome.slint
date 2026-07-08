@@ -19,6 +19,7 @@ export struct SessionInfo {
 component SessionRow inherits Rectangle {
     in property <SessionInfo> session;
     in property <bool> compact: false;
+    in property <bool> selected: false;
     callback connect();
     callback edit();
     callback duplicate();
@@ -30,7 +31,11 @@ component SessionRow inherits Rectangle {
 
     height: root.compact ? 48px : 36px;
     border-radius: Theme.radius-sm;
-    background: touch.has-hover ? Theme.bg-hover : transparent;
+    border-width: root.selected ? 1px : 0px;
+    border-color: root.selected ? Theme.accent : transparent;
+    background: root.selected
+        ? (touch.has-hover ? #4a90e27a : #4a90e25c)
+        : (touch.has-hover ? Theme.bg-hover : transparent);
     animate background { duration: 120ms; }
 
     // Remember where the right-click landed so the popup can appear there.
@@ -228,6 +233,7 @@ component SessionRow inherits Rectangle {
 
 export component SessionBrowser inherits Rectangle {
     in property <[SessionInfo]> sessions;
+    in property <string> selected-session-id;
     in property <string> import-hint;        // result text after an import
     in property <string> panel-title: @tr("Quick connect");
     in property <bool> show-import-hint: true;
@@ -422,6 +428,7 @@ export component SessionBrowser inherits Rectangle {
                                 height: parent.height;
                                 session: session;
                                 compact: root.compact-rows;
+                                selected: root.selected-session-id == session.id;
                                 all-sessions: root.sessions;
                                 connect => { root.connect-session(session.id); }
                                 edit => { root.edit-session(session.id); }
@@ -440,6 +447,7 @@ export component SessionBrowser inherits Rectangle {
 // --- Welcome ---------------------------------------------------------------
 export component Welcome inherits Rectangle {
     in property <[SessionInfo]> sessions;
+    in property <string> selected-session-id;
     in property <string> import-hint;        // result text after an import
     in-out property <length> scroll-y: 0px;
     callback new-session();
@@ -478,6 +486,7 @@ export component Welcome inherits Rectangle {
         SessionBrowser {
             vertical-stretch: 1;
             sessions: root.sessions;
+            selected-session-id: root.selected-session-id;
             import-hint: root.import-hint;
             scroll-y <=> root.scroll-y;
             panel-title: @tr("Quick connect");

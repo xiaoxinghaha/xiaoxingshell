@@ -1,6 +1,6 @@
 [package]
 name = "xiaoxingshell"
-version = "1.0.9"
+version = "1.1.0"
 edition = "2021"
 authors = ["xiaoxingshell contributors"]
 description = "A lightweight FinalShell-style SSH/terminal client written in Rust + Slint"

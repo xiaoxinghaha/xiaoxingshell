@@ -1931,6 +1931,35 @@ fn active_sftp_path(win: &AppWindow, tab_id: &str) -> String {
     String::new()
 }
 
+fn sftp_entry_paths_in_range(win: &AppWindow, tab_id: &str, start: i32, end: i32) -> Vec<String> {
+    use slint::Model as _;
+
+    let terminals_rc = win.get_terminals();
+    let Some(terminals) = terminals_rc.as_any().downcast_ref::<VecModel<TerminalState>>() else {
+        return Vec::new();
+    };
+    let lo = start.min(end).max(0) as usize;
+    let hi = start.max(end).max(0) as usize;
+    for i in 0..terminals.row_count() {
+        if let Some(row) = terminals.row_data(i) {
+            if row.id.as_str() == tab_id {
+                return row
+                    .sftp_entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, _)| *idx >= lo && *idx <= hi)
+                    .map(|(_, entry)| entry.full_path.to_string())
+                    .collect();
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn focus_session_in_lists(win: &AppWindow, _model: &VecModel<SessionInfo>, session_id: &str) {
+    win.set_selected_session_id(session_id.into());
+}
+
 /// Current mouse cursor position in physical screen pixels (Windows).
 #[cfg(windows)]
 fn cursor_pos() -> Option<(i32, i32)> {
@@ -2372,15 +2401,19 @@ fn wire_session_callbacks(
         let store = store.clone();
         let sessions_model = sessions_model.clone();
         window.on_remove_session(move |id: SharedString| {
+            let removed_id = id.to_string();
             {
                 let mut s = store.borrow_mut();
-                s.remove(&id.to_string());
+                s.remove(&removed_id);
                 if let Err(err) = s.save() {
                     tracing::warn!("failed to save config: {err:#}");
                 }
             }
             sync_sessions_to_model(&store.borrow(), &sessions_model);
             if let Some(w) = weak.upgrade() {
+                if w.get_selected_session_id().as_str() == removed_id {
+                    w.set_selected_session_id("".into());
+                }
                 // Touch a property so the list re-renders reliably.
                 let _ = w.get_sessions();
             }
@@ -2595,6 +2628,7 @@ fn wire_session_callbacks(
             clear_credential_cache_for_session(&id);
             sync_sessions_to_model(&store.borrow(), &sessions_model);
             if let Some(w) = weak.upgrade() {
+                focus_session_in_lists(&w, &sessions_model, &id);
                 w.set_group_options(group_options_model(&store.borrow()));
                 w.set_dialog_password("".into());
                 w.set_dialog_key_passphrase("".into());
@@ -3026,19 +3060,24 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                         let sftp_sort_evt = sftp_sort_pump.clone();
                         let hidden_transfer_ids_evt = hidden_transfer_ids_pump.clone();
                         let _ = slint::invoke_from_event_loop(move || {
-                            if let Some(win) = weak_evt.upgrade() {
-                                apply_session_event_to_window(
-                                    &win,
-                                    &tid,
-                                    shell_evt,
-                                    &bufs_evt,
-                                    &st_evt,
-                                    &lc_evt,
-                                    &nh_evt,
-                                    &sftp_cache_evt,
-                                    &sftp_sort_evt,
-                                    &hidden_transfer_ids_evt,
-                                );
+                            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                if let Some(win) = weak_evt.upgrade() {
+                                    apply_session_event_to_window(
+                                        &win,
+                                        &tid,
+                                        shell_evt,
+                                        &bufs_evt,
+                                        &st_evt,
+                                        &lc_evt,
+                                        &nh_evt,
+                                        &sftp_cache_evt,
+                                        &sftp_sort_evt,
+                                        &hidden_transfer_ids_evt,
+                                    );
+                                }
+                            }));
+                            if result.is_err() {
+                                tracing::error!("shell event UI update panicked; event skipped");
                             }
                         });
                     }
@@ -3074,19 +3113,24 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                         let sftp_sort_s = sftp_sort_sftp.clone();
                         let hidden_transfer_ids_s = hidden_transfer_ids_sftp.clone();
                         let _ = slint::invoke_from_event_loop(move || {
-                            if let Some(win) = weak_s.upgrade() {
-                                apply_session_event_to_window(
-                                    &win,
-                                    &tid,
-                                    sftp_evt,
-                                    &bufs_s,
-                                    &st_s,
-                                    &lc_s,
-                                    &nh_s,
-                                    &sftp_cache_s,
-                                    &sftp_sort_s,
-                                    &hidden_transfer_ids_s,
-                                );
+                            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                if let Some(win) = weak_s.upgrade() {
+                                    apply_session_event_to_window(
+                                        &win,
+                                        &tid,
+                                        sftp_evt,
+                                        &bufs_s,
+                                        &st_s,
+                                        &lc_s,
+                                        &nh_s,
+                                        &sftp_cache_s,
+                                        &sftp_sort_s,
+                                        &hidden_transfer_ids_s,
+                                    );
+                                }
+                            }));
+                            if result.is_err() {
+                                tracing::error!("sftp event UI update panicked; event skipped");
                             }
                         });
                     }
@@ -3481,14 +3525,14 @@ fn apply_session_event_to_window(
     let tabs_rc = win.get_tabs();
     let terminals_rc = win.get_terminals();
     // `ModelRc::as_any` lets us downcast to the concrete `VecModel<T>`.
-    let tabs = tabs_rc
-        .as_any()
-        .downcast_ref::<VecModel<TabInfo>>()
-        .expect("tabs model must be a VecModel");
-    let terminals = terminals_rc
-        .as_any()
-        .downcast_ref::<VecModel<TerminalState>>()
-        .expect("terminals model must be a VecModel");
+    let Some(tabs) = tabs_rc.as_any().downcast_ref::<VecModel<TabInfo>>() else {
+        tracing::warn!("tabs model was not a VecModel; dropping session event");
+        return;
+    };
+    let Some(terminals) = terminals_rc.as_any().downcast_ref::<VecModel<TerminalState>>() else {
+        tracing::warn!("terminals model was not a VecModel; dropping session event");
+        return;
+    };
 
     let update_terminal = |mutator: &dyn Fn(&mut TerminalState)| {
         for i in 0..terminals.row_count() {
@@ -4589,35 +4633,7 @@ fn wire_sftp_callbacks(
             let tab_id = tab_id.to_string();
             let remote_paths: Vec<String> = weak
                 .upgrade()
-                .map(|w| {
-                    let terminals_rc = w.get_terminals();
-                    let terminals = terminals_rc
-                        .as_any()
-                        .downcast_ref::<VecModel<TerminalState>>();
-                    let Some(terminals) = terminals else {
-                        return Vec::new();
-                    };
-                    for i in 0..terminals.row_count() {
-                        if let Some(row) = terminals.row_data(i) {
-                            if row.id.as_str() == tab_id {
-                                let entries = row
-                                    .sftp_entries
-                                    .iter()
-                                    .map(|e| e.full_path.to_string())
-                                    .collect::<Vec<_>>();
-                                let lo = start.min(end).max(0) as usize;
-                                let hi = start.max(end).max(0) as usize;
-                                return entries
-                                    .into_iter()
-                                    .enumerate()
-                                    .filter(|(idx, _)| *idx >= lo && *idx <= hi)
-                                    .map(|(_, path)| path)
-                                    .collect();
-                            }
-                        }
-                    }
-                    Vec::new()
-                })
+                .map(|w| sftp_entry_paths_in_range(&w, &tab_id, start, end))
                 .unwrap_or_default();
             if remote_paths.is_empty() {
                 return;
@@ -4773,6 +4789,27 @@ fn wire_sftp_callbacks(
             if let Ok(handles) = sftp_handles.lock() {
                 if let Some(h) = handles.get(tab_id.as_str()) {
                     h.delete(path.to_string());
+                }
+            }
+        });
+    }
+    {
+        let sftp_handles = sftp_handles.clone();
+        let weak = window.as_weak();
+        window.on_sftp_delete_range(move |tab_id: SharedString, start: i32, end: i32| {
+            let tab_id = tab_id.to_string();
+            let remote_paths = weak
+                .upgrade()
+                .map(|w| sftp_entry_paths_in_range(&w, &tab_id, start, end))
+                .unwrap_or_default();
+            if remote_paths.is_empty() {
+                return;
+            }
+            if let Ok(handles) = sftp_handles.lock() {
+                if let Some(h) = handles.get(&tab_id) {
+                    for remote_path in remote_paths {
+                        h.delete(remote_path);
+                    }
                 }
             }
         });
@@ -5188,13 +5225,17 @@ fn wire_key_input(
             // Check whether the remote PTY switched to application cursor mode
             // (DECCKM, set by nano/vim via \x1b[?1h). In that mode the terminal
             // must send \x1bOA/B/C/D instead of \x1b[A/B/C/D.
+            let mut snapped_to_live = false;
             let app_cursor = {
                 let mut map = bufs.lock().unwrap();
                 match map.get_mut(tab_id.as_str()) {
                     Some(b) => {
                         // Typing snaps the view back to the live bottom so the
                         // user always sees what they're entering.
-                        b.view_offset = 0;
+                        if b.view_offset != 0 {
+                            b.view_offset = 0;
+                            snapped_to_live = true;
+                        }
                         b.parser.screen().application_cursor()
                     }
                     None => false,
@@ -5439,7 +5480,7 @@ fn wire_key_input(
                     }
                 }
             }
-            if repaint_after_local {
+            if snapped_to_live || repaint_after_local {
                 pending_ui_refresh.lock().unwrap().push(tid.clone());
             }
             if consume_locally && locally_queued_send.is_none() {
@@ -5502,6 +5543,7 @@ fn wire_key_input(
     {
         let handles = handles.clone();
         let bufs_resize = bufs.clone(); // keep bufs alive for the copy handler below
+        let pending_ui_refresh = pending_ui_refresh.clone();
                                         // The Slint side now measures the real Consolas cell size (via a hidden
                                         // probe Text) and passes whole column/row counts directly, so there is
                                         // no pixel→cell guesswork here.  This keeps full-screen programs like
@@ -5510,6 +5552,17 @@ fn wire_key_input(
             let cols = (cols_f as u32).max(10);
             let rows = (rows_f as u32).max(5);
             tracing::debug!("terminal_resize tab={} cols={} rows={}", tab_id, cols, rows);
+            let previous_size = *last_term_size.lock().unwrap();
+            if cols <= 10 && rows <= 5 && previous_size.1 > 5 {
+                tracing::debug!(
+                    "ignore transient terminal resize tab={} cols={} rows={} previous_rows={}",
+                    tab_id,
+                    cols,
+                    rows,
+                    previous_size.1
+                );
+                return;
+            }
             // Keep the shared size up-to-date so future connections start
             // with the correct PTY dimensions.
             *last_term_size.lock().unwrap() = (cols, rows);
@@ -5553,6 +5606,10 @@ fn wire_key_input(
                 // a scroll (which would double-capture lines).
                 buf.prev.clear();
             }
+            pending_ui_refresh
+                .lock()
+                .unwrap()
+                .push(tab_id.to_string());
         });
     }
 
@@ -6340,6 +6397,11 @@ struct HistSpan {
 /// A rendered line: plain text (one char per cell, for find/selection) + runs.
 type Line = (String, Vec<HistSpan>);
 
+/// Placeholder stored in plain-text rows for the trailing cell of a wide glyph.
+/// It keeps selection indices aligned to terminal cells without leaking extra
+/// text into the copied result.
+const WIDE_CONT_PLACEHOLDER: char = '\u{FDD0}';
+
 /// Build one screen row into `(plain_text, coloured_runs)`.  `plain` carries one
 /// char per cell (space for blanks) so a char index equals the grid column.
 /// Effective (contents, fg, bg, bold) for one grid cell, applying reverse-video.
@@ -6393,6 +6455,7 @@ fn build_row(screen: &vt100::Screen, r: u16, cols: u16) -> Line {
         // (CJK advance != 2×the Latin cell width).
         if wide {
             plain.push_str(&s);
+            plain.push(WIDE_CONT_PLACEHOLDER);
             runs.push(HistSpan {
                 text: s,
                 fg,
@@ -6460,6 +6523,9 @@ fn detect_scroll(prev: &[Line], curr: &[Line]) -> usize {
 }
 
 fn terminal_token_class(ch: char) -> u8 {
+    if ch == WIDE_CONT_PLACEHOLDER {
+        3
+    } else
     if ch.is_whitespace() {
         0
     } else if matches!(
@@ -6471,6 +6537,18 @@ fn terminal_token_class(ch: char) -> u8 {
     } else {
         2
     }
+}
+
+fn normalize_terminal_token_index(chars: &[char], idx: usize) -> Option<usize> {
+    if idx >= chars.len() {
+        return None;
+    }
+    if chars[idx] != WIDE_CONT_PLACEHOLDER {
+        return Some(idx);
+    }
+    (0..idx)
+        .rev()
+        .find(|&i| chars[i] != WIDE_CONT_PLACEHOLDER)
 }
 
 fn should_force_passthrough_for_command(cmd: &str) -> bool {
@@ -6827,7 +6905,11 @@ impl TermBuffer {
             self.sel_focus = None;
             return;
         }
-        let idx = col as usize;
+        let Some(idx) = normalize_terminal_token_index(&chars, col as usize) else {
+            self.sel_anchor = None;
+            self.sel_focus = None;
+            return;
+        };
         let class = terminal_token_class(chars[idx]);
         let mut start = idx;
         while start > 0 && terminal_token_class(chars[start - 1]) == class {
@@ -6940,7 +7022,10 @@ impl TermBuffer {
             let c0 = (c0 as usize).min(chars.len());
             let c1 = ((c1 as usize).saturating_add(1)).min(chars.len());
             let seg: String = if c0 < c1 {
-                chars[c0..c1].iter().collect()
+                chars[c0..c1]
+                    .iter()
+                    .filter(|&&ch| ch != WIDE_CONT_PLACEHOLDER)
+                    .collect()
             } else {
                 String::new()
             };
@@ -7209,10 +7294,16 @@ impl TermBuffer {
             displayed.push(String::new());
         }
         self.displayed_text = displayed;
+        let cursor_abs = hist_len + cur_row as usize;
+        let cursor_row = if cursor_abs >= start && cursor_abs < end {
+            (cursor_abs - start) as i32
+        } else {
+            -1
+        };
         BuiltScreen {
             spans,
-            cursor_row: -1, // hide the live cursor while viewing history
-            cursor_col: 0,
+            cursor_row,
+            cursor_col: cur_col as i32,
             rows_used: win as i32,
             is_alt: false,
         }
@@ -7677,6 +7768,22 @@ mod selection_tests {
     }
 
     #[test]
+    fn scrolled_render_keeps_cursor_when_live_row_is_visible() {
+        let mut buf = make_buf(5, 20, &["H0", "H1", "H2"], &["LIVE0", "LIVE1"], 3);
+        let built = buf.render();
+        assert_eq!(built.cursor_row, 4);
+        assert_eq!(built.cursor_col, 5);
+    }
+
+    #[test]
+    fn scrolled_render_hides_cursor_when_live_row_is_above_view() {
+        let history = ["H0", "H1", "H2", "H3", "H4", "H5", "H6", "H7", "H8", "H9"];
+        let mut buf = make_buf(5, 20, &history, &["LIVE0", "LIVE1"], 10);
+        let built = buf.render();
+        assert_eq!(built.cursor_row, -1);
+    }
+
+    #[test]
     fn extract_spans_history_and_live() {
         let mut buf = make_buf(5, 20, &["HIST0", "HIST1", "HIST2"], &["LIVE0", "LIVE1"], 3);
         buf.sel_anchor = Some((0, 0)); // top of history
@@ -7685,6 +7792,35 @@ mod selection_tests {
             buf.extract_selection_text(),
             "HIST0\nHIST1\nHIST2\nLIVE0\nLIVE1"
         );
+    }
+
+    #[test]
+    fn extract_selection_ignores_wide_continuation_cells() {
+        let mut parser = vt100::Parser::new(5, 20, 0);
+        parser.process("你好哈111222".as_bytes());
+        let buf = TermBuffer {
+            parser,
+            find_query: String::new(),
+            is_dark: false,
+            sel_anchor: Some((0, 0)),
+            sel_focus: Some((0, 5)),
+            history: Vec::new(),
+            max_history_lines: 9_999,
+            prev: Vec::new(),
+            view_offset: 0,
+            displayed_text: Vec::new(),
+            local_line: String::new(),
+            local_line_cells: 0,
+            local_cursor_chars: 0,
+            local_cursor_cells: 0,
+            local_buffer_enabled: true,
+            local_buffer_preferred: false,
+            local_prompt_ready: false,
+            local_passthrough_until_prompt: false,
+            suppress_echo: String::new(),
+            csi_state: CsiState::Normal,
+        };
+        assert_eq!(buf.extract_selection_text(), "你好哈");
     }
 
     #[test]

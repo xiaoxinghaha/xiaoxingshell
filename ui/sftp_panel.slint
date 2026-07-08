@@ -109,6 +109,7 @@ export component SftpPanel inherits Rectangle {
     callback refresh(string);
     callback tree-expand(string);   // toggle expand/collapse + navigate
     callback delete(string);        // remove a remote file/dir
+    callback delete-range(int, int);
     callback view(string);          // open read-only in the built-in viewer
     callback edit(string);          // open writable in the built-in editor
     callback open-external(string);     // open with the OS default app (#81)
@@ -1080,7 +1081,13 @@ export component SftpPanel inherits Rectangle {
                             }
                             if (e.text == Key.Delete || e.text == "\u{007f}") {
                                 if (root.selected-row >= 0 && root.selected-row < root.entries.length) {
-                                    root.delete(root.entries[root.selected-row].full-path);
+                                    if (root.selection-start-row >= 0
+                                            && root.selection-end-row >= 0
+                                            && root.selection-start-row != root.selection-end-row) {
+                                        root.delete-range(root.selection-start-row, root.selection-end-row);
+                                    } else {
+                                        root.delete(root.entries[root.selected-row].full-path);
+                                    }
                                     return accept;
                                 }
                             }
@@ -1167,7 +1174,15 @@ export component SftpPanel inherits Rectangle {
                                     label: @tr("Delete");
                                     tint: #d86c6c;
                                     enabled: root.menu-target != "";
-                                    clicked => { root.delete(root.menu-target); }
+                                    clicked => {
+                                        if (root.menu-selection-start >= 0
+                                                && root.menu-selection-end >= 0
+                                                && root.menu-selection-start != root.menu-selection-end) {
+                                            root.delete-range(root.menu-selection-start, root.menu-selection-end);
+                                        } else {
+                                            root.delete(root.menu-target);
+                                        }
+                                    }
                                 }
                                 Rectangle { height: 1px; background: Theme.border-subtle; }
                                 SftpMenuItem {
