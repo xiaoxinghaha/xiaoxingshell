@@ -313,6 +313,8 @@ export component AppWindow inherits Window {
     callback set-term-font-size(int);              // apply + persist font size (px)
     in-out property <int> terminal-scrollback-lines: 9999;
     callback set-terminal-scrollback-lines(int);   // apply + persist terminal scrollback cap
+    in-out property <int> session-flash-ms: 1000;
+    callback set-session-flash-ms(int);             // apply + persist session-row flash duration
     in-out property <string> nav-rail-color-text: "";
     in-out property <string> top-bar-color-text: "";
     in-out property <string> term-bg-color-text: "";
@@ -444,7 +446,7 @@ export component AppWindow inherits Window {
 
     // --- Session list ------------------------------------------------------
     in property <[SessionInfo]> sessions;
-    in-out property <string> selected-session-id;
+    in-out property <string> flash-session-id;
 
     // --- Tabs --------------------------------------------------------------
     in property <[TabInfo]> tabs;
@@ -517,6 +519,12 @@ export component AppWindow inherits Window {
     // is now active.  Fired on every active-tab change, UI- or code-driven.
     callback refresh-sidebar();
     changed active-tab-id => { root.refresh-sidebar(); }
+
+    Timer {
+        interval: root.session-flash-ms * 1ms;
+        running: root.flash-session-id != "";
+        triggered => { root.flash-session-id = ""; }
+    }
 
     // Raw keystroke forwarding: Rust converts key+modifiers to PTY bytes.
     callback send-key(string /* tab-id */, string /* key */, bool /* ctrl */, bool /* alt */, bool /* shift */);
@@ -822,7 +830,7 @@ export component AppWindow inherits Window {
                         // Welcome tab
                         if root.active-tab-id == "welcome" : Welcome {
                             sessions: root.sessions;
-                            selected-session-id: root.selected-session-id;
+                            flash-session-id: root.flash-session-id;
                             import-hint: root.ssh-import-hint;
                             scroll-y <=> root.welcome-scroll-y;
                             new-session => { root.new-session-clicked(); }
@@ -1013,7 +1021,7 @@ export component AppWindow inherits Window {
                     background: transparent;
                     border-width: 0px;
                     sessions: root.sessions;
-                    selected-session-id: root.selected-session-id;
+                    flash-session-id: root.flash-session-id;
                     import-hint: "";
                     panel-title: root.lang-en ? "Session manager" : "会话管理器";
                     show-import-hint: false;
@@ -2506,6 +2514,37 @@ export component AppWindow inherits Window {
                                         text: root.lang-en
                                             ? "Controls how many terminal scrollback lines stay in memory per session."
                                             : "控制每个会话在内存中保留多少行终端滚动缓存。";
+                                        color: Theme.text-muted;
+                                        font-size: Theme.fs-sm;
+                                        wrap: word-wrap;
+                                    }
+
+                                    VerticalLayout {
+                                        spacing: 6px;
+                                        Text { text: root.lang-en ? "Session row flash" : "会话条目闪烁时间";
+                                               color: Theme.text-secondary; font-size: Theme.fs-sm; }
+                                        HorizontalLayout {
+                                            spacing: 10px;
+                                            SpinBox {
+                                                width: 120px;
+                                                value: root.session-flash-ms;
+                                                minimum: 100;
+                                                maximum: 5000;
+                                                edited => { root.set-session-flash-ms(self.value); }
+                                            }
+                                            Text {
+                                                text: root.session-flash-ms + " ms";
+                                                color: Theme.text-muted;
+                                                font-size: Theme.fs-sm;
+                                                vertical-alignment: center;
+                                            }
+                                            Rectangle { horizontal-stretch: 1; }
+                                        }
+                                    }
+                                    Text {
+                                        text: root.lang-en
+                                            ? "How long a session row is highlighted after create, save, or connect."
+                                            : "创建、保存或连接会话后，条目短暂高亮的持续时间。";
                                         color: Theme.text-muted;
                                         font-size: Theme.fs-sm;
                                         wrap: word-wrap;

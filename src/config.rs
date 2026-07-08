@@ -367,6 +367,10 @@ pub struct ConfigFile {
     /// Maximum terminal scrollback lines kept in memory. 0 = built-in default.
     #[serde(default)]
     pub terminal_scrollback_lines: u32,
+    /// Duration for the short session-row flash after create/edit/connect. 0 =
+    /// built-in default.
+    #[serde(default)]
+    pub session_flash_ms: u32,
     /// Explicit session groups/folders (#41), including empty ones so a folder
     /// can exist before any session is moved into it. "default" is implicit and
     /// not stored here.
@@ -842,6 +846,19 @@ impl ConfigStore {
 
     pub fn set_terminal_scrollback_lines(&mut self, lines: u32) {
         self.cache.terminal_scrollback_lines = lines.clamp(100, 200_000);
+    }
+
+    /// Session row flash duration in milliseconds (default 1000).
+    pub fn session_flash_ms(&self) -> u32 {
+        if self.cache.session_flash_ms == 0 {
+            1_000
+        } else {
+            self.cache.session_flash_ms.clamp(100, 5_000)
+        }
+    }
+
+    pub fn set_session_flash_ms(&mut self, ms: u32) {
+        self.cache.session_flash_ms = ms.clamp(100, 5_000);
     }
 
     /// Whether the SFTP panel follows the terminal's cd (default true).
@@ -1326,6 +1343,19 @@ mod tests {
 
         store.set_terminal_scrollback_lines(500_000);
         assert_eq!(store.terminal_scrollback_lines(), 200_000);
+    }
+
+    #[test]
+    fn session_flash_ms_defaults_and_clamps() {
+        let mut store = temp_store();
+
+        assert_eq!(store.session_flash_ms(), 1_000);
+
+        store.set_session_flash_ms(50);
+        assert_eq!(store.session_flash_ms(), 100);
+
+        store.set_session_flash_ms(8_000);
+        assert_eq!(store.session_flash_ms(), 5_000);
     }
 
     #[test]

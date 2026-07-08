@@ -233,7 +233,7 @@ component SessionRow inherits Rectangle {
 
 export component SessionBrowser inherits Rectangle {
     in property <[SessionInfo]> sessions;
-    in property <string> selected-session-id;
+    in property <string> flash-session-id;
     in property <string> import-hint;        // result text after an import
     in property <string> panel-title: @tr("Quick connect");
     in property <bool> show-import-hint: true;
@@ -428,7 +428,7 @@ export component SessionBrowser inherits Rectangle {
                                 height: parent.height;
                                 session: session;
                                 compact: root.compact-rows;
-                                selected: root.selected-session-id == session.id;
+                                selected: root.flash-session-id == session.id;
                                 all-sessions: root.sessions;
                                 connect => { root.connect-session(session.id); }
                                 edit => { root.edit-session(session.id); }
@@ -447,7 +447,7 @@ export component SessionBrowser inherits Rectangle {
 // --- Welcome ---------------------------------------------------------------
 export component Welcome inherits Rectangle {
     in property <[SessionInfo]> sessions;
-    in property <string> selected-session-id;
+    in property <string> flash-session-id;
     in property <string> import-hint;        // result text after an import
     in-out property <length> scroll-y: 0px;
     callback new-session();
@@ -486,7 +486,7 @@ export component Welcome inherits Rectangle {
         SessionBrowser {
             vertical-stretch: 1;
             sessions: root.sessions;
-            selected-session-id: root.selected-session-id;
+            flash-session-id: root.flash-session-id;
             import-hint: root.import-hint;
             scroll-y <=> root.scroll-y;
             panel-title: @tr("Quick connect");

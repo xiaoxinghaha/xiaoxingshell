@@ -561,6 +561,7 @@ pub fn run() -> Result<()> {
         }
         window.set_term_font_size(s.font_size() as f32);
         window.set_terminal_scrollback_lines(s.terminal_scrollback_lines() as i32);
+        window.set_session_flash_ms(s.session_flash_ms() as i32);
     }
     // Editable inputs (e.g. the SFTP path bar) need a CJK-capable font: the
     // embedded mono font has no Chinese glyphs and native TextInput doesn't
@@ -767,6 +768,22 @@ pub fn run() -> Result<()> {
             }
             if let Some(w) = weak.upgrade() {
                 w.set_terminal_scrollback_lines(saved as i32);
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        window.on_set_session_flash_ms(move |ms: i32| {
+            let saved = {
+                let mut s = store.borrow_mut();
+                s.set_session_flash_ms(ms.max(100) as u32);
+                let saved = s.session_flash_ms();
+                let _ = s.save();
+                saved
+            };
+            if let Some(w) = weak.upgrade() {
+                w.set_session_flash_ms(saved as i32);
             }
         });
     }
@@ -1956,8 +1973,9 @@ fn sftp_entry_paths_in_range(win: &AppWindow, tab_id: &str, start: i32, end: i32
     Vec::new()
 }
 
-fn focus_session_in_lists(win: &AppWindow, _model: &VecModel<SessionInfo>, session_id: &str) {
-    win.set_selected_session_id(session_id.into());
+fn flash_session_in_lists(win: &AppWindow, session_id: &str) {
+    win.set_flash_session_id("".into());
+    win.set_flash_session_id(session_id.into());
 }
 
 /// Current mouse cursor position in physical screen pixels (Windows).
@@ -2411,8 +2429,8 @@ fn wire_session_callbacks(
             }
             sync_sessions_to_model(&store.borrow(), &sessions_model);
             if let Some(w) = weak.upgrade() {
-                if w.get_selected_session_id().as_str() == removed_id {
-                    w.set_selected_session_id("".into());
+                if w.get_flash_session_id().as_str() == removed_id {
+                    w.set_flash_session_id("".into());
                 }
                 // Touch a property so the list re-renders reliably.
                 let _ = w.get_sessions();
@@ -2628,11 +2646,17 @@ fn wire_session_callbacks(
             clear_credential_cache_for_session(&id);
             sync_sessions_to_model(&store.borrow(), &sessions_model);
             if let Some(w) = weak.upgrade() {
-                focus_session_in_lists(&w, &sessions_model, &id);
                 w.set_group_options(group_options_model(&store.borrow()));
                 w.set_dialog_password("".into());
                 w.set_dialog_key_passphrase("".into());
                 w.set_dialog_open(false);
+                let weak_flash = w.as_weak();
+                let id_flash = id.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(w) = weak_flash.upgrade() {
+                        flash_session_in_lists(&w, &id_flash);
+                    }
+                });
             }
         });
     }
@@ -2758,6 +2782,9 @@ fn wire_session_callbacks(
                 Some(s) => s,
                 None => return,
             };
+            if let Some(w) = weak.upgrade() {
+                flash_session_in_lists(&w, &id);
+            }
             let tab_id = format!("term-{}", uuid::Uuid::new_v4());
             let tab_title = session.name.clone();
 
