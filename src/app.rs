@@ -82,6 +82,9 @@ struct TermBuffer {
     mouse_sgr: bool,
     /// Small state buffer for DEC private mouse-mode CSI sequences.
     mouse_csi: Vec<u8>,
+    /// Short-lived helper for tmux's default Ctrl+B prefix: if the next key is
+    /// a fullwidth Chinese punctuation mark, send the ASCII command key instead.
+    tmux_prefix_until: Option<std::time::Instant>,
     /// CSI-scanner state for rewriting HVP (`ESC [ … f`) into CUP (`ESC [ … H`).
     /// vt100 0.15 only implements the `H` final byte, not the equivalent `f`
     /// that btop/htop use for cursor positioning — without this rewrite their
@@ -2888,6 +2891,7 @@ fn wire_session_callbacks(
                     mouse_tracking: false,
                     mouse_sgr: false,
                     mouse_csi: Vec::new(),
+                    tmux_prefix_until: None,
                     csi_state: CsiState::Normal,
                 },
             );
@@ -5248,6 +5252,7 @@ fn wire_key_input(
                             b.mouse_tracking = false;
                             b.mouse_sgr = false;
                             b.mouse_csi.clear();
+                            b.tmux_prefix_until = None;
                             b.view_offset = 0;
                             b.sel_anchor = None;
                             b.sel_focus = None;
@@ -5468,6 +5473,28 @@ fn wire_key_input(
                 tracing::info!("[KEY_DIAG] Backspace PASSED all filters → sent to PTY");
             }
 
+            let mut effective_key = key.to_string();
+            {
+                let mut map = bufs.lock().unwrap();
+                if let Some(buf) = map.get_mut(tid.as_str()) {
+                    let now = std::time::Instant::now();
+                    if is_tmux_prefix_key(key.as_str(), ctrl, alt) {
+                        buf.tmux_prefix_until = Some(now + Duration::from_secs(2));
+                    } else if !key.as_str().is_empty() {
+                        let prefix_active = buf
+                            .tmux_prefix_until
+                            .is_some_and(|deadline| now <= deadline);
+                        if prefix_active {
+                            if let Some(mapped) = tmux_prefix_fullwidth_key(key.as_str()) {
+                                effective_key = mapped.to_string();
+                            }
+                        }
+                        buf.tmux_prefix_until = None;
+                    }
+                }
+            }
+            let key_for_pty = effective_key.as_str();
+
             let mut locally_queued_send: Option<Vec<u8>> = None;
             let mut consume_locally = false;
             let mut repaint_after_local = false;
@@ -5477,12 +5504,12 @@ fn wire_key_input(
                 if let Some(buf) = map.get_mut(tid.as_str()) {
                     local_mode_was_active = buf.can_local_buffer_input();
                     if buf.can_local_buffer_input() {
-                        if ctrl || alt || key.as_str() == "\t" {
+                        if ctrl || alt || key_for_pty == "\t" {
                             if let Some(flush) = buf.handoff_local_line_to_remote() {
                                 locally_queued_send = Some(flush.into_bytes());
                                 repaint_after_local = true;
                             }
-                        } else if key.as_str() == "\n" && !ctrl && !alt {
+                        } else if key_for_pty == "\n" && !ctrl && !alt {
                             if !buf.local_line.is_empty() {
                                 let committed = buf.take_local_line();
                                 buf.commit_local_line_optimistically(&committed);
@@ -5491,28 +5518,28 @@ fn wire_key_input(
                                 repaint_after_local = true;
                                 consume_locally = true;
                             }
-                        } else if key.as_str() == "\u{0008}" && !ctrl && !alt {
+                        } else if key_for_pty == "\u{0008}" && !ctrl && !alt {
                             if buf.backspace_local_char() {
                                 repaint_after_local = true;
                                 consume_locally = true;
                             }
-                        } else if matches!(key.as_str(), "\u{F728}" | "\u{007f}") && !ctrl && !alt {
+                        } else if matches!(key_for_pty, "\u{F728}" | "\u{007f}") && !ctrl && !alt {
                             if buf.delete_local_char() {
                                 repaint_after_local = true;
                                 consume_locally = true;
                             }
-                        } else if key.as_str() == "\u{F702}" && !ctrl && !alt {
+                        } else if key_for_pty == "\u{F702}" && !ctrl && !alt {
                             if buf.move_local_cursor_left() {
                                 repaint_after_local = true;
                                 consume_locally = true;
                             }
-                        } else if key.as_str() == "\u{F703}" && !ctrl && !alt {
+                        } else if key_for_pty == "\u{F703}" && !ctrl && !alt {
                             if buf.move_local_cursor_right() {
                                 repaint_after_local = true;
                                 consume_locally = true;
                             }
                         } else if let Some(ch) =
-                            TermBuffer::locally_bufferable_char(key.as_str(), ctrl, alt)
+                            TermBuffer::locally_bufferable_char(key_for_pty, ctrl, alt)
                         {
                             buf.insert_local_char(ch);
                             repaint_after_local = true;
@@ -5535,7 +5562,7 @@ fn wire_key_input(
                 return;
             }
 
-            let bytes = key_to_pty_bytes(key.as_str(), ctrl, alt, shift, app_cursor);
+            let bytes = key_to_pty_bytes(key_for_pty, ctrl, alt, shift, app_cursor);
             // Log only the length — never the keystroke bytes, which can be
             // password characters (#15).
             tracing::debug!(
@@ -5837,6 +5864,7 @@ fn wire_key_input(
                 buf.mouse_tracking = false;
                 buf.mouse_sgr = false;
                 buf.mouse_csi.clear();
+                buf.tmux_prefix_until = None;
                 buf.sel_anchor = None;
                 buf.sel_focus = None;
                 buf.displayed_text = Vec::new();
@@ -5904,6 +5932,8 @@ fn wire_key_input(
                             let c = col.clamp(0, cols.saturating_sub(1) as i32) as u16;
                             passthrough =
                                 Some(terminal_mouse_wheel_bytes(delta, r, c, buf.mouse_sgr));
+                        } else if buf.looks_like_tmux() {
+                            passthrough = Some(tmux_wheel_fallback_bytes(delta));
                         }
                     } else {
                         let max_off = buf.history.len() as i64;
@@ -6308,6 +6338,49 @@ fn terminal_mouse_wheel_bytes(delta: i32, row: u16, col: u16, sgr: bool) -> Vec<
             (32 + y) as u8,
         ]
     }
+}
+
+fn tmux_wheel_fallback_bytes(delta: i32) -> Vec<u8> {
+    let lines = 3;
+    if delta > 0 {
+        format!("\x02:copy-mode -e \\; send -X -N {lines} scroll-up\r").into_bytes()
+    } else {
+        format!("\x02:send -X -N {lines} scroll-down\r").into_bytes()
+    }
+}
+
+fn tmux_prefix_fullwidth_key(key: &str) -> Option<&'static str> {
+    match key {
+        "【" | "［" => Some("["),
+        "】" | "］" => Some("]"),
+        "：" => Some(":"),
+        "；" => Some(";"),
+        "，" => Some(","),
+        "。" => Some("."),
+        "／" => Some("/"),
+        "？" => Some("?"),
+        _ => None,
+    }
+}
+
+fn is_tmux_prefix_key(key: &str, ctrl: bool, alt: bool) -> bool {
+    ctrl && !alt && matches!(key, "\u{0002}" | "b" | "B")
+}
+
+fn tmux_status_line_looks_default(line: &str) -> bool {
+    let s = line.trim();
+    if !s.starts_with('[') || !s.contains(']') {
+        return false;
+    }
+    s.split_whitespace().any(|part| {
+        let mut chars = part.chars();
+        matches!(chars.next(), Some(ch) if ch.is_ascii_digit())
+            && part.contains(':')
+            && part
+                .chars()
+                .last()
+                .is_some_and(|ch| matches!(ch, '*' | '-' | '#'))
+    })
 }
 
 fn apply_mouse_mode_csi(seq: &[u8], mouse_tracking: &mut bool, mouse_sgr: &mut bool) {
@@ -7319,6 +7392,23 @@ impl TermBuffer {
         }
     }
 
+    fn looks_like_tmux(&self) -> bool {
+        if self
+            .displayed_text
+            .iter()
+            .rev()
+            .take(3)
+            .any(|line| tmux_status_line_looks_default(line))
+        {
+            return true;
+        }
+        let s = self.parser.screen();
+        let (rows, cols) = s.size();
+        (rows.saturating_sub(3)..rows)
+            .map(|r| build_row(s, r, cols).0)
+            .any(|line| tmux_status_line_looks_default(&line))
+    }
+
     /// Translate every CSI sequence terminated by `f` (HVP) into the identical
     /// sequence terminated by `H` (CUP).  The scanner state persists across
     /// calls, so a sequence split across read chunks is still handled.  Only the
@@ -7963,6 +8053,33 @@ mod key_tests {
     }
 
     #[test]
+    fn tmux_wheel_fallback_uses_copy_mode_commands() {
+        assert_eq!(
+            tmux_wheel_fallback_bytes(1),
+            b"\x02:copy-mode -e \\; send -X -N 3 scroll-up\r".to_vec()
+        );
+        assert_eq!(
+            tmux_wheel_fallback_bytes(-1),
+            b"\x02:send -X -N 3 scroll-down\r".to_vec()
+        );
+    }
+
+    #[test]
+    fn tmux_prefix_fullwidth_keys_map_to_ascii_commands() {
+        assert_eq!(tmux_prefix_fullwidth_key("【"), Some("["));
+        assert_eq!(tmux_prefix_fullwidth_key("】"), Some("]"));
+        assert_eq!(tmux_prefix_fullwidth_key("："), Some(":"));
+        assert_eq!(tmux_prefix_fullwidth_key("中"), None);
+    }
+
+    #[test]
+    fn tmux_default_status_line_is_detected() {
+        assert!(tmux_status_line_looks_default("[3] 0:bash*"));
+        assert!(tmux_status_line_looks_default("[server] 1:vim-"));
+        assert!(!tmux_status_line_looks_default("(venv) [root@host ~]#"));
+    }
+
+    #[test]
     fn mouse_mode_csi_sets_tracking_and_sgr() {
         let mut tracking = false;
         let mut sgr = false;
@@ -8068,6 +8185,7 @@ mod selection_tests {
             mouse_tracking: false,
             mouse_sgr: false,
             mouse_csi: Vec::new(),
+            tmux_prefix_until: None,
             csi_state: CsiState::Normal,
         }
     }
@@ -8080,6 +8198,12 @@ mod selection_tests {
         buf.update_mouse_modes(b"1006h");
         assert!(buf.mouse_tracking);
         assert!(buf.mouse_sgr);
+    }
+
+    #[test]
+    fn buffer_detects_tmux_status_line_near_bottom() {
+        let buf = make_buf(5, 40, &[], &["line", "line", "line", "[3] 0:bash*"], 0);
+        assert!(buf.looks_like_tmux());
     }
 
     #[test]
@@ -8158,6 +8282,7 @@ mod selection_tests {
             mouse_tracking: false,
             mouse_sgr: false,
             mouse_csi: Vec::new(),
+            tmux_prefix_until: None,
             csi_state: CsiState::Normal,
         };
         assert_eq!(buf.extract_selection_text(), "你好哈");
