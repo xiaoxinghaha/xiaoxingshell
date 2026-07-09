@@ -75,13 +75,6 @@ struct TermBuffer {
     /// next output chunks consume this prefix so the command line doesn't get
     /// duplicated once the server finally echoes it.
     suppress_echo: String,
-    /// Whether the remote program enabled xterm mouse reporting. tmux enables
-    /// this when `set -g mouse on` is active.
-    mouse_tracking: bool,
-    /// Whether mouse reports should use SGR coordinates (`CSI < ... M`).
-    mouse_sgr: bool,
-    /// Small state buffer for DEC private mouse-mode CSI sequences.
-    mouse_csi: Vec<u8>,
     /// Short-lived helper for tmux's default Ctrl+B prefix: if the next key is
     /// a fullwidth Chinese punctuation mark, send the ASCII command key instead.
     tmux_prefix_until: Option<std::time::Instant>,
@@ -2888,9 +2881,6 @@ fn wire_session_callbacks(
                     local_prompt_ready: false,
                     local_passthrough_until_prompt: false,
                     suppress_echo: String::new(),
-                    mouse_tracking: false,
-                    mouse_sgr: false,
-                    mouse_csi: Vec::new(),
                     tmux_prefix_until: None,
                     csi_state: CsiState::Normal,
                 },
@@ -5249,9 +5239,6 @@ fn wire_key_input(
                             b.local_prompt_ready = false;
                             b.local_passthrough_until_prompt = false;
                             b.suppress_echo.clear();
-                            b.mouse_tracking = false;
-                            b.mouse_sgr = false;
-                            b.mouse_csi.clear();
                             b.tmux_prefix_until = None;
                             b.view_offset = 0;
                             b.sel_anchor = None;
@@ -5861,9 +5848,6 @@ fn wire_key_input(
                 buf.local_prompt_ready = false;
                 buf.local_passthrough_until_prompt = false;
                 buf.suppress_echo.clear();
-                buf.mouse_tracking = false;
-                buf.mouse_sgr = false;
-                buf.mouse_csi.clear();
                 buf.tmux_prefix_until = None;
                 buf.sel_anchor = None;
                 buf.sel_focus = None;
@@ -5908,56 +5892,6 @@ fn wire_key_input(
                 });
             }
         });
-    }
-
-    // Mouse-wheel → scroll local history, or pass through to alt-screen apps
-    // that enabled xterm mouse reporting (tmux `mouse on`, vim `set mouse=a`).
-    {
-        let bufs_scroll = bufs.clone();
-        let handles_scroll = handles.clone();
-        let weak = window.as_weak();
-        window.on_terminal_wheel(
-            move |tab_id: SharedString, delta: i32, row: i32, col: i32| {
-                let tid = tab_id.to_string();
-                let mut passthrough = None;
-                let mut redraw = false;
-                {
-                    let mut map = bufs_scroll.lock().unwrap();
-                    let Some(buf) = map.get_mut(&tid) else { return };
-                    if buf.parser.screen().alternate_screen() {
-                        buf.view_offset = 0;
-                        if buf.mouse_tracking {
-                            let (rows, cols) = buf.parser.screen().size();
-                            let r = row.clamp(0, rows.saturating_sub(1) as i32) as u16;
-                            let c = col.clamp(0, cols.saturating_sub(1) as i32) as u16;
-                            passthrough =
-                                Some(terminal_mouse_wheel_bytes(delta, r, c, buf.mouse_sgr));
-                        } else if buf.looks_like_tmux() {
-                            passthrough = Some(tmux_wheel_fallback_bytes(delta));
-                        }
-                    } else {
-                        let max_off = buf.history.len() as i64;
-                        let cur = buf.view_offset as i64;
-                        let next =
-                            (cur + if delta > 0 { 3 } else { -3 }).clamp(0, max_off) as usize;
-                        if next != buf.view_offset {
-                            buf.view_offset = next;
-                            redraw = true;
-                        }
-                    }
-                }
-                if let Some(bytes) = passthrough {
-                    if let Some(handle) = handles_scroll.borrow().get(tab_id.as_str()) {
-                        handle.send_raw(bytes);
-                    }
-                }
-                if redraw {
-                    if let Some(win) = weak.upgrade() {
-                        rebuild_tab_display(&win, &bufs_scroll, &tid);
-                    }
-                }
-            },
-        );
     }
 
     // Mouse-wheel → scroll the scrollback history.
@@ -6322,33 +6256,6 @@ fn locally_bufferable_paste(text: &str) -> Option<&str> {
     Some(text)
 }
 
-fn terminal_mouse_wheel_bytes(delta: i32, row: u16, col: u16, sgr: bool) -> Vec<u8> {
-    let button = if delta > 0 { 64 } else { 65 };
-    let x = (col as u32 + 1).clamp(1, 223);
-    let y = (row as u32 + 1).clamp(1, 223);
-    if sgr {
-        format!("\x1b[<{button};{x};{y}M").into_bytes()
-    } else {
-        vec![
-            0x1b,
-            b'[',
-            b'M',
-            (32 + button) as u8,
-            (32 + x) as u8,
-            (32 + y) as u8,
-        ]
-    }
-}
-
-fn tmux_wheel_fallback_bytes(delta: i32) -> Vec<u8> {
-    let lines = 3;
-    if delta > 0 {
-        format!("\x02:copy-mode -e \\; send -X -N {lines} scroll-up\r").into_bytes()
-    } else {
-        format!("\x02:send -X -N {lines} scroll-down\r").into_bytes()
-    }
-}
-
 fn tmux_prefix_fullwidth_key(key: &str) -> Option<&'static str> {
     match key {
         "【" | "［" => Some("["),
@@ -6365,48 +6272,6 @@ fn tmux_prefix_fullwidth_key(key: &str) -> Option<&'static str> {
 
 fn is_tmux_prefix_key(key: &str, ctrl: bool, alt: bool) -> bool {
     ctrl && !alt && matches!(key, "\u{0002}" | "b" | "B")
-}
-
-fn tmux_status_line_looks_default(line: &str) -> bool {
-    let s = line.trim();
-    if !s.starts_with('[') || !s.contains(']') {
-        return false;
-    }
-    s.split_whitespace().any(|part| {
-        let mut chars = part.chars();
-        matches!(chars.next(), Some(ch) if ch.is_ascii_digit())
-            && part.contains(':')
-            && part
-                .chars()
-                .last()
-                .is_some_and(|ch| matches!(ch, '*' | '-' | '#'))
-    })
-}
-
-fn apply_mouse_mode_csi(seq: &[u8], mouse_tracking: &mut bool, mouse_sgr: &mut bool) {
-    if seq.len() < 5 || seq[0] != 0x1b || seq[1] != b'[' || seq[2] != b'?' {
-        return;
-    }
-    let Some(&final_byte) = seq.last() else {
-        return;
-    };
-    let set = match final_byte {
-        b'h' => true,
-        b'l' => false,
-        _ => return,
-    };
-    for part in seq[3..seq.len() - 1].split(|b| *b == b';') {
-        let code = part
-            .split(|b| *b == b':')
-            .next()
-            .and_then(|p| std::str::from_utf8(p).ok())
-            .and_then(|p| p.parse::<u16>().ok());
-        match code {
-            Some(1000 | 1002 | 1003) => *mouse_tracking = set,
-            Some(1006) => *mouse_sgr = set,
-            _ => {}
-        }
-    }
 }
 
 fn modifier_param(ctrl: bool, alt: bool, shift: bool) -> Option<u8> {
@@ -7327,7 +7192,6 @@ impl TermBuffer {
     /// and nothing is lost.  (Splitting only on `\n` is safe: VT escape
     /// sequences never contain a newline.)
     fn ingest(&mut self, raw: &[u8]) {
-        self.update_mouse_modes(raw);
         // Rewrite HVP (`ESC [ … f`) → CUP (`ESC [ … H`) so vt100 (which only
         // implements `H`) honours btop/htop's absolute cursor positioning.
         let bytes = self.rewrite_hvp(raw);
@@ -7349,64 +7213,6 @@ impl TermBuffer {
         if start < bytes.len() {
             self.ingest_chunk(&bytes[start..]);
         }
-    }
-
-    fn update_mouse_modes(&mut self, input: &[u8]) {
-        for &b in input {
-            match self.mouse_csi.len() {
-                0 => {
-                    if b == 0x1b {
-                        self.mouse_csi.push(b);
-                    }
-                }
-                1 => {
-                    if b == b'[' {
-                        self.mouse_csi.push(b);
-                    } else if b == 0x1b {
-                        self.mouse_csi.clear();
-                        self.mouse_csi.push(b);
-                    } else {
-                        self.mouse_csi.clear();
-                    }
-                }
-                2 => {
-                    if b == b'?' {
-                        self.mouse_csi.push(b);
-                    } else if b == 0x1b {
-                        self.mouse_csi.clear();
-                        self.mouse_csi.push(b);
-                    } else {
-                        self.mouse_csi.clear();
-                    }
-                }
-                _ => {
-                    self.mouse_csi.push(b);
-                    if (0x40..=0x7e).contains(&b) {
-                        let seq = std::mem::take(&mut self.mouse_csi);
-                        apply_mouse_mode_csi(&seq, &mut self.mouse_tracking, &mut self.mouse_sgr);
-                    } else if self.mouse_csi.len() > 64 {
-                        self.mouse_csi.clear();
-                    }
-                }
-            }
-        }
-    }
-
-    fn looks_like_tmux(&self) -> bool {
-        if self
-            .displayed_text
-            .iter()
-            .rev()
-            .take(3)
-            .any(|line| tmux_status_line_looks_default(line))
-        {
-            return true;
-        }
-        let s = self.parser.screen();
-        let (rows, cols) = s.size();
-        (rows.saturating_sub(3)..rows)
-            .map(|r| build_row(s, r, cols).0)
-            .any(|line| tmux_status_line_looks_default(&line))
     }
 
     /// Translate every CSI sequence terminated by `f` (HVP) into the identical
@@ -8041,56 +7847,11 @@ mod key_tests {
     }
 
     #[test]
-    fn mouse_wheel_bytes_match_xterm_protocols() {
-        assert_eq!(
-            terminal_mouse_wheel_bytes(1, 2, 4, true),
-            b"\x1b[<64;5;3M".to_vec()
-        );
-        assert_eq!(
-            terminal_mouse_wheel_bytes(-1, 0, 0, false),
-            vec![0x1b, b'[', b'M', b'a', b'!', b'!']
-        );
-    }
-
-    #[test]
-    fn tmux_wheel_fallback_uses_copy_mode_commands() {
-        assert_eq!(
-            tmux_wheel_fallback_bytes(1),
-            b"\x02:copy-mode -e \\; send -X -N 3 scroll-up\r".to_vec()
-        );
-        assert_eq!(
-            tmux_wheel_fallback_bytes(-1),
-            b"\x02:send -X -N 3 scroll-down\r".to_vec()
-        );
-    }
-
-    #[test]
     fn tmux_prefix_fullwidth_keys_map_to_ascii_commands() {
         assert_eq!(tmux_prefix_fullwidth_key("【"), Some("["));
         assert_eq!(tmux_prefix_fullwidth_key("】"), Some("]"));
         assert_eq!(tmux_prefix_fullwidth_key("："), Some(":"));
         assert_eq!(tmux_prefix_fullwidth_key("中"), None);
-    }
-
-    #[test]
-    fn tmux_default_status_line_is_detected() {
-        assert!(tmux_status_line_looks_default("[3] 0:bash*"));
-        assert!(tmux_status_line_looks_default("[server] 1:vim-"));
-        assert!(!tmux_status_line_looks_default("(venv) [root@host ~]#"));
-    }
-
-    #[test]
-    fn mouse_mode_csi_sets_tracking_and_sgr() {
-        let mut tracking = false;
-        let mut sgr = false;
-        apply_mouse_mode_csi(b"\x1b[?1000;1006h", &mut tracking, &mut sgr);
-        assert!(tracking);
-        assert!(sgr);
-        apply_mouse_mode_csi(b"\x1b[?1000l", &mut tracking, &mut sgr);
-        assert!(!tracking);
-        assert!(sgr);
-        apply_mouse_mode_csi(b"\x1b[?1006l", &mut tracking, &mut sgr);
-        assert!(!sgr);
     }
 
     #[test]
@@ -8182,28 +7943,9 @@ mod selection_tests {
             local_prompt_ready: false,
             local_passthrough_until_prompt: false,
             suppress_echo: String::new(),
-            mouse_tracking: false,
-            mouse_sgr: false,
-            mouse_csi: Vec::new(),
             tmux_prefix_until: None,
             csi_state: CsiState::Normal,
         }
-    }
-
-    #[test]
-    fn mouse_mode_tracking_handles_split_csi() {
-        let mut buf = make_buf(5, 20, &[], &[""], 0);
-        buf.update_mouse_modes(b"\x1b[?1000;");
-        assert!(!buf.mouse_tracking);
-        buf.update_mouse_modes(b"1006h");
-        assert!(buf.mouse_tracking);
-        assert!(buf.mouse_sgr);
-    }
-
-    #[test]
-    fn buffer_detects_tmux_status_line_near_bottom() {
-        let buf = make_buf(5, 40, &[], &["line", "line", "line", "[3] 0:bash*"], 0);
-        assert!(buf.looks_like_tmux());
     }
 
     #[test]
@@ -8279,9 +8021,6 @@ mod selection_tests {
             local_prompt_ready: false,
             local_passthrough_until_prompt: false,
             suppress_echo: String::new(),
-            mouse_tracking: false,
-            mouse_sgr: false,
-            mouse_csi: Vec::new(),
             tmux_prefix_until: None,
             csi_state: CsiState::Normal,
         };
