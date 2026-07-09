@@ -75,6 +75,13 @@ struct TermBuffer {
     /// next output chunks consume this prefix so the command line doesn't get
     /// duplicated once the server finally echoes it.
     suppress_echo: String,
+    /// Whether the remote program enabled xterm mouse reporting. tmux enables
+    /// this when `set -g mouse on` is active.
+    mouse_tracking: bool,
+    /// Whether mouse reports should use SGR coordinates (`CSI < ... M`).
+    mouse_sgr: bool,
+    /// Small state buffer for DEC private mouse-mode CSI sequences.
+    mouse_csi: Vec<u8>,
     /// CSI-scanner state for rewriting HVP (`ESC [ … f`) into CUP (`ESC [ … H`).
     /// vt100 0.15 only implements the `H` final byte, not the equivalent `f`
     /// that btop/htop use for cursor positioning — without this rewrite their
@@ -1952,7 +1959,10 @@ fn sftp_entry_paths_in_range(win: &AppWindow, tab_id: &str, start: i32, end: i32
     use slint::Model as _;
 
     let terminals_rc = win.get_terminals();
-    let Some(terminals) = terminals_rc.as_any().downcast_ref::<VecModel<TerminalState>>() else {
+    let Some(terminals) = terminals_rc
+        .as_any()
+        .downcast_ref::<VecModel<TerminalState>>()
+    else {
         return Vec::new();
     };
     let lo = start.min(end).max(0) as usize;
@@ -2875,6 +2885,9 @@ fn wire_session_callbacks(
                     local_prompt_ready: false,
                     local_passthrough_until_prompt: false,
                     suppress_echo: String::new(),
+                    mouse_tracking: false,
+                    mouse_sgr: false,
+                    mouse_csi: Vec::new(),
                     csi_state: CsiState::Normal,
                 },
             );
@@ -3087,22 +3100,23 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                         let sftp_sort_evt = sftp_sort_pump.clone();
                         let hidden_transfer_ids_evt = hidden_transfer_ids_pump.clone();
                         let _ = slint::invoke_from_event_loop(move || {
-                            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                if let Some(win) = weak_evt.upgrade() {
-                                    apply_session_event_to_window(
-                                        &win,
-                                        &tid,
-                                        shell_evt,
-                                        &bufs_evt,
-                                        &st_evt,
-                                        &lc_evt,
-                                        &nh_evt,
-                                        &sftp_cache_evt,
-                                        &sftp_sort_evt,
-                                        &hidden_transfer_ids_evt,
-                                    );
-                                }
-                            }));
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    if let Some(win) = weak_evt.upgrade() {
+                                        apply_session_event_to_window(
+                                            &win,
+                                            &tid,
+                                            shell_evt,
+                                            &bufs_evt,
+                                            &st_evt,
+                                            &lc_evt,
+                                            &nh_evt,
+                                            &sftp_cache_evt,
+                                            &sftp_sort_evt,
+                                            &hidden_transfer_ids_evt,
+                                        );
+                                    }
+                                }));
                             if result.is_err() {
                                 tracing::error!("shell event UI update panicked; event skipped");
                             }
@@ -3140,22 +3154,23 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                         let sftp_sort_s = sftp_sort_sftp.clone();
                         let hidden_transfer_ids_s = hidden_transfer_ids_sftp.clone();
                         let _ = slint::invoke_from_event_loop(move || {
-                            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                if let Some(win) = weak_s.upgrade() {
-                                    apply_session_event_to_window(
-                                        &win,
-                                        &tid,
-                                        sftp_evt,
-                                        &bufs_s,
-                                        &st_s,
-                                        &lc_s,
-                                        &nh_s,
-                                        &sftp_cache_s,
-                                        &sftp_sort_s,
-                                        &hidden_transfer_ids_s,
-                                    );
-                                }
-                            }));
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    if let Some(win) = weak_s.upgrade() {
+                                        apply_session_event_to_window(
+                                            &win,
+                                            &tid,
+                                            sftp_evt,
+                                            &bufs_s,
+                                            &st_s,
+                                            &lc_s,
+                                            &nh_s,
+                                            &sftp_cache_s,
+                                            &sftp_sort_s,
+                                            &hidden_transfer_ids_s,
+                                        );
+                                    }
+                                }));
                             if result.is_err() {
                                 tracing::error!("sftp event UI update panicked; event skipped");
                             }
@@ -3556,7 +3571,10 @@ fn apply_session_event_to_window(
         tracing::warn!("tabs model was not a VecModel; dropping session event");
         return;
     };
-    let Some(terminals) = terminals_rc.as_any().downcast_ref::<VecModel<TerminalState>>() else {
+    let Some(terminals) = terminals_rc
+        .as_any()
+        .downcast_ref::<VecModel<TerminalState>>()
+    else {
         tracing::warn!("terminals model was not a VecModel; dropping session event");
         return;
     };
@@ -5227,6 +5245,9 @@ fn wire_key_input(
                             b.local_prompt_ready = false;
                             b.local_passthrough_until_prompt = false;
                             b.suppress_echo.clear();
+                            b.mouse_tracking = false;
+                            b.mouse_sgr = false;
+                            b.mouse_csi.clear();
                             b.view_offset = 0;
                             b.sel_anchor = None;
                             b.sel_focus = None;
@@ -5514,7 +5535,7 @@ fn wire_key_input(
                 return;
             }
 
-            let bytes = key_to_pty_bytes(key.as_str(), ctrl, alt, app_cursor);
+            let bytes = key_to_pty_bytes(key.as_str(), ctrl, alt, shift, app_cursor);
             // Log only the length — never the keystroke bytes, which can be
             // password characters (#15).
             tracing::debug!(
@@ -5571,10 +5592,10 @@ fn wire_key_input(
         let handles = handles.clone();
         let bufs_resize = bufs.clone(); // keep bufs alive for the copy handler below
         let pending_ui_refresh = pending_ui_refresh.clone();
-                                        // The Slint side now measures the real Consolas cell size (via a hidden
-                                        // probe Text) and passes whole column/row counts directly, so there is
-                                        // no pixel→cell guesswork here.  This keeps full-screen programs like
-                                        // nano from over-counting rows and clipping their bottom shortcut bar.
+        // The Slint side now measures the real Consolas cell size (via a hidden
+        // probe Text) and passes whole column/row counts directly, so there is
+        // no pixel→cell guesswork here.  This keeps full-screen programs like
+        // nano from over-counting rows and clipping their bottom shortcut bar.
         window.on_terminal_resize(move |tab_id: SharedString, cols_f: f32, rows_f: f32| {
             let cols = (cols_f as u32).max(10);
             let rows = (rows_f as u32).max(5);
@@ -5633,10 +5654,7 @@ fn wire_key_input(
                 // a scroll (which would double-capture lines).
                 buf.prev.clear();
             }
-            pending_ui_refresh
-                .lock()
-                .unwrap()
-                .push(tab_id.to_string());
+            pending_ui_refresh.lock().unwrap().push(tab_id.to_string());
         });
     }
 
@@ -5816,6 +5834,9 @@ fn wire_key_input(
                 buf.local_prompt_ready = false;
                 buf.local_passthrough_until_prompt = false;
                 buf.suppress_echo.clear();
+                buf.mouse_tracking = false;
+                buf.mouse_sgr = false;
+                buf.mouse_csi.clear();
                 buf.sel_anchor = None;
                 buf.sel_focus = None;
                 buf.displayed_text = Vec::new();
@@ -5859,6 +5880,54 @@ fn wire_key_input(
                 });
             }
         });
+    }
+
+    // Mouse-wheel → scroll local history, or pass through to alt-screen apps
+    // that enabled xterm mouse reporting (tmux `mouse on`, vim `set mouse=a`).
+    {
+        let bufs_scroll = bufs.clone();
+        let handles_scroll = handles.clone();
+        let weak = window.as_weak();
+        window.on_terminal_wheel(
+            move |tab_id: SharedString, delta: i32, row: i32, col: i32| {
+                let tid = tab_id.to_string();
+                let mut passthrough = None;
+                let mut redraw = false;
+                {
+                    let mut map = bufs_scroll.lock().unwrap();
+                    let Some(buf) = map.get_mut(&tid) else { return };
+                    if buf.parser.screen().alternate_screen() {
+                        buf.view_offset = 0;
+                        if buf.mouse_tracking {
+                            let (rows, cols) = buf.parser.screen().size();
+                            let r = row.clamp(0, rows.saturating_sub(1) as i32) as u16;
+                            let c = col.clamp(0, cols.saturating_sub(1) as i32) as u16;
+                            passthrough =
+                                Some(terminal_mouse_wheel_bytes(delta, r, c, buf.mouse_sgr));
+                        }
+                    } else {
+                        let max_off = buf.history.len() as i64;
+                        let cur = buf.view_offset as i64;
+                        let next =
+                            (cur + if delta > 0 { 3 } else { -3 }).clamp(0, max_off) as usize;
+                        if next != buf.view_offset {
+                            buf.view_offset = next;
+                            redraw = true;
+                        }
+                    }
+                }
+                if let Some(bytes) = passthrough {
+                    if let Some(handle) = handles_scroll.borrow().get(tab_id.as_str()) {
+                        handle.send_raw(bytes);
+                    }
+                }
+                if redraw {
+                    if let Some(win) = weak.upgrade() {
+                        rebuild_tab_display(&win, &bufs_scroll, &tid);
+                    }
+                }
+            },
+        );
     }
 
     // Mouse-wheel → scroll the scrollback history.
@@ -6223,35 +6292,149 @@ fn locally_bufferable_paste(text: &str) -> Option<&str> {
     Some(text)
 }
 
-fn key_to_pty_bytes(key: &str, ctrl: bool, alt: bool, app_cursor: bool) -> Vec<u8> {
+fn terminal_mouse_wheel_bytes(delta: i32, row: u16, col: u16, sgr: bool) -> Vec<u8> {
+    let button = if delta > 0 { 64 } else { 65 };
+    let x = (col as u32 + 1).clamp(1, 223);
+    let y = (row as u32 + 1).clamp(1, 223);
+    if sgr {
+        format!("\x1b[<{button};{x};{y}M").into_bytes()
+    } else {
+        vec![
+            0x1b,
+            b'[',
+            b'M',
+            (32 + button) as u8,
+            (32 + x) as u8,
+            (32 + y) as u8,
+        ]
+    }
+}
+
+fn apply_mouse_mode_csi(seq: &[u8], mouse_tracking: &mut bool, mouse_sgr: &mut bool) {
+    if seq.len() < 5 || seq[0] != 0x1b || seq[1] != b'[' || seq[2] != b'?' {
+        return;
+    }
+    let Some(&final_byte) = seq.last() else {
+        return;
+    };
+    let set = match final_byte {
+        b'h' => true,
+        b'l' => false,
+        _ => return,
+    };
+    for part in seq[3..seq.len() - 1].split(|b| *b == b';') {
+        let code = part
+            .split(|b| *b == b':')
+            .next()
+            .and_then(|p| std::str::from_utf8(p).ok())
+            .and_then(|p| p.parse::<u16>().ok());
+        match code {
+            Some(1000 | 1002 | 1003) => *mouse_tracking = set,
+            Some(1006) => *mouse_sgr = set,
+            _ => {}
+        }
+    }
+}
+
+fn modifier_param(ctrl: bool, alt: bool, shift: bool) -> Option<u8> {
+    let value = 1 + u8::from(shift) + (u8::from(alt) * 2) + (u8::from(ctrl) * 4);
+    (value > 1).then_some(value)
+}
+
+fn csi_key(final_byte: char, ctrl: bool, alt: bool, shift: bool) -> Vec<u8> {
+    match modifier_param(ctrl, alt, shift) {
+        Some(param) => format!("\x1b[1;{param}{final_byte}").into_bytes(),
+        None => format!("\x1b[{final_byte}").into_bytes(),
+    }
+}
+
+fn tilde_key(code: u8, ctrl: bool, alt: bool, shift: bool) -> Vec<u8> {
+    match modifier_param(ctrl, alt, shift) {
+        Some(param) => format!("\x1b[{code};{param}~").into_bytes(),
+        None => format!("\x1b[{code}~").into_bytes(),
+    }
+}
+
+fn function_key(code: Option<u8>, final_byte: char, ctrl: bool, alt: bool, shift: bool) -> Vec<u8> {
+    match (code, modifier_param(ctrl, alt, shift)) {
+        (None, None) => format!("\x1bO{final_byte}").into_bytes(),
+        (None, Some(param)) => format!("\x1b[1;{param}{final_byte}").into_bytes(),
+        (Some(code), None) => format!("\x1b[{code}~").into_bytes(),
+        (Some(code), Some(param)) => format!("\x1b[{code};{param}~").into_bytes(),
+    }
+}
+
+fn key_to_pty_bytes(key: &str, ctrl: bool, alt: bool, shift: bool, app_cursor: bool) -> Vec<u8> {
     // --- Special keys (Slint PUA code points, plus Windows Delete) ---------
-    // Arrow keys: respect DECCKM application-cursor mode.
-    let special: Option<&[u8]> = match key {
-        "\u{F700}" => Some(if app_cursor { b"\x1bOA" } else { b"\x1b[A" }), // Up
-        "\u{F701}" => Some(if app_cursor { b"\x1bOB" } else { b"\x1b[B" }), // Down
-        "\u{F702}" => Some(if app_cursor { b"\x1bOD" } else { b"\x1b[D" }), // Left
-        "\u{F703}" => Some(if app_cursor { b"\x1bOC" } else { b"\x1b[C" }), // Right
-        "\u{F729}" => Some(b"\x1b[H"),                                      // Home
-        "\u{F72B}" => Some(b"\x1b[F"),                                      // End
-        "\u{F72C}" => Some(b"\x1b[5~"),                                     // PageUp
-        "\u{F72D}" => Some(b"\x1b[6~"),                                     // PageDown
-        "\u{F728}" | "\u{007f}" => Some(b"\x1b[3~"),                        // Delete (forward)
-        "\u{F704}" => Some(b"\x1bOP"),                                      // F1
-        "\u{F705}" => Some(b"\x1bOQ"),                                      // F2
-        "\u{F706}" => Some(b"\x1bOR"),                                      // F3
-        "\u{F707}" => Some(b"\x1bOS"),                                      // F4
-        "\u{F708}" => Some(b"\x1b[15~"),                                    // F5
-        "\u{F709}" => Some(b"\x1b[17~"),                                    // F6
-        "\u{F70A}" => Some(b"\x1b[18~"),                                    // F7
-        "\u{F70B}" => Some(b"\x1b[19~"),                                    // F8
-        "\u{F70C}" => Some(b"\x1b[20~"),                                    // F9
-        "\u{F70D}" => Some(b"\x1b[21~"),                                    // F10
-        "\u{F70E}" => Some(b"\x1b[23~"),                                    // F11
-        "\u{F70F}" => Some(b"\x1b[24~"),                                    // F12
+    // Arrow keys respect DECCKM application-cursor mode when unmodified.  Other
+    // special keys use xterm-style modifier parameters, which vim/readline know.
+    let special: Option<Vec<u8>> = match key {
+        "\u{F700}" => Some(if modifier_param(ctrl, alt, shift).is_some() {
+            csi_key('A', ctrl, alt, shift)
+        } else if app_cursor {
+            b"\x1bOA".to_vec()
+        } else {
+            b"\x1b[A".to_vec()
+        }), // Up
+        "\u{F701}" => Some(if modifier_param(ctrl, alt, shift).is_some() {
+            csi_key('B', ctrl, alt, shift)
+        } else if app_cursor {
+            b"\x1bOB".to_vec()
+        } else {
+            b"\x1b[B".to_vec()
+        }), // Down
+        "\u{F702}" => Some(if modifier_param(ctrl, alt, shift).is_some() {
+            csi_key('D', ctrl, alt, shift)
+        } else if app_cursor {
+            b"\x1bOD".to_vec()
+        } else {
+            b"\x1b[D".to_vec()
+        }), // Left
+        "\u{F703}" => Some(if modifier_param(ctrl, alt, shift).is_some() {
+            csi_key('C', ctrl, alt, shift)
+        } else if app_cursor {
+            b"\x1bOC".to_vec()
+        } else {
+            b"\x1b[C".to_vec()
+        }), // Right
+        "\u{F727}" => Some(tilde_key(2, ctrl, alt, shift)), // Insert
+        "\u{F728}" | "\u{007f}" => Some(tilde_key(3, ctrl, alt, shift)), // Delete
+        "\u{F729}" => Some(if modifier_param(ctrl, alt, shift).is_some() {
+            csi_key('H', ctrl, alt, shift)
+        } else if app_cursor {
+            b"\x1bOH".to_vec()
+        } else {
+            b"\x1b[H".to_vec()
+        }), // Home
+        "\u{F72B}" => Some(if modifier_param(ctrl, alt, shift).is_some() {
+            csi_key('F', ctrl, alt, shift)
+        } else if app_cursor {
+            b"\x1bOF".to_vec()
+        } else {
+            b"\x1b[F".to_vec()
+        }), // End
+        "\u{F72C}" => Some(tilde_key(5, ctrl, alt, shift)), // PageUp
+        "\u{F72D}" => Some(tilde_key(6, ctrl, alt, shift)), // PageDown
+        "\u{F704}" => Some(function_key(None, 'P', ctrl, alt, shift)), // F1
+        "\u{F705}" => Some(function_key(None, 'Q', ctrl, alt, shift)), // F2
+        "\u{F706}" => Some(function_key(None, 'R', ctrl, alt, shift)), // F3
+        "\u{F707}" => Some(function_key(None, 'S', ctrl, alt, shift)), // F4
+        "\u{F708}" => Some(function_key(Some(15), '\0', ctrl, alt, shift)), // F5
+        "\u{F709}" => Some(function_key(Some(17), '\0', ctrl, alt, shift)), // F6
+        "\u{F70A}" => Some(function_key(Some(18), '\0', ctrl, alt, shift)), // F7
+        "\u{F70B}" => Some(function_key(Some(19), '\0', ctrl, alt, shift)), // F8
+        "\u{F70C}" => Some(function_key(Some(20), '\0', ctrl, alt, shift)), // F9
+        "\u{F70D}" => Some(function_key(Some(21), '\0', ctrl, alt, shift)), // F10
+        "\u{F70E}" => Some(function_key(Some(23), '\0', ctrl, alt, shift)), // F11
+        "\u{F70F}" => Some(function_key(Some(24), '\0', ctrl, alt, shift)), // F12
         _ => None,
     };
     if let Some(seq) = special {
-        return seq.to_vec();
+        return seq;
+    }
+
+    if key == "\t" && shift && !ctrl && !alt {
+        return b"\x1b[Z".to_vec();
     }
 
     // Slint sometimes sends `\u{0008}` for Backspace; terminals expect DEL.
@@ -6552,8 +6735,7 @@ fn detect_scroll(prev: &[Line], curr: &[Line]) -> usize {
 fn terminal_token_class(ch: char) -> u8 {
     if ch == WIDE_CONT_PLACEHOLDER {
         3
-    } else
-    if ch.is_whitespace() {
+    } else if ch.is_whitespace() {
         0
     } else if matches!(
         ch,
@@ -6573,9 +6755,7 @@ fn normalize_terminal_token_index(chars: &[char], idx: usize) -> Option<usize> {
     if chars[idx] != WIDE_CONT_PLACEHOLDER {
         return Some(idx);
     }
-    (0..idx)
-        .rev()
-        .find(|&i| chars[i] != WIDE_CONT_PLACEHOLDER)
+    (0..idx).rev().find(|&i| chars[i] != WIDE_CONT_PLACEHOLDER)
 }
 
 fn should_force_passthrough_for_command(cmd: &str) -> bool {
@@ -7074,6 +7254,7 @@ impl TermBuffer {
     /// and nothing is lost.  (Splitting only on `\n` is safe: VT escape
     /// sequences never contain a newline.)
     fn ingest(&mut self, raw: &[u8]) {
+        self.update_mouse_modes(raw);
         // Rewrite HVP (`ESC [ … f`) → CUP (`ESC [ … H`) so vt100 (which only
         // implements `H`) honours btop/htop's absolute cursor positioning.
         let bytes = self.rewrite_hvp(raw);
@@ -7094,6 +7275,47 @@ impl TermBuffer {
         }
         if start < bytes.len() {
             self.ingest_chunk(&bytes[start..]);
+        }
+    }
+
+    fn update_mouse_modes(&mut self, input: &[u8]) {
+        for &b in input {
+            match self.mouse_csi.len() {
+                0 => {
+                    if b == 0x1b {
+                        self.mouse_csi.push(b);
+                    }
+                }
+                1 => {
+                    if b == b'[' {
+                        self.mouse_csi.push(b);
+                    } else if b == 0x1b {
+                        self.mouse_csi.clear();
+                        self.mouse_csi.push(b);
+                    } else {
+                        self.mouse_csi.clear();
+                    }
+                }
+                2 => {
+                    if b == b'?' {
+                        self.mouse_csi.push(b);
+                    } else if b == 0x1b {
+                        self.mouse_csi.clear();
+                        self.mouse_csi.push(b);
+                    } else {
+                        self.mouse_csi.clear();
+                    }
+                }
+                _ => {
+                    self.mouse_csi.push(b);
+                    if (0x40..=0x7e).contains(&b) {
+                        let seq = std::mem::take(&mut self.mouse_csi);
+                        apply_mouse_mode_csi(&seq, &mut self.mouse_tracking, &mut self.mouse_sgr);
+                    } else if self.mouse_csi.len() > 64 {
+                        self.mouse_csi.clear();
+                    }
+                }
+            }
         }
     }
 
@@ -7629,7 +7851,7 @@ mod key_tests {
         // Slint sends Alt-alone as key=0x12 with alt=true. It must produce no
         // bytes — otherwise it becomes ESC+0x12 and clears the input (issue #43).
         assert_eq!(
-            key_to_pty_bytes("\u{0012}", false, true, false),
+            key_to_pty_bytes("\u{0012}", false, true, false, false),
             Vec::<u8>::new()
         );
     }
@@ -7640,7 +7862,7 @@ mod key_tests {
         for cp in 0x10u32..=0x18 {
             let s = char::from_u32(cp).unwrap().to_string();
             assert_eq!(
-                key_to_pty_bytes(&s, false, false, false),
+                key_to_pty_bytes(&s, false, false, false, false),
                 Vec::<u8>::new(),
                 "code point {:#04x} should be dropped",
                 cp
@@ -7652,15 +7874,24 @@ mod key_tests {
     fn ctrl_letter_c0_still_passes() {
         // A real Ctrl+R encoded as the C0 byte 0x12 with ctrl=true must still be
         // forwarded — the !ctrl guard keeps the #43 fix from breaking it.
-        assert_eq!(key_to_pty_bytes("\u{0012}", true, false, false), vec![0x12]);
+        assert_eq!(
+            key_to_pty_bytes("\u{0012}", true, false, false, false),
+            vec![0x12]
+        );
         // Ctrl+X as C0 0x18.
-        assert_eq!(key_to_pty_bytes("\u{0018}", true, false, false), vec![0x18]);
+        assert_eq!(
+            key_to_pty_bytes("\u{0018}", true, false, false, false),
+            vec![0x18]
+        );
     }
 
     #[test]
     fn alt_letter_still_sends_esc_prefix() {
         // Alt+a (a real Meta combo) must still send ESC + 'a'.
-        assert_eq!(key_to_pty_bytes("a", false, true, false), vec![0x1b, b'a']);
+        assert_eq!(
+            key_to_pty_bytes("a", false, true, false, false),
+            vec![0x1b, b'a']
+        );
     }
 
     #[test]
@@ -7674,9 +7905,75 @@ mod key_tests {
     #[test]
     fn delete_ascii_del_still_sends_forward_delete_sequence() {
         assert_eq!(
-            key_to_pty_bytes("\u{007f}", false, false, false),
+            key_to_pty_bytes("\u{007f}", false, false, false, false),
             b"\x1b[3~".to_vec()
         );
+    }
+
+    #[test]
+    fn home_end_respect_application_cursor_mode() {
+        assert_eq!(
+            key_to_pty_bytes("\u{F729}", false, false, false, false),
+            b"\x1b[H".to_vec()
+        );
+        assert_eq!(
+            key_to_pty_bytes("\u{F72B}", false, false, false, false),
+            b"\x1b[F".to_vec()
+        );
+        assert_eq!(
+            key_to_pty_bytes("\u{F729}", false, false, false, true),
+            b"\x1bOH".to_vec()
+        );
+        assert_eq!(
+            key_to_pty_bytes("\u{F72B}", false, false, false, true),
+            b"\x1bOF".to_vec()
+        );
+    }
+
+    #[test]
+    fn special_keys_include_xterm_modifier_parameters() {
+        assert_eq!(
+            key_to_pty_bytes("\u{F702}", true, false, false, true),
+            b"\x1b[1;5D".to_vec()
+        );
+        assert_eq!(
+            key_to_pty_bytes("\u{F729}", false, false, true, true),
+            b"\x1b[1;2H".to_vec()
+        );
+        assert_eq!(
+            key_to_pty_bytes("\u{F728}", true, false, true, false),
+            b"\x1b[3;6~".to_vec()
+        );
+        assert_eq!(
+            key_to_pty_bytes("\t", false, false, true, false),
+            b"\x1b[Z".to_vec()
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_bytes_match_xterm_protocols() {
+        assert_eq!(
+            terminal_mouse_wheel_bytes(1, 2, 4, true),
+            b"\x1b[<64;5;3M".to_vec()
+        );
+        assert_eq!(
+            terminal_mouse_wheel_bytes(-1, 0, 0, false),
+            vec![0x1b, b'[', b'M', b'a', b'!', b'!']
+        );
+    }
+
+    #[test]
+    fn mouse_mode_csi_sets_tracking_and_sgr() {
+        let mut tracking = false;
+        let mut sgr = false;
+        apply_mouse_mode_csi(b"\x1b[?1000;1006h", &mut tracking, &mut sgr);
+        assert!(tracking);
+        assert!(sgr);
+        apply_mouse_mode_csi(b"\x1b[?1000l", &mut tracking, &mut sgr);
+        assert!(!tracking);
+        assert!(sgr);
+        apply_mouse_mode_csi(b"\x1b[?1006l", &mut tracking, &mut sgr);
+        assert!(!sgr);
     }
 
     #[test]
@@ -7768,8 +8065,21 @@ mod selection_tests {
             local_prompt_ready: false,
             local_passthrough_until_prompt: false,
             suppress_echo: String::new(),
+            mouse_tracking: false,
+            mouse_sgr: false,
+            mouse_csi: Vec::new(),
             csi_state: CsiState::Normal,
         }
+    }
+
+    #[test]
+    fn mouse_mode_tracking_handles_split_csi() {
+        let mut buf = make_buf(5, 20, &[], &[""], 0);
+        buf.update_mouse_modes(b"\x1b[?1000;");
+        assert!(!buf.mouse_tracking);
+        buf.update_mouse_modes(b"1006h");
+        assert!(buf.mouse_tracking);
+        assert!(buf.mouse_sgr);
     }
 
     #[test]
@@ -7845,6 +8155,9 @@ mod selection_tests {
             local_prompt_ready: false,
             local_passthrough_until_prompt: false,
             suppress_echo: String::new(),
+            mouse_tracking: false,
+            mouse_sgr: false,
+            mouse_csi: Vec::new(),
             csi_state: CsiState::Normal,
         };
         assert_eq!(buf.extract_selection_text(), "你好哈");

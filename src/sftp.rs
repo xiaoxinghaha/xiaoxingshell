@@ -1305,6 +1305,20 @@ fn sanitize_filename(name: &str) -> String {
 /// changes on disk (the "edit" flow).  Re-upload is routed back through the
 /// worker's own command channel.  Stops when the channel closes or after a
 /// generous idle window.
+async fn local_mtime(path: String) -> Option<std::time::SystemTime> {
+    tokio::task::spawn_blocking(move || std::fs::metadata(path).ok()?.modified().ok())
+        .await
+        .ok()
+        .flatten()
+}
+
+async fn local_bytes(path: String) -> Option<Vec<u8>> {
+    tokio::task::spawn_blocking(move || std::fs::read(path).ok())
+        .await
+        .ok()
+        .flatten()
+}
+
 fn spawn_edit_watcher(
     self_tx: UnboundedSender<SftpCommand>,
     local: String,
@@ -1316,10 +1330,8 @@ fn spawn_edit_watcher(
     tokio::spawn(async move {
         use std::time::{Duration, Instant};
 
-        let mtime = |p: &str| std::fs::metadata(p).ok().and_then(|m| m.modified().ok());
-        let bytes = |p: &str| std::fs::read(p).ok();
-        let mut last = mtime(&local);
-        let mut last_content = bytes(&local);
+        let mut last = local_mtime(local.clone()).await;
+        let mut last_content = local_bytes(local.clone()).await;
         let mut child = child;
         let started = Instant::now();
         // VS Code and similar launchers often exit immediately after handing
@@ -1333,9 +1345,9 @@ fn spawn_edit_watcher(
             if self_tx.is_closed() {
                 break;
             }
-            let cur = mtime(&local);
+            let cur = local_mtime(local.clone()).await;
             if cur.is_some() && cur != last {
-                let cur_content = bytes(&local);
+                let cur_content = local_bytes(local.clone()).await;
                 // Atomic-save editors can briefly replace the file between the
                 // mtime change and our read. If the read fails, keep `last`
                 // unchanged so the next poll retries instead of dropping the
@@ -1371,7 +1383,7 @@ fn spawn_edit_watcher(
                     child = None;
                     continue;
                 }
-                let final_content = bytes(&local);
+                let final_content = local_bytes(local.clone()).await;
                 if final_content.is_some() && final_content != last_content {
                     let _ = self_tx.send(SftpCommand::UploadTo {
                         local: local.clone(),

@@ -160,6 +160,7 @@ export component TerminalView inherits Rectangle {
     callback clear-terminal();              // wipe this session's screen buffer
     callback find-query-changed(string);    // recompute search highlights
     callback terminal-scroll(int);          // scroll history by N lines (+ = up)
+    callback terminal-wheel(int, int, int); // wheel delta (+ = up), row, col
     callback select-start(int, int);        // begin drag-selection at (row, col)
     callback select-update(int, int);       // extend drag-selection to (row, col)
     callback select-end();                  // finish selection → copy to clipboard
@@ -478,12 +479,13 @@ export component TerminalView inherits Rectangle {
                             scroll-event(ev) => {
                                 // Wheel scrolls the scrollback history (~3 lines
                                 // per notch).  Positive delta-y = scroll up = older.
-                                // In alt-screen mode (vim/nano/btop) the program
-                                // handles scroll itself — suppress our history scroll
-                                // so the full-screen UI isn't pushed out of view.
-                                if (!root.is-alt-screen) {
-                                    root.terminal-scroll(ev.delta-y > 0 ? 3 : -3);
-                                }
+                                // Rust decides whether this is local scrollback
+                                // or an xterm mouse-wheel event for alt-screen
+                                // programs such as tmux with `mouse on`.
+                                root.terminal-wheel(
+                                    ev.delta-y > 0 ? 1 : -1,
+                                    floor(self.mouse-y / root.cell-h),
+                                    floor(self.mouse-x / root.cell-w));
                                 accept
                             }
                         }

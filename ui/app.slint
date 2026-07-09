@@ -587,6 +587,8 @@ export component AppWindow inherits Window {
     callback find-query-changed(string /* tab-id */, string /* query */);
     // Scroll a session's scrollback history by N lines (+ = up/older).
     callback terminal-scroll(string /* tab-id */, int /* delta-lines */);
+    // Mouse wheel with grid coordinates; Rust decides local scroll vs PTY mouse event.
+    callback terminal-wheel(string /* tab-id */, int /* delta */, int /* row */, int /* col */);
     // Drag-selection lifecycle (grid row/col coordinates).
     callback term-select-start(string /* tab-id */, int /* row */, int /* col */);
     callback term-select-update(string /* tab-id */, int /* row */, int /* col */);
@@ -978,6 +980,7 @@ export component AppWindow inherits Window {
                             clear-terminal() => { root.clear-terminal(term.id); }
                             find-query-changed(q) => { root.find-query-changed(term.id, q); }
                             terminal-scroll(d) => { root.terminal-scroll(term.id, d); }
+                            terminal-wheel(d, r, c) => { root.terminal-wheel(term.id, d, r, c); }
                             select-start(r, c) => { root.term-select-start(term.id, r, c); }
                             select-update(r, c) => { root.term-select-update(term.id, r, c); }
                             select-end() => { root.term-select-end(term.id); }
