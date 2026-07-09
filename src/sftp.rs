@@ -981,7 +981,7 @@ async fn run_sftp(
             } => {
                 // Sanitize the remote-controlled name before it becomes a local
                 // file path that we later hand to the OS "open" call.
-                let filename = sanitize_filename(&base_name(&remote));
+                let filename = temp_edit_filename(&session, &remote, edit);
                 let tmp_dir = std::env::temp_dir().join("xiaoxingshell");
                 let _ = tokio::fs::create_dir_all(&tmp_dir).await;
                 let local = tmp_dir.join(&filename);
@@ -1299,6 +1299,19 @@ fn sanitize_filename(name: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+fn temp_edit_filename(session: &Session, remote: &str, edit: bool) -> String {
+    let filename = sanitize_filename(&base_name(remote));
+    if !edit {
+        return filename;
+    }
+    let prefix = if session.name.trim().is_empty() {
+        format!("{}_{}", session.host.trim(), session.port)
+    } else {
+        session.name.trim().to_string()
+    };
+    format!("{}_{}", sanitize_filename(&prefix), filename)
 }
 
 /// Watch a downloaded temp file and re-upload it to the remote whenever it
@@ -2189,7 +2202,8 @@ const _: fn() = || {
 
 #[cfg(test)]
 mod sanitize_tests {
-    use super::{remote_zip_error_message, sanitize_filename, shell_quote};
+    use super::{remote_zip_error_message, sanitize_filename, shell_quote, temp_edit_filename};
+    use crate::config::Session;
 
     #[test]
     fn plain_names_pass_through() {
@@ -2244,6 +2258,32 @@ mod sanitize_tests {
         assert_eq!(sanitize_filename(""), "file");
         assert_eq!(sanitize_filename("   "), "file");
         assert_eq!(sanitize_filename("..."), "file");
+    }
+
+    #[test]
+    fn edit_temp_filename_is_prefixed_by_session_label() {
+        let mut session = Session::new_empty();
+        session.name = "ss1".into();
+        session.host = "10.0.0.1".into();
+        assert_eq!(
+            temp_edit_filename(&session, "/root/aaa.py", true),
+            "ss1_aaa.py"
+        );
+        assert_eq!(
+            temp_edit_filename(&session, "/root/aaa.py", false),
+            "aaa.py"
+        );
+    }
+
+    #[test]
+    fn edit_temp_filename_falls_back_to_host_port() {
+        let mut session = Session::new_empty();
+        session.host = "10.0.0.8".into();
+        session.port = 2222;
+        assert_eq!(
+            temp_edit_filename(&session, "/tmp/aaa.py", true),
+            "10.0.0.8_2222_aaa.py"
+        );
     }
 
     #[test]
