@@ -10,7 +10,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Per-terminal state: vt100 parser drives all rendering for both normal
 /// (bash) and alt-screen (vim/nano/htop) modes.
@@ -482,6 +482,7 @@ pub fn run() -> Result<()> {
     // size to spawn_session before the first resize callback fires.
     // Default: 80 cols × 24 rows (SSH spec minimum).
     let last_term_size: Arc<Mutex<(u32, u32)>> = Arc::new(Mutex::new((80, 24)));
+    let minimize_resize_guard: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
 
     // --- Build window + models ------------------------------------------
     // Set the Wayland app_id / X11 WM_CLASS *before* the window is created so
@@ -1589,6 +1590,7 @@ pub fn run() -> Result<()> {
         bufs.clone(),
         pending_ui_refresh.clone(),
         last_term_size.clone(),
+        minimize_resize_guard.clone(),
         store.clone(),
         ConnectCtx {
             weak: window.as_weak(),
@@ -1716,6 +1718,7 @@ pub fn run() -> Result<()> {
         let close_handles = handles.clone();
         let schedule_save = schedule_window_geometry_save.clone();
         let save_window_geometry = save_window_geometry.clone();
+        let minimize_resize_guard = minimize_resize_guard.clone();
         window.window().on_winit_window_event(move |_w, event| {
             match event {
                 WEvent::DroppedFile(path) => {
@@ -1731,6 +1734,15 @@ pub fn run() -> Result<()> {
                             .window()
                             .with_winit_window(|ww| ww.is_maximized())
                             .unwrap_or(false);
+                        if win
+                            .window()
+                            .with_winit_window(|ww| ww.is_minimized())
+                            .flatten()
+                            .unwrap_or(false)
+                        {
+                            *minimize_resize_guard.lock().unwrap() =
+                                Some(Instant::now() + Duration::from_secs(2));
+                        }
                         win.set_window_maximized(maxed);
                     }
                     schedule_save();
@@ -1766,7 +1778,9 @@ pub fn run() -> Result<()> {
     // --- Custom title-bar window controls (#119) --------------------------
     {
         let weak = window.as_weak();
+        let minimize_resize_guard = minimize_resize_guard.clone();
         window.on_win_minimize(move || {
+            *minimize_resize_guard.lock().unwrap() = Some(Instant::now() + Duration::from_secs(2));
             if let Some(w) = weak.upgrade() {
                 w.window().with_winit_window(|ww| ww.set_minimized(true));
             }
@@ -5070,6 +5084,7 @@ fn wire_key_input(
     bufs: TermBuffers,
     pending_ui_refresh: PendingUiRefresh,
     last_term_size: Arc<Mutex<(u32, u32)>>,
+    minimize_resize_guard: Arc<Mutex<Option<Instant>>>,
     store: Rc<RefCell<ConfigStore>>,
     ctx: ConnectCtx,
 ) {
@@ -5606,6 +5621,7 @@ fn wire_key_input(
         let handles = handles.clone();
         let bufs_resize = bufs.clone(); // keep bufs alive for the copy handler below
         let pending_ui_refresh = pending_ui_refresh.clone();
+        let weak = window.as_weak();
         // The Slint side now measures the real Consolas cell size (via a hidden
         // probe Text) and passes whole column/row counts directly, so there is
         // no pixel→cell guesswork here.  This keeps full-screen programs like
@@ -5615,13 +5631,36 @@ fn wire_key_input(
             let rows = (rows_f as u32).max(5);
             tracing::debug!("terminal_resize tab={} cols={} rows={}", tab_id, cols, rows);
             let previous_size = *last_term_size.lock().unwrap();
-            if cols <= 10 && rows <= 5 && previous_size.1 > 5 {
+            let minimize_guard_active = {
+                let mut guard = minimize_resize_guard.lock().unwrap();
+                match *guard {
+                    Some(until) if Instant::now() <= until => true,
+                    Some(_) => {
+                        *guard = None;
+                        false
+                    }
+                    None => false,
+                }
+            };
+            let minimized_now = weak
+                .upgrade()
+                .and_then(|w| w.window().with_winit_window(|ww| ww.is_minimized()).flatten())
+                .unwrap_or(false);
+            if should_ignore_terminal_resize(
+                cols,
+                rows,
+                previous_size,
+                minimize_guard_active,
+                minimized_now,
+            ) {
                 tracing::debug!(
-                    "ignore transient terminal resize tab={} cols={} rows={} previous_rows={}",
+                    "ignore transient terminal resize tab={} cols={} rows={} previous={:?} guard={} minimized={}",
                     tab_id,
                     cols,
                     rows,
-                    previous_size.1
+                    previous_size,
+                    minimize_guard_active,
+                    minimized_now
                 );
                 return;
             }
@@ -6254,6 +6293,20 @@ fn locally_bufferable_paste(text: &str) -> Option<&str> {
         return None;
     }
     Some(text)
+}
+
+fn should_ignore_terminal_resize(
+    cols: u32,
+    rows: u32,
+    previous_size: (u32, u32),
+    minimize_guard_active: bool,
+    minimized_now: bool,
+) -> bool {
+    if cols <= 10 && rows <= 5 && previous_size.1 > 5 {
+        return true;
+    }
+    let shrinking = cols < previous_size.0 || rows < previous_size.1;
+    shrinking && (minimize_guard_active || minimized_now)
 }
 
 fn tmux_prefix_fullwidth_key(key: &str) -> Option<&'static str> {
@@ -7852,6 +7905,45 @@ mod key_tests {
         assert_eq!(tmux_prefix_fullwidth_key("】"), Some("]"));
         assert_eq!(tmux_prefix_fullwidth_key("："), Some(":"));
         assert_eq!(tmux_prefix_fullwidth_key("中"), None);
+    }
+
+    #[test]
+    fn resize_guard_ignores_minimize_shrinks_but_allows_restore() {
+        assert!(should_ignore_terminal_resize(
+            40,
+            10,
+            (100, 30),
+            true,
+            false
+        ));
+        assert!(should_ignore_terminal_resize(
+            40,
+            10,
+            (100, 30),
+            false,
+            true
+        ));
+        assert!(should_ignore_terminal_resize(
+            10,
+            5,
+            (100, 30),
+            false,
+            false
+        ));
+        assert!(!should_ignore_terminal_resize(
+            100,
+            30,
+            (40, 10),
+            true,
+            false
+        ));
+        assert!(!should_ignore_terminal_resize(
+            40,
+            10,
+            (100, 30),
+            false,
+            false
+        ));
     }
 
     #[test]
