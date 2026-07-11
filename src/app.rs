@@ -4389,6 +4389,12 @@ fn wire_tab_callbacks(
     }
 
     {
+        let tabs_model = tabs_model.clone();
+        window.on_tab_moved(move |id: SharedString, to_index: i32| {
+            move_tab_after_welcome(&tabs_model, id.as_str(), to_index);
+        });
+    }
+    {
         let weak = window.as_weak();
         let store = store.clone();
         let tab_statuses = tab_statuses.clone();
@@ -4493,6 +4499,35 @@ fn wire_tab_callbacks(
             }
         });
     }
+}
+
+fn move_tab_after_welcome(tabs: &VecModel<TabInfo>, id: &str, to_index: i32) {
+    if id == "welcome" || to_index < 1 {
+        return;
+    }
+    let count = tabs.row_count();
+    if count <= 2 {
+        return;
+    }
+    let Some(from) = (1..count).find(|&i| {
+        tabs.row_data(i)
+            .map(|row| row.id.as_str() == id)
+            .unwrap_or(false)
+    }) else {
+        return;
+    };
+    let Some(row) = tabs.row_data(from) else {
+        return;
+    };
+    let mut target = (to_index as usize).min(count - 1).max(1);
+    if target == from {
+        return;
+    }
+    tabs.remove(from);
+    if target > from {
+        target -= 1;
+    }
+    tabs.insert(target, row);
 }
 
 // ---------------------------------------------------------------------------
@@ -7788,6 +7823,45 @@ fn parent_path(path: &str) -> String {
         Some(0) => "/".to_string(),
         Some(i) => trimmed[..i].to_string(),
         None => "/".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tab_tests {
+    use super::*;
+
+    fn tab(id: &str, kind: &str) -> TabInfo {
+        TabInfo {
+            id: id.into(),
+            title: id.into(),
+            kind: kind.into(),
+            connected: false,
+        }
+    }
+
+    fn ids(model: &VecModel<TabInfo>) -> Vec<String> {
+        (0..model.row_count())
+            .filter_map(|i| model.row_data(i).map(|row| row.id.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn moves_terminal_tabs_but_keeps_welcome_first() {
+        let model = VecModel::from(vec![
+            tab("welcome", "welcome"),
+            tab("a", "terminal"),
+            tab("b", "terminal"),
+            tab("c", "terminal"),
+        ]);
+
+        move_tab_after_welcome(&model, "c", 1);
+        assert_eq!(ids(&model), vec!["welcome", "c", "a", "b"]);
+
+        move_tab_after_welcome(&model, "welcome", 3);
+        assert_eq!(ids(&model), vec!["welcome", "c", "a", "b"]);
+
+        move_tab_after_welcome(&model, "c", 0);
+        assert_eq!(ids(&model), vec!["welcome", "c", "a", "b"]);
     }
 }
 

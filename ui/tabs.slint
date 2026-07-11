@@ -12,9 +12,14 @@ export struct TabInfo {
 component SingleTab inherits Rectangle {
     in property <TabInfo> info;
     in property <bool> active;
+    in property <bool> dragging: false;
+    in property <bool> draggable: true;
     in property <length> forced-width: 112px;
     callback selected();
     callback closed();
+    callback drag-started(length);
+    callback drag-moved(length);
+    callback drag-ended(length);
     property <length> content-y-offset: -2px;
 
     height: 30px;
@@ -22,17 +27,34 @@ component SingleTab inherits Rectangle {
     horizontal-stretch: 0;
     clip: true;
     border-radius: Theme.radius-sm;
+    opacity: dragging ? 0.72 : 1.0;
     background: active ? Theme.bg-active
         : (touch.has-hover ? Theme.bg-hover : transparent);
-    border-width: active ? 1px : 0px;
+    border-width: active || dragging ? 1px : 0px;
     border-color: active ? Theme.accent : transparent;
     animate background { duration: 120ms; }
+    animate opacity { duration: 90ms; }
 
     // Declared FIRST so the HorizontalLayout's children (close button) are at
     // a higher z-order and receive their own click events.
     touch := TouchArea {
-        mouse-cursor: default;
+        mouse-cursor: root.draggable ? pointer : default;
         clicked => { root.selected(); }
+        pointer-event(e) => {
+            if (!root.draggable) {
+                return;
+            }
+            if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                root.drag-started(self.absolute-position.x + self.mouse-x);
+            } else if (e.kind == PointerEventKind.up && e.button == PointerEventButton.left) {
+                root.drag-ended(self.absolute-position.x + self.mouse-x);
+            }
+        }
+        moved => {
+            if (root.draggable) {
+                root.drag-moved(self.absolute-position.x + self.mouse-x);
+            }
+        }
     }
 
     if active : Rectangle {
@@ -114,6 +136,7 @@ export component TabBar inherits Rectangle {
     in property <length> right-reserved-width: 0px;
     callback tab-selected(string);
     callback tab-closed(string);
+    callback tab-moved(string, int);
     callback new-tab();
 
     height: 36px;
@@ -144,6 +167,16 @@ export component TabBar inherits Rectangle {
         root.tabs-space-no-scroll - (root.show-scroll-buttons ? root.scroll-controls-width + root.control-gap : 0px)
     );
     property <length> max-scroll-x: max(0px, root.content-total-width - root.tabs-viewport-width);
+    property <string> drag-tab-id: "";
+    property <int> drag-tab-index: -1;
+    property <length> drag-start-x: 0px;
+    property <bool> drag-active: false;
+
+    function clamp-target-index(global-x: length) -> int {
+        let local-x = global-x - tabs-clip.absolute-position.x + root.scroll-x;
+        let raw = floor((local-x + root.tab-width / 2) / (root.tab-width + root.tab-spacing));
+        return clamp(raw, 1, root.tabs.length - 1);
+    }
 
     init => {
         root.previous-tab-count = root.tab-count;
@@ -180,7 +213,7 @@ export component TabBar inherits Rectangle {
         }
     }
 
-    Rectangle {
+    tabs-clip := Rectangle {
         x: root.edge-padding;
         y: root.edge-padding;
         width: root.tabs-viewport-width;
@@ -199,8 +232,32 @@ export component TabBar inherits Rectangle {
                 forced-width: root.tab-width;
                 info: tab;
                 active: tab.id == root.active-id;
+                dragging: tab.id == root.drag-tab-id && root.drag-active;
+                draggable: i > 0;
                 selected => { root.tab-selected(tab.id); }
                 closed => { root.tab-closed(tab.id); }
+                drag-started(global-x) => {
+                    root.drag-tab-id = tab.id;
+                    root.drag-tab-index = i;
+                    root.drag-start-x = global-x;
+                    root.drag-active = false;
+                }
+                drag-moved(global-x) => {
+                    if (root.drag-tab-id == tab.id && (global-x > root.drag-start-x + 8px || global-x < root.drag-start-x - 8px)) {
+                        root.drag-active = true;
+                    }
+                }
+                drag-ended(global-x) => {
+                    if (root.drag-tab-id == tab.id && root.drag-active) {
+                        let target = root.clamp-target-index(global-x);
+                        if (target != root.drag-tab-index) {
+                            root.tab-moved(tab.id, target);
+                        }
+                    }
+                    root.drag-tab-id = "";
+                    root.drag-tab-index = -1;
+                    root.drag-active = false;
+                }
             }
 
             IconButton {
