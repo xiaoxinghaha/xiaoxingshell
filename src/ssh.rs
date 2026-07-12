@@ -1058,35 +1058,58 @@ async fn run_session(
 }
 
 async fn collect_system_info(handle: &Handle<ClientHandler>, lang_en: bool) -> Result<String> {
-    let (basic, user, host, os, version, kernel, uptime, memory, disk, network, login) = if lang_en
-    {
-        (
-            "Basic",
-            "User",
-            "Host",
-            "Operating System",
-            "OS Version",
-            "Kernel",
-            "Uptime",
-            "Memory",
-            "Disk",
-            "Network",
-            "Login",
-        )
+    let (basic, user, host, os, version, kernel, uptime, cpu_section, memory, disk, network, login) =
+        if lang_en {
+            (
+                "Basic",
+                "User",
+                "Host",
+                "Operating System",
+                "OS Version",
+                "Kernel",
+                "Uptime",
+                "CPU",
+                "Memory",
+                "Disk",
+                "Network",
+                "Login",
+            )
+        } else {
+            (
+                "基础信息",
+                "用户名",
+                "主机",
+                "操作系统",
+                "系统版本",
+                "内核",
+                "运行时间",
+                "处理器",
+                "内存",
+                "磁盘",
+                "网络",
+                "登录记录",
+            )
+        };
+    let cpu_cmd = if lang_en {
+        "(lscpu 2>/dev/null | sed -n '1,12p') || (grep -m1 'model name' /proc/cpuinfo 2>/dev/null; grep -c '^processor' /proc/cpuinfo 2>/dev/null)"
+            .to_string()
     } else {
-        (
-            "基础信息",
-            "用户名",
-            "主机",
-            "操作系统",
-            "系统版本",
-            "内核",
-            "运行时间",
-            "内存",
-            "磁盘",
-            "网络",
-            "登录记录",
-        )
+        r#"LC_ALL=C lscpu 2>/dev/null | awk -F: '
+function trim(s){ sub(/^[ \t]+/,"",s); sub(/[ \t]+$/,"",s); return s }
+$1=="Architecture"{print "架构: " trim($2)}
+$1=="CPU op-mode(s)"{print "CPU 运行模式: " trim($2)}
+$1=="Address sizes"{print "地址位数: " trim($2)}
+$1=="Byte Order"{print "字节序: " trim($2)}
+$1=="CPU(s)"{print "CPU 数量: " trim($2)}
+$1=="On-line CPU(s) list"{print "在线 CPU 列表: " trim($2)}
+$1=="Vendor ID"{print "厂商 ID: " trim($2)}
+$1=="BIOS Vendor ID"{print "BIOS 厂商 ID: " trim($2)}
+$1=="Model name"{print "型号名称: " trim($2)}
+$1=="BIOS Model name"{print "BIOS 型号名称: " trim($2)}
+$1=="BIOS CPU family"{print "BIOS CPU 家族: " trim($2)}
+$1=="CPU family"{print "CPU 家族: " trim($2)}
+' || { grep -m1 'model name' /proc/cpuinfo 2>/dev/null | sed 's/^model name[ \t]*:[ \t]*/型号名称: /'; n=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null); [ -n "$n" ] && printf 'CPU 数量: %s\n' "$n"; }"#
+            .to_string()
     };
     let cmd = format!(
         r#"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH
@@ -1097,8 +1120,8 @@ printf '{os}: '; if [ -r /etc/os-release ]; then . /etc/os-release; printf '%s\n
 printf '{version}: '; if [ -r /etc/os-release ]; then . /etc/os-release; printf '%s\n' "${{VERSION_ID:-Unknown}}"; else uname -r 2>/dev/null || true; fi
 printf '{kernel}: '; uname -a 2>/dev/null || true
 printf '{uptime}: '; (uptime -p 2>/dev/null || uptime 2>/dev/null || true)
-printf '\n===== CPU =====\n'
-(lscpu 2>/dev/null | sed -n '1,12p') || (grep -m1 'model name' /proc/cpuinfo 2>/dev/null; grep -c '^processor' /proc/cpuinfo 2>/dev/null)
+printf '\n===== {cpu_section} =====\n'
+{cpu_cmd}
 printf '\n===== {memory} =====\n'
 free -h 2>/dev/null || sed -n '1,8p' /proc/meminfo 2>/dev/null
 printf '\n===== {disk} =====\n'
