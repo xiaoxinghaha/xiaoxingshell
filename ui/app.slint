@@ -75,11 +75,33 @@ export struct TerminalState {
     sftp-sudo-available: bool,
 }
 
+export struct InfoKvRow {
+    label1: string,
+    value1: string,
+    label2: string,
+    value2: string,
+    has-second: bool,
+}
+
+export struct InfoTableRow {
+    cells: [string],
+}
+
+export struct InfoSection {
+    title: string,
+    layout: int,
+    kv-rows: [InfoKvRow],
+    headers: [string],
+    rows: [InfoTableRow],
+    raw-text: string,
+}
+
 export struct InfoState {
     id: string,
     title: string,
     content: string,
     loading: bool,
+    sections: [InfoSection],
 }
 
 // A 26×26 top-bar icon button with a hover tooltip (right-aligned so it never
@@ -1055,25 +1077,185 @@ export component AppWindow inherits Window {
                                     border-width: 1px;
                                     border-color: Theme.border-subtle;
                                     clip: true;
-                                    Flickable {
+                                    ScrollView {
                                         x: 0; y: 0;
                                         width: parent.width;
                                         height: parent.height;
-                                        viewport-width: max(self.width, sysinfo-content.preferred-width + 32px);
-                                        viewport-height: max(self.height, sysinfo-content.preferred-height + 32px);
-                                        sysinfo-content := TextInput {
-                                            x: 16px; y: 16px;
-                                            width: max(parent.width - 32px, self.preferred-width);
-                                            height: self.preferred-height;
-                                            text: info.loading
-                                                ? (root.lang-en ? "Loading..." : "加载中...")
-                                                : info.content;
-                                            read-only: true;
-                                            single-line: false;
-                                            color: Theme.text-primary;
-                                            font-family: Theme.font-mono;
-                                            font-size: Theme.fs-sm;
-                                            wrap: word-wrap;
+                                        viewport-width: self.visible-width;
+                                        viewport-height: max(self.visible-height, info-sections.preferred-height + 24px);
+                                        info-sections := VerticalLayout {
+                                            x: 12px;
+                                            y: 12px;
+                                            width: parent.visible-width - 24px;
+                                            spacing: 14px;
+
+                                            if info.loading : Rectangle {
+                                                height: 52px;
+                                                border-radius: Theme.radius-sm;
+                                                background: Theme.bg-root;
+                                                Text {
+                                                    text: root.lang-en ? "Loading..." : "加载中...";
+                                                    color: Theme.text-muted;
+                                                    font-size: Theme.fs-sm;
+                                                    horizontal-alignment: center;
+                                                    vertical-alignment: center;
+                                                }
+                                            }
+
+                                            for section in info.sections : Rectangle {
+                                                border-radius: Theme.radius-md;
+                                                border-width: 1px;
+                                                border-color: Theme.border-subtle;
+                                                background: Theme.bg-root;
+                                                clip: true;
+                                                height: section-body.preferred-height + 44px;
+
+                                                VerticalLayout {
+                                                    spacing: 0;
+                                                    Rectangle {
+                                                        height: 34px;
+                                                        background: #ffffff06;
+                                                        Text {
+                                                            x: 14px;
+                                                            width: parent.width - 28px;
+                                                            text: section.title;
+                                                            color: Theme.text-primary;
+                                                            font-size: Theme.fs-sm;
+                                                            font-weight: 700;
+                                                            vertical-alignment: center;
+                                                        }
+                                                    }
+
+                                                    section-body := VerticalLayout {
+                                                        spacing: 0;
+
+                                                        if section.layout == 0 : VerticalLayout {
+                                                            spacing: 0;
+                                                            for row[i] in section.kv-rows : Rectangle {
+                                                                height: 36px;
+                                                                background: mod(i, 2) == 0 ? transparent : #ffffff05;
+                                                                HorizontalLayout {
+                                                                    spacing: 0;
+                                                                    Rectangle {
+                                                                        width: 112px;
+                                                                        Text {
+                                                                            x: 14px;
+                                                                            width: parent.width - 18px;
+                                                                            text: row.label1;
+                                                                            color: Theme.text-muted;
+                                                                            font-size: Theme.fs-sm;
+                                                                            vertical-alignment: center;
+                                                                        }
+                                                                    }
+                                                                    Rectangle {
+                                                                        horizontal-stretch: 1;
+                                                                        Text {
+                                                                            x: 6px;
+                                                                            width: parent.width - 12px;
+                                                                            text: row.value1;
+                                                                            color: Theme.text-primary;
+                                                                            font-size: Theme.fs-sm;
+                                                                            font-weight: 600;
+                                                                            vertical-alignment: center;
+                                                                            overflow: elide;
+                                                                        }
+                                                                    }
+                                                                    if row.has-second : Rectangle {
+                                                                        width: 112px;
+                                                                        Text {
+                                                                            x: 14px;
+                                                                            width: parent.width - 18px;
+                                                                            text: row.label2;
+                                                                            color: Theme.text-muted;
+                                                                            font-size: Theme.fs-sm;
+                                                                            vertical-alignment: center;
+                                                                        }
+                                                                    }
+                                                                    if row.has-second : Rectangle {
+                                                                        horizontal-stretch: 1;
+                                                                        Text {
+                                                                            x: 6px;
+                                                                            width: parent.width - 12px;
+                                                                            text: row.value2;
+                                                                            color: Theme.text-primary;
+                                                                            font-size: Theme.fs-sm;
+                                                                            font-weight: 600;
+                                                                            vertical-alignment: center;
+                                                                            overflow: elide;
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+
+                                                        if section.layout == 1 : VerticalLayout {
+                                                            spacing: 0;
+                                                            if section.headers.length > 0 : Rectangle {
+                                                                height: 34px;
+                                                                background: #ffffff06;
+                                                                HorizontalLayout {
+                                                                    spacing: 0;
+                                                                    for head[j] in section.headers : Rectangle {
+                                                                        horizontal-stretch: j == 0 ? 2 : 1;
+                                                                        Text {
+                                                                            x: 12px;
+                                                                            width: parent.width - 16px;
+                                                                            text: head;
+                                                                            color: Theme.text-muted;
+                                                                            font-size: Theme.fs-sm;
+                                                                            font-weight: 600;
+                                                                            vertical-alignment: center;
+                                                                            overflow: elide;
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                            for row[i] in section.rows : Rectangle {
+                                                                height: 34px;
+                                                                background: mod(i, 2) == 0 ? transparent : #ffffff05;
+                                                                HorizontalLayout {
+                                                                    spacing: 0;
+                                                                    for cell[j] in row.cells : Rectangle {
+                                                                        horizontal-stretch: j == 0 ? 2 : 1;
+                                                                        Text {
+                                                                            x: 12px;
+                                                                            width: parent.width - 16px;
+                                                                            text: cell;
+                                                                            color: Theme.text-primary;
+                                                                            font-size: Theme.fs-sm;
+                                                                            font-weight: j == 0 ? 600 : 400;
+                                                                            vertical-alignment: center;
+                                                                            overflow: elide;
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+
+                                                        if section.layout == 2 : Rectangle {
+                                                            height: section-raw.preferred-height + 24px;
+                                                            raw-wrap := Rectangle {
+                                                                x: 10px;
+                                                                y: 10px;
+                                                                width: parent.width - 20px;
+                                                                height: parent.height - 20px;
+                                                                clip: true;
+                                                                section-raw := TextInput {
+                                                                    width: parent.width;
+                                                                    height: self.preferred-height;
+                                                                    text: section.raw-text;
+                                                                    read-only: true;
+                                                                    single-line: false;
+                                                                    wrap: word-wrap;
+                                                                    color: Theme.text-primary;
+                                                                    font-family: Theme.font-mono;
+                                                                    font-size: Theme.fs-sm;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }

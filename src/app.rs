@@ -4400,6 +4400,7 @@ fn wire_system_info_callbacks(
             title: title.into(),
             content: String::new().into(),
             loading: true,
+            sections: ModelRc::from(Rc::new(VecModel::<InfoSection>::default())),
         });
         w.set_active_tab_id(info_id.clone().into());
         if let Some(handle) = handles.borrow().get(&source_tab) {
@@ -6466,6 +6467,271 @@ fn terminal_row(win: &AppWindow, tab_id: &str) -> Option<TerminalState> {
     None
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParsedInfoKvRow {
+    label1: String,
+    value1: String,
+    label2: String,
+    value2: String,
+    has_second: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParsedInfoSection {
+    title: String,
+    layout: i32,
+    kv_rows: Vec<ParsedInfoKvRow>,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    raw_text: String,
+}
+
+fn string_model(items: &[String]) -> ModelRc<SharedString> {
+    let rows: Vec<SharedString> = items.iter().map(|s| s.as_str().into()).collect();
+    ModelRc::from(Rc::new(VecModel::from(rows)))
+}
+
+fn info_table_rows_model(rows: &[Vec<String>]) -> ModelRc<InfoTableRow> {
+    let mapped: Vec<InfoTableRow> = rows
+        .iter()
+        .map(|cols| InfoTableRow {
+            cells: string_model(cols),
+        })
+        .collect();
+    ModelRc::from(Rc::new(VecModel::from(mapped)))
+}
+
+fn info_kv_rows_model(rows: &[ParsedInfoKvRow]) -> ModelRc<InfoKvRow> {
+    let mapped: Vec<InfoKvRow> = rows
+        .iter()
+        .map(|row| InfoKvRow {
+            label1: row.label1.as_str().into(),
+            value1: row.value1.as_str().into(),
+            label2: row.label2.as_str().into(),
+            value2: row.value2.as_str().into(),
+            has_second: row.has_second,
+        })
+        .collect();
+    ModelRc::from(Rc::new(VecModel::from(mapped)))
+}
+
+fn info_sections_model(sections: &[ParsedInfoSection]) -> ModelRc<InfoSection> {
+    let mapped: Vec<InfoSection> = sections
+        .iter()
+        .map(|section| InfoSection {
+            title: section.title.as_str().into(),
+            layout: section.layout,
+            kv_rows: info_kv_rows_model(&section.kv_rows),
+            headers: string_model(&section.headers),
+            rows: info_table_rows_model(&section.rows),
+            raw_text: section.raw_text.as_str().into(),
+        })
+        .collect();
+    ModelRc::from(Rc::new(VecModel::from(mapped)))
+}
+
+fn parse_info_section_title(title: &str) -> String {
+    match title.trim() {
+        "Basic" => "Overview".to_string(),
+        "基础信息" => "概览".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn parse_info_heading(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    trimmed
+        .strip_prefix("=====")
+        .and_then(|rest| rest.strip_suffix("====="))
+        .map(|inner| inner.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn split_table_columns(line: &str) -> Vec<String> {
+    let mut cols = Vec::new();
+    let mut cur = String::new();
+    let mut ws = 0usize;
+    for ch in line.trim().chars() {
+        if ch.is_whitespace() {
+            ws += 1;
+            continue;
+        }
+        if ws >= 2 {
+            if !cur.trim().is_empty() {
+                cols.push(cur.trim().to_string());
+                cur.clear();
+            }
+        } else if ws == 1 && !cur.is_empty() {
+            cur.push(' ');
+        }
+        ws = 0;
+        cur.push(ch);
+    }
+    if !cur.trim().is_empty() {
+        cols.push(cur.trim().to_string());
+    }
+    cols
+}
+
+fn normalize_table_row(mut cols: Vec<String>, expected: usize) -> Vec<String> {
+    if expected == 0 {
+        return cols;
+    }
+    if cols.len() > expected {
+        let tail = cols.split_off(expected - 1);
+        cols.push(tail.join(" "));
+    }
+    while cols.len() < expected {
+        cols.push(String::new());
+    }
+    cols
+}
+
+fn parse_kv_rows(raw_text: &str) -> Vec<ParsedInfoKvRow> {
+    let pairs: Vec<(String, String)> = raw_text
+        .lines()
+        .filter_map(|line| {
+            let (label, value) = line.split_once(':')?;
+            let label = label.trim();
+            let value = value.trim();
+            if label.is_empty() || value.is_empty() {
+                None
+            } else {
+                Some((label.to_string(), value.to_string()))
+            }
+        })
+        .collect();
+
+    let mut rows = Vec::new();
+    for chunk in pairs.chunks(2) {
+        let (label1, value1) = chunk[0].clone();
+        if let Some((label2, value2)) = chunk.get(1).cloned() {
+            rows.push(ParsedInfoKvRow {
+                label1,
+                value1,
+                label2,
+                value2,
+                has_second: true,
+            });
+        } else {
+            rows.push(ParsedInfoKvRow {
+                label1,
+                value1,
+                label2: String::new(),
+                value2: String::new(),
+                has_second: false,
+            });
+        }
+    }
+    rows
+}
+
+fn parse_info_table(lines: &[String]) -> Option<(Vec<String>, Vec<Vec<String>>)> {
+    let rows_src: Vec<String> = lines
+        .iter()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+    if rows_src.len() < 2 {
+        return None;
+    }
+    let headers = split_table_columns(&rows_src[0]);
+    if headers.len() < 2 || headers.iter().any(|h| h.ends_with(':')) {
+        return None;
+    }
+    let mut rows = Vec::new();
+    for line in rows_src.iter().skip(1) {
+        let cols = split_table_columns(line);
+        if cols.len() < 2 {
+            continue;
+        }
+        rows.push(normalize_table_row(cols, headers.len()));
+    }
+    if rows.is_empty() {
+        None
+    } else {
+        Some((headers, rows))
+    }
+}
+
+fn parse_info_section(title: &str, lines: &[String]) -> Option<ParsedInfoSection> {
+    let raw_text = lines
+        .iter()
+        .map(|line| line.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
+    if raw_text.is_empty() {
+        return None;
+    }
+
+    let display_title = parse_info_section_title(title);
+    let is_kv = matches!(title.trim(), "Basic" | "基础信息" | "CPU" | "处理器");
+    let is_login = matches!(title.trim(), "Login" | "登录记录");
+
+    if is_kv {
+        return Some(ParsedInfoSection {
+            title: display_title,
+            layout: 0,
+            kv_rows: parse_kv_rows(&raw_text),
+            headers: Vec::new(),
+            rows: Vec::new(),
+            raw_text,
+        });
+    }
+
+    if !is_login {
+        if let Some((headers, rows)) = parse_info_table(lines) {
+            return Some(ParsedInfoSection {
+                title: display_title,
+                layout: 1,
+                kv_rows: Vec::new(),
+                headers,
+                rows,
+                raw_text,
+            });
+        }
+    }
+
+    Some(ParsedInfoSection {
+        title: display_title,
+        layout: 2,
+        kv_rows: Vec::new(),
+        headers: Vec::new(),
+        rows: Vec::new(),
+        raw_text,
+    })
+}
+
+fn parse_system_info_sections(content: &str) -> Vec<ParsedInfoSection> {
+    let mut sections = Vec::new();
+    let mut current_title: Option<String> = None;
+    let mut current_lines: Vec<String> = Vec::new();
+
+    for line in content.lines() {
+        if let Some(title) = parse_info_heading(line) {
+            if let Some(prev_title) = current_title.take() {
+                if let Some(section) = parse_info_section(&prev_title, &current_lines) {
+                    sections.push(section);
+                }
+            }
+            current_title = Some(title);
+            current_lines.clear();
+        } else {
+            current_lines.push(line.to_string());
+        }
+    }
+
+    if let Some(prev_title) = current_title {
+        if let Some(section) = parse_info_section(&prev_title, &current_lines) {
+            sections.push(section);
+        }
+    }
+
+    sections
+}
+
 fn update_info_tab_content(win: &AppWindow, info_id: &str, content: &str, error: &str) {
     let info_tabs = win.get_info_tabs();
     let Some(model) = info_tabs.as_any().downcast_ref::<VecModel<InfoState>>() else {
@@ -6475,16 +6741,29 @@ fn update_info_tab_content(win: &AppWindow, info_id: &str, content: &str, error:
         if let Some(mut row) = model.row_data(i) {
             if row.id.as_str() == info_id {
                 row.loading = false;
-                row.content = if error.trim().is_empty() {
-                    content.into()
+                let final_content = if error.trim().is_empty() {
+                    content.to_string()
                 } else {
                     format!(
                         "{}:\n{}",
                         t("系统信息加载失败", "Failed to load system info"),
                         error
                     )
-                    .into()
                 };
+                let sections = if error.trim().is_empty() {
+                    parse_system_info_sections(&final_content)
+                } else {
+                    vec![ParsedInfoSection {
+                        title: t("错误", "Error").to_string(),
+                        layout: 2,
+                        kv_rows: Vec::new(),
+                        headers: Vec::new(),
+                        rows: Vec::new(),
+                        raw_text: final_content.clone(),
+                    }]
+                };
+                row.content = final_content.into();
+                row.sections = info_sections_model(&sections);
                 model.set_row_data(i, row);
                 break;
             }
@@ -6580,6 +6859,63 @@ fn clipboard_set_text(text: String) {
     let result = arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text));
     if let Err(e) = result {
         tracing::warn!("clipboard set_text error: {}", e);
+    }
+}
+
+#[cfg(test)]
+mod info_tests {
+    use super::{parse_system_info_sections, split_table_columns};
+
+    #[test]
+    fn split_table_columns_keeps_single_space_columns() {
+        let cols = split_table_columns("Filesystem      Type  Size  Used  Avail  Use%  Mounted on");
+        assert_eq!(
+            cols,
+            vec![
+                "Filesystem",
+                "Type",
+                "Size",
+                "Used",
+                "Avail",
+                "Use%",
+                "Mounted on"
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_system_info_sections_creates_cards_and_tables() {
+        let content = "\
+===== 基础信息 =====
+用户名: root
+主机: demo
+操作系统: Ubuntu 24.04
+系统版本: 24.04
+
+===== 处理器 =====
+架构: x86_64
+CPU 数量: 4
+型号名称: Intel Xeon
+
+===== 内存 =====
+               total        used        free      shared  buff/cache   available
+Mem:            15Gi       3.2Gi       8.1Gi       120Mi       4.5Gi        11Gi
+Swap:          2.0Gi          0B       2.0Gi
+
+===== 登录记录 =====
+root pts/0 10.0.0.1
+";
+        let sections = parse_system_info_sections(content);
+        assert_eq!(sections.len(), 4);
+        assert_eq!(sections[0].title, "概览");
+        assert_eq!(sections[0].layout, 0);
+        assert_eq!(sections[1].title, "处理器");
+        assert_eq!(sections[1].layout, 0);
+        assert_eq!(sections[2].title, "内存");
+        assert_eq!(sections[2].layout, 1);
+        assert_eq!(sections[2].headers[0], "total");
+        assert_eq!(sections[3].title, "登录记录");
+        assert_eq!(sections[3].layout, 2);
     }
 }
 
