@@ -4403,7 +4403,7 @@ fn wire_system_info_callbacks(
         });
         w.set_active_tab_id(info_id.clone().into());
         if let Some(handle) = handles.borrow().get(&source_tab) {
-            handle.system_info(info_id);
+            handle.system_info(info_id, w.get_lang_en());
         }
     });
 }

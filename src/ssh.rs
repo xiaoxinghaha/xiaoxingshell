@@ -250,7 +250,7 @@ pub enum SessionCommand {
     /// Notify the remote PTY of a terminal resize.
     Resize(u32, u32),
     /// Collect a one-shot read-only system overview over a separate exec channel.
-    RunSystemInfo { request_id: String },
+    RunSystemInfo { request_id: String, lang_en: bool },
     /// Gracefully disconnect and drop the session.
     Close,
 }
@@ -443,10 +443,11 @@ impl SessionHandle {
         let _ = self.commands.send(SessionCommand::Resize(cols, rows));
     }
 
-    pub fn system_info(&self, request_id: String) {
-        let _ = self
-            .commands
-            .send(SessionCommand::RunSystemInfo { request_id });
+    pub fn system_info(&self, request_id: String, lang_en: bool) {
+        let _ = self.commands.send(SessionCommand::RunSystemInfo {
+            request_id,
+            lang_en,
+        });
     }
 
     pub fn close(&self) {
@@ -841,11 +842,15 @@ async fn run_session(
                     Some(SessionCommand::Resize(cols, rows)) => {
                         let _ = channel.window_change(cols, rows, 0, 0).await;
                     }
-                    Some(SessionCommand::RunSystemInfo { request_id }) => {
+                    Some(SessionCommand::RunSystemInfo {
+                        request_id,
+                        lang_en,
+                    }) => {
                         let handle = handle.clone();
                         let events = events.clone();
                         tokio::spawn(async move {
-                            let (content, error) = match collect_system_info(&handle).await {
+                            let (content, error) = match collect_system_info(&handle, lang_en).await
+                            {
                                 Ok(text) => (text, String::new()),
                                 Err(err) => (String::new(), err.to_string()),
                             };
@@ -1052,32 +1057,64 @@ async fn run_session(
     Ok(())
 }
 
-async fn collect_system_info(handle: &Handle<ClientHandler>) -> Result<String> {
-    const CMD: &str = r#"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH
-printf '===== Basic =====\n'
-printf 'User: '; whoami 2>/dev/null || true
-printf 'Host: '; hostname 2>/dev/null || true
-printf 'Operating System: '; if [ -r /etc/os-release ]; then . /etc/os-release; printf '%s\n' "${PRETTY_NAME:-${NAME:-Unknown} ${VERSION_ID:-}}"; else uname -s 2>/dev/null || true; fi
-printf 'OS Version: '; if [ -r /etc/os-release ]; then . /etc/os-release; printf '%s\n' "${VERSION_ID:-Unknown}"; else uname -r 2>/dev/null || true; fi
-printf 'Kernel: '; uname -a 2>/dev/null || true
-printf 'Uptime: '; (uptime -p 2>/dev/null || uptime 2>/dev/null || true)
+async fn collect_system_info(handle: &Handle<ClientHandler>, lang_en: bool) -> Result<String> {
+    let (basic, user, host, os, version, kernel, uptime, memory, disk, network, login) = if lang_en
+    {
+        (
+            "Basic",
+            "User",
+            "Host",
+            "Operating System",
+            "OS Version",
+            "Kernel",
+            "Uptime",
+            "Memory",
+            "Disk",
+            "Network",
+            "Login",
+        )
+    } else {
+        (
+            "基础信息",
+            "用户名",
+            "主机",
+            "操作系统",
+            "系统版本",
+            "内核",
+            "运行时间",
+            "内存",
+            "磁盘",
+            "网络",
+            "登录记录",
+        )
+    };
+    let cmd = format!(
+        r#"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH
+printf '===== {basic} =====\n'
+printf '{user}: '; whoami 2>/dev/null || true
+printf '{host}: '; hostname 2>/dev/null || true
+printf '{os}: '; if [ -r /etc/os-release ]; then . /etc/os-release; printf '%s\n' "${{PRETTY_NAME:-${{NAME:-Unknown}} ${{VERSION_ID:-}}}}"; else uname -s 2>/dev/null || true; fi
+printf '{version}: '; if [ -r /etc/os-release ]; then . /etc/os-release; printf '%s\n' "${{VERSION_ID:-Unknown}}"; else uname -r 2>/dev/null || true; fi
+printf '{kernel}: '; uname -a 2>/dev/null || true
+printf '{uptime}: '; (uptime -p 2>/dev/null || uptime 2>/dev/null || true)
 printf '\n===== CPU =====\n'
 (lscpu 2>/dev/null | sed -n '1,12p') || (grep -m1 'model name' /proc/cpuinfo 2>/dev/null; grep -c '^processor' /proc/cpuinfo 2>/dev/null)
-printf '\n===== Memory =====\n'
+printf '\n===== {memory} =====\n'
 free -h 2>/dev/null || sed -n '1,8p' /proc/meminfo 2>/dev/null
-printf '\n===== Disk =====\n'
+printf '\n===== {disk} =====\n'
 df -hT 2>/dev/null | sed -n '1,12p'
-printf '\n===== Network =====\n'
+printf '\n===== {network} =====\n'
 (ip -brief addr 2>/dev/null || ifconfig 2>/dev/null || true) | sed -n '1,20p'
-printf '\n===== Login =====\n'
+printf '\n===== {login} =====\n'
 (last -n 5 2>/dev/null || who 2>/dev/null || true)
-"#;
+"#
+    );
     let mut channel = handle
         .channel_open_session()
         .await
         .context("open system info channel")?;
     channel
-        .exec(true, CMD.as_bytes())
+        .exec(true, cmd.as_bytes())
         .await
         .context("start system info command")?;
 

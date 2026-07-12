@@ -1028,21 +1028,23 @@ export component AppWindow inherits Window {
                                 HorizontalLayout {
                                     spacing: 12px;
                                     Text {
-                                        text: "System information";
+                                        text: root.lang-en ? "System information" : "系统信息";
                                         color: Theme.text-primary;
                                         font-size: Theme.fs-xl;
                                         font-weight: 700;
                                         horizontal-stretch: 1;
                                     }
                                     GhostButton {
-                                        text: "Copy all";
+                                        text: root.lang-en ? "Copy all" : "复制全部";
                                         clicked => {
                                             root.copy-text(info.loading ? "" : info.content);
                                         }
                                     }
                                 }
                                 Text {
-                                    text: "Current host overview, resource usage, network and filesystem status.";
+                                    text: root.lang-en
+                                        ? "Current host overview, resource usage, network and filesystem status."
+                                        : "查看当前主机的系统概览、资源占用、网络与文件系统状态。";
                                     color: Theme.text-muted;
                                     font-size: Theme.fs-sm;
                                 }
@@ -1064,7 +1066,7 @@ export component AppWindow inherits Window {
                                             width: max(parent.width - 32px, self.preferred-width);
                                             height: self.preferred-height;
                                             text: info.loading
-                                                ? "Loading..."
+                                                ? (root.lang-en ? "Loading..." : "加载中...")
                                                 : info.content;
                                             read-only: true;
                                             single-line: false;
