@@ -1149,15 +1149,29 @@ export component AppWindow inherits Window {
                                                                     }
                                                                     Rectangle {
                                                                         horizontal-stretch: 1;
-                                                                        Text {
+                                                                        clip: true;
+                                                                        TouchArea {
+                                                                            mouse-cursor: text;
+                                                                            clicked => {
+                                                                                kv-value1.focus();
+                                                                            }
+                                                                            double-clicked => {
+                                                                                kv-value1.focus();
+                                                                                kv-value1.select-all();
+                                                                                kv-value1.copy();
+                                                                            }
+                                                                        }
+                                                                        kv-value1 := TextInput {
                                                                             x: 6px;
+                                                                            y: 6px;
                                                                             width: parent.width - 12px;
+                                                                            height: parent.height - 12px;
                                                                             text: row.value1;
+                                                                            read-only: true;
+                                                                            single-line: true;
                                                                             color: Theme.text-primary;
                                                                             font-size: Theme.fs-sm;
                                                                             font-weight: 600;
-                                                                            vertical-alignment: center;
-                                                                            overflow: elide;
                                                                         }
                                                                     }
                                                                     if row.has-second : Rectangle {
@@ -1173,15 +1187,29 @@ export component AppWindow inherits Window {
                                                                     }
                                                                     if row.has-second : Rectangle {
                                                                         horizontal-stretch: 1;
-                                                                        Text {
+                                                                        clip: true;
+                                                                        TouchArea {
+                                                                            mouse-cursor: text;
+                                                                            clicked => {
+                                                                                kv-value2.focus();
+                                                                            }
+                                                                            double-clicked => {
+                                                                                kv-value2.focus();
+                                                                                kv-value2.select-all();
+                                                                                kv-value2.copy();
+                                                                            }
+                                                                        }
+                                                                        kv-value2 := TextInput {
                                                                             x: 6px;
+                                                                            y: 6px;
                                                                             width: parent.width - 12px;
+                                                                            height: parent.height - 12px;
                                                                             text: row.value2;
+                                                                            read-only: true;
+                                                                            single-line: true;
                                                                             color: Theme.text-primary;
                                                                             font-size: Theme.fs-sm;
                                                                             font-weight: 600;
-                                                                            vertical-alignment: center;
-                                                                            overflow: elide;
                                                                         }
                                                                     }
                                                                 }
@@ -1217,15 +1245,29 @@ export component AppWindow inherits Window {
                                                                     spacing: 0;
                                                                     for cell[j] in row.cells : Rectangle {
                                                                         horizontal-stretch: j == 0 ? 2 : 1;
-                                                                        Text {
+                                                                        clip: true;
+                                                                        TouchArea {
+                                                                            mouse-cursor: text;
+                                                                            clicked => {
+                                                                                table-cell.focus();
+                                                                            }
+                                                                            double-clicked => {
+                                                                                table-cell.focus();
+                                                                                table-cell.select-all();
+                                                                                table-cell.copy();
+                                                                            }
+                                                                        }
+                                                                        table-cell := TextInput {
                                                                             x: 12px;
+                                                                            y: 5px;
                                                                             width: parent.width - 16px;
+                                                                            height: parent.height - 10px;
                                                                             text: cell;
+                                                                            read-only: true;
+                                                                            single-line: true;
                                                                             color: Theme.text-primary;
                                                                             font-size: Theme.fs-sm;
                                                                             font-weight: j == 0 ? 600 : 400;
-                                                                            vertical-alignment: center;
-                                                                            overflow: elide;
                                                                         }
                                                                     }
                                                                 }
