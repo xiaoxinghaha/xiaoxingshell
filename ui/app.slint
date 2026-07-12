@@ -1025,16 +1025,24 @@ export component AppWindow inherits Window {
                             VerticalLayout {
                                 padding: 22px;
                                 spacing: 14px;
-                                Text {
-                                    text: root.lang-en ? "System information" : "系统信息";
-                                    color: Theme.text-primary;
-                                    font-size: Theme.fs-xl;
-                                    font-weight: 700;
+                                HorizontalLayout {
+                                    spacing: 12px;
+                                    Text {
+                                        text: "System information";
+                                        color: Theme.text-primary;
+                                        font-size: Theme.fs-xl;
+                                        font-weight: 700;
+                                        horizontal-stretch: 1;
+                                    }
+                                    GhostButton {
+                                        text: "Copy all";
+                                        clicked => {
+                                            root.copy-text(info.loading ? "" : info.content);
+                                        }
+                                    }
                                 }
                                 Text {
-                                    text: root.lang-en
-                                        ? "Current host overview, resource usage, network and filesystem status."
-                                        : "查看当前主机的系统概览、资源占用、网络与文件系统状态。";
+                                    text: "Current host overview, resource usage, network and filesystem status.";
                                     color: Theme.text-muted;
                                     font-size: Theme.fs-sm;
                                 }
@@ -1049,14 +1057,17 @@ export component AppWindow inherits Window {
                                         x: 0; y: 0;
                                         width: parent.width;
                                         height: parent.height;
-                                        viewport-width: self.width;
+                                        viewport-width: max(self.width, sysinfo-content.preferred-width + 32px);
                                         viewport-height: max(self.height, sysinfo-content.preferred-height + 32px);
-                                        sysinfo-content := Text {
+                                        sysinfo-content := TextInput {
                                             x: 16px; y: 16px;
-                                            width: parent.width - 32px;
+                                            width: max(parent.width - 32px, self.preferred-width);
+                                            height: self.preferred-height;
                                             text: info.loading
-                                                ? (root.lang-en ? "Loading..." : "加载中...")
+                                                ? "Loading..."
                                                 : info.content;
+                                            read-only: true;
+                                            single-line: false;
                                             color: Theme.text-primary;
                                             font-family: Theme.font-mono;
                                             font-size: Theme.fs-sm;
@@ -1310,8 +1321,9 @@ export component AppWindow inherits Window {
                                 clip: true;
                                 Text {
                                     x: 0;
-                                    y: ed-scroll.viewport-y + 8px;
+                                    y: 8px - ed-scroll.viewport-y;
                                     width: parent.width - 6px;
+                                    height: self.preferred-height;
                                     text: root.editor-line-numbers;
                                     horizontal-alignment: right;
                                     font-family: Theme.ui-font-family;

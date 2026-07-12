@@ -1057,6 +1057,8 @@ async fn collect_system_info(handle: &Handle<ClientHandler>) -> Result<String> {
 printf '===== Basic =====\n'
 printf 'User: '; whoami 2>/dev/null || true
 printf 'Host: '; hostname 2>/dev/null || true
+printf 'Operating System: '; if [ -r /etc/os-release ]; then . /etc/os-release; printf '%s\n' "${PRETTY_NAME:-${NAME:-Unknown} ${VERSION_ID:-}}"; else uname -s 2>/dev/null || true; fi
+printf 'OS Version: '; if [ -r /etc/os-release ]; then . /etc/os-release; printf '%s\n' "${VERSION_ID:-Unknown}"; else uname -r 2>/dev/null || true; fi
 printf 'Kernel: '; uname -a 2>/dev/null || true
 printf 'Uptime: '; (uptime -p 2>/dev/null || uptime 2>/dev/null || true)
 printf '\n===== CPU =====\n'
