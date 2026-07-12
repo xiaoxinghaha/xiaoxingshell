@@ -69,6 +69,17 @@ export struct TerminalState {
     sftp-status: string,
     sftp-loading: bool,
     sftp-tree-nodes: [SftpTreeNode],
+    sftp-current-user: string,
+    sftp-sudo-user: string,
+    sftp-sudo-active: bool,
+    sftp-sudo-available: bool,
+}
+
+export struct InfoState {
+    id: string,
+    title: string,
+    content: string,
+    loading: bool,
 }
 
 // A 26×26 top-bar icon button with a hover tooltip (right-aligned so it never
@@ -236,6 +247,7 @@ export component AppWindow inherits Window {
     in property <string> local-input-status-text;
     callback select-net-iface(string);
     callback set-local-input-optimization(bool);
+    callback show-system-info();
     callback copy-connection-address();
 
     // --- Top-right popups --------------------------------------------------
@@ -376,6 +388,13 @@ export component AppWindow inherits Window {
     in-out property <bool> cred-remember: false;   // persist to the saved session
     callback cred-accept();                        // use the entered credentials
     callback cred-reject();                        // cancel the connection
+    in-out property <bool> sudo-prompt-open: false;
+    in-out property <string> sudo-prompt-tab;
+    in-out property <string> sudo-login-user;
+    in-out property <string> sudo-target-user: "root";
+    in-out property <string> sudo-password;
+    callback sudo-prompt-accept();
+    callback sudo-prompt-cancel();
     // Group create / rename dialog (#41).
     in-out property <bool> group-dialog-open: false;
     in-out property <string> group-dialog-orig;    // "" = create, else rename
@@ -420,6 +439,7 @@ export component AppWindow inherits Window {
     // --- Built-in file viewer/editor (#70) --------------------------------
     in-out property <bool> editor-open: false;
     in-out property <string> editor-name;     // file name shown in the title
+    in-out property <string> editor-tab;      // owning SFTP tab
     in-out property <string> editor-path;     // remote path (used on save)
     in-out property <string> editor-content;  // text, two-way with the input
     in-out property <bool> editor-readonly;   // view = true, edit = false
@@ -452,6 +472,7 @@ export component AppWindow inherits Window {
     in property <[TabInfo]> tabs;
     in-out property <string> active-tab-id: "welcome";
     in property <[TerminalState]> terminals;
+    in property <[InfoState]> info-tabs;
     in-out property <length> welcome-scroll-y: 0px;
     in-out property <length> session-manager-scroll-y: 0px;
     property <length> top-toolbar-reserve: 146px;
@@ -543,6 +564,7 @@ export component AppWindow inherits Window {
     callback sftp-download-range(string /* tab-id */, int /* start */, int /* end */);
     // Trigger an upload: Rust opens a file-picker dialog then transfers.
     callback sftp-upload-clicked(string /* tab-id */, string /* remote-dir */, bool /* folder */);
+    callback sftp-sudo-clicked(string /* tab-id */);
     // Refresh the current directory listing.
     callback sftp-refresh(string /* tab-id */, string /* path */);
     // Toggle expand/collapse of a tree node (also navigates to that directory).
@@ -741,6 +763,7 @@ export component AppWindow inherits Window {
                     set-local-input-optimization(v) => {
                         root.set-local-input-optimization(v);
                     }
+                    system-info-clicked() => { root.show-system-info(); }
                     copy-connection-address() => { root.copy-connection-address(); }
                 }
 
@@ -892,6 +915,10 @@ export component AppWindow inherits Window {
                             sftp-status: term.sftp-status;
                             sftp-loading: term.sftp-loading;
                             sftp-tree-nodes: term.sftp-tree-nodes;
+                            sftp-current-user: term.sftp-current-user;
+                            sftp-sudo-user: term.sftp-sudo-user;
+                            sftp-sudo-active: term.sftp-sudo-active;
+                            sftp-sudo-available: term.sftp-sudo-available;
                             quick-commands: root.quick-commands;
                             command-history: root.command-history;
                             run-command(cmd, all) => { root.run-command(term.id, cmd, all); }
@@ -920,6 +947,7 @@ export component AppWindow inherits Window {
                             sftp-download-folder-zip(path) => { root.sftp-download-folder-zip(term.id, path); }
                             sftp-download-range(start, end) => { root.sftp-download-range(term.id, start, end); }
                             sftp-upload-clicked(dir, folder) => { root.sftp-upload-clicked(term.id, dir, folder); }
+                            sftp-sudo-clicked() => { root.sftp-sudo-clicked(term.id); }
                             sftp-refresh(path) => { root.sftp-refresh(term.id, path); }
                             sftp-tree-expand(path) => { root.sftp-tree-expand(term.id, path); }
                             // Gate delete behind an in-app confirmation (#28): stash the
@@ -987,6 +1015,56 @@ export component AppWindow inherits Window {
                             select-line(r, c) => { root.term-select-line(term.id, r, c); }
                             select-autoscroll(dir) => { root.term-select-autoscroll(term.id, dir); }
                             copy-selection-or-ctrl-c() => { root.copy-selection-or-ctrl-c(term.id); }
+                        }
+
+                        for info in root.info-tabs : Rectangle {
+                            visible: info.id == root.active-tab-id;
+                            width: info.id == root.active-tab-id ? parent.width : 0px;
+                            height: info.id == root.active-tab-id ? parent.height : 0px;
+                            background: Theme.bg-root;
+                            VerticalLayout {
+                                padding: 22px;
+                                spacing: 14px;
+                                Text {
+                                    text: root.lang-en ? "System information" : "系统信息";
+                                    color: Theme.text-primary;
+                                    font-size: Theme.fs-xl;
+                                    font-weight: 700;
+                                }
+                                Text {
+                                    text: root.lang-en
+                                        ? "Current host overview, resource usage, network and filesystem status."
+                                        : "查看当前主机的系统概览、资源占用、网络与文件系统状态。";
+                                    color: Theme.text-muted;
+                                    font-size: Theme.fs-sm;
+                                }
+                                Rectangle {
+                                    vertical-stretch: 1;
+                                    background: Theme.bg-panel;
+                                    border-radius: Theme.radius-md;
+                                    border-width: 1px;
+                                    border-color: Theme.border-subtle;
+                                    clip: true;
+                                    Flickable {
+                                        x: 0; y: 0;
+                                        width: parent.width;
+                                        height: parent.height;
+                                        viewport-width: self.width;
+                                        viewport-height: max(self.height, sysinfo-content.preferred-height + 32px);
+                                        sysinfo-content := Text {
+                                            x: 16px; y: 16px;
+                                            width: parent.width - 32px;
+                                            text: info.loading
+                                                ? (root.lang-en ? "Loading..." : "加载中...")
+                                                : info.content;
+                                            color: Theme.text-primary;
+                                            font-family: Theme.font-mono;
+                                            font-size: Theme.fs-sm;
+                                            wrap: word-wrap;
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -3411,6 +3489,124 @@ export component AppWindow inherits Window {
                     PrimaryButton {
                         text: @tr("Connect");
                         clicked => { root.cred-accept(); }
+                    }
+                }
+            }
+        }
+    }
+
+    if root.sudo-prompt-open : Rectangle {
+        width: parent.width;
+        height: parent.height;
+        background: #000000aa;
+        TouchArea { clicked => { root.sudo-prompt-cancel(); } }
+        Rectangle {
+            width: 460px;
+            height: sudo-card.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: Theme.bg-panel;
+            border-radius: Theme.radius-lg;
+            border-width: 1px;
+            border-color: Theme.border-strong;
+            drop-shadow-blur: 24px;
+            drop-shadow-color: #00000080;
+            TouchArea {}
+            sudo-card := VerticalLayout {
+                padding: 20px;
+                spacing: 14px;
+                HorizontalLayout {
+                    Text {
+                        text: root.lang-en ? "Enable root view" : "启用 root 视角";
+                        color: Theme.text-primary;
+                        font-size: Theme.fs-xl;
+                        font-weight: 600;
+                        horizontal-stretch: 1;
+                    }
+                    Rectangle {
+                        width: 24px; height: 24px;
+                        border-radius: Theme.radius-sm;
+                        background: sudo-close.has-hover ? Theme.bg-hover : transparent;
+                        sudo-close := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.sudo-prompt-cancel(); }
+                        }
+                        Text { text: "×"; color: Theme.text-secondary; font-size: Theme.fs-lg;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                }
+                Text {
+                    text: root.lang-en
+                        ? "Enter sudo target user and password. Target user defaults to root."
+                        : "请输入 sudo 目标用户和密码。目标用户默认为 root，也可以改成其他用户。";
+                    color: Theme.text-muted;
+                    font-size: Theme.fs-sm;
+                    wrap: word-wrap;
+                }
+                Rectangle {
+                    height: 42px;
+                    background: Theme.bg-root;
+                    border-radius: Theme.radius-sm;
+                    border-width: 1px;
+                    border-color: Theme.border-subtle;
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        Text {
+                            text: root.lang-en ? "Current SSH user" : "当前 SSH 登录用户";
+                            color: Theme.text-muted;
+                            font-size: Theme.fs-sm;
+                            horizontal-stretch: 1;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: root.sudo-login-user;
+                            color: Theme.text-primary;
+                            font-family: Theme.font-mono;
+                            font-size: Theme.fs-sm;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+                LabeledInput {
+                    label: root.lang-en ? "sudo target user" : "sudo 目标用户";
+                    placeholder: "root";
+                    value <=> root.sudo-target-user;
+                }
+                LabeledInput {
+                    label: root.lang-en ? "sudo password" : "sudo 密码";
+                    placeholder: "••••••••";
+                    password: true;
+                    value <=> root.sudo-password;
+                }
+                Rectangle {
+                    height: sudo-help-text.preferred-height + 20px;
+                    background: Theme.accent.with-alpha(0.12);
+                    border-radius: Theme.radius-sm;
+                    border-width: 1px;
+                    border-color: Theme.accent.with-alpha(0.35);
+                    sudo-help-text := Text {
+                        x: 12px; y: 10px;
+                        width: parent.width - 24px;
+                        text: root.lang-en
+                            ? "Password can be empty if sudo is passwordless. Root upload writes a temporary file first, then installs it with sudo."
+                            : "已配置免密 sudo 可留空；否则直接输入密码。root 上传会先写入临时文件，再通过 sudo 覆盖目标路径。";
+                        color: Theme.text-secondary;
+                        font-size: Theme.fs-xs;
+                        wrap: word-wrap;
+                    }
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
+                    GhostButton {
+                        text: root.lang-en ? "Cancel" : "取消";
+                        clicked => { root.sudo-prompt-cancel(); }
+                    }
+                    PrimaryButton {
+                        text: root.lang-en ? "Enter root view" : "进入 root 视角";
+                        clicked => { root.sudo-prompt-accept(); }
                     }
                 }
             }

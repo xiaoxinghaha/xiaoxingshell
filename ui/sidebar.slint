@@ -227,6 +227,7 @@ export component Sidebar inherits Rectangle {
     in property <string> local-input-status-text: "";
     callback select-net-iface(string);
     callback set-local-input-optimization(bool);
+    callback system-info-clicked();
     callback copy-connection-address();
 
     width: 220px;
@@ -312,7 +313,7 @@ export component Sidebar inherits Rectangle {
         Rectangle { height: 1px; background: Theme.border-subtle; }
 
         if root.local-input-toggle-visible : Rectangle {
-            height: 75px;
+            height: 103px;
 
             VerticalLayout {
                 spacing: 6px;
@@ -365,6 +366,25 @@ export component Sidebar inherits Rectangle {
                     text: root.local-input-status-text;
                     color: root.local-input-optimization-active ? Theme.success : Theme.text-primary;
                     font-size: Theme.fs-xs;
+                }
+
+                Rectangle {
+                    height: 24px;
+                    border-radius: Theme.radius-sm;
+                    border-width: 1px;
+                    border-color: sysinfo-ta.has-hover ? Theme.accent : Theme.border-subtle;
+                    background: sysinfo-ta.has-hover ? Theme.bg-hover : Theme.bg-root;
+                    sysinfo-ta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.system-info-clicked(); }
+                    }
+                    Text {
+                        text: @tr("系统信息");
+                        color: Theme.text-primary;
+                        font-size: Theme.fs-sm;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
                 }
 
                 Rectangle { height: 1px; background: Theme.border-subtle; }

@@ -61,6 +61,10 @@ export component SftpPanel inherits Rectangle {
     in property <string>  status: @tr("SFTP not connected");
     in property <bool>    loading: false;
     in property <[SftpTreeNode]> tree-nodes: [];
+    in property <string> current-user: "";
+    in property <string> sudo-user: "";
+    in property <bool> sudo-active: false;
+    in property <bool> sudo-available: false;
     in property <bool> collapsed: false;   // when true only the toolbar shows
     property <int> selected-row: -1;       // clicked/highlighted file-list row (#70)
     property <int> selection-anchor-row: -1;
@@ -106,6 +110,7 @@ export component SftpPanel inherits Rectangle {
     callback download-folder-zip(string);
     callback download-range(int, int);
     callback upload-clicked(string /* remote dir */, bool /* folder */);
+    callback sudo-clicked();
     callback refresh(string);
     callback tree-expand(string);   // toggle expand/collapse + navigate
     callback delete(string);        // remove a remote file/dir
@@ -290,6 +295,29 @@ export component SftpPanel inherits Rectangle {
                                 }
                             }
                         }
+                    }
+                }
+
+                if root.sudo-available : Rectangle {
+                    width: max(46px, sudo-label.preferred-width + 16px);
+                    height: 22px;
+                    border-radius: Theme.radius-sm;
+                    background: root.sudo-active
+                        ? (sudo-ta.has-hover ? Theme.warning.with-alpha(0.32) : Theme.warning.with-alpha(0.22))
+                        : (sudo-ta.has-hover ? Theme.bg-hover : Theme.bg-root);
+                    border-width: 1px;
+                    border-color: root.sudo-active ? Theme.warning : Theme.border-subtle;
+                    sudo-ta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.sudo-clicked(); }
+                    }
+                    sudo-label := Text {
+                        text: root.sudo-active ? root.sudo-user : root.current-user;
+                        color: root.sudo-active ? Theme.warning : Theme.text-secondary;
+                        font-size: Theme.fs-sm;
+                        font-weight: root.sudo-active ? 700 : 400;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
                     }
                 }
 

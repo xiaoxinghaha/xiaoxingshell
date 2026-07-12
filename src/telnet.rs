@@ -179,6 +179,7 @@ async fn run_telnet(
                         let _ = wr.write_all(&naws_subneg(cols, rows)).await;
                         let _ = wr.flush().await;
                     }
+                    Some(SessionCommand::RunSystemInfo { .. }) => {}
                     Some(SessionCommand::Close) | None => break,
                 }
             }

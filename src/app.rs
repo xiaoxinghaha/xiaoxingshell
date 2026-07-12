@@ -234,6 +234,18 @@ type TabStatuses = Arc<Mutex<HashMap<String, TabStatus>>>;
 /// Last local-machine sample (shown on the welcome tab).
 type LocalSnap = Arc<Mutex<SystemSnapshot>>;
 type SftpEntryCache = Arc<Mutex<HashMap<String, Vec<RemoteEntry>>>>;
+type SudoStates = Rc<RefCell<HashMap<String, SudoUploadState>>>;
+
+#[derive(Clone, Default)]
+struct SudoUploadState {
+    active: bool,
+    target_user: String,
+    password: String,
+}
+
+fn active_sudo_state(states: &SudoStates, tab_id: &str) -> Option<SudoUploadState> {
+    states.borrow().get(tab_id).cloned().filter(|s| s.active)
+}
 
 #[derive(Clone, Copy)]
 enum SftpSortColumn {
@@ -880,6 +892,8 @@ pub fn run() -> Result<()> {
 
     let terminals_model: Rc<VecModel<TerminalState>> = Rc::new(VecModel::default());
     window.set_terminals(ModelRc::from(terminals_model.clone()));
+    let info_tabs_model: Rc<VecModel<InfoState>> = Rc::new(VecModel::default());
+    window.set_info_tabs(ModelRc::from(info_tabs_model.clone()));
 
     // Per-tab connection status + remote resources, the latest local sample,
     // and the local machine's network history (bottom sparkline).
@@ -887,6 +901,7 @@ pub fn run() -> Result<()> {
     let local_snap: LocalSnap = Arc::new(Mutex::new(SystemSnapshot::default()));
     let local_net_hist: NetHist = Arc::new(Mutex::new(vec![0.0; NET_HISTORY_LEN]));
     let hidden_transfer_ids: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let sudo_states: SudoStates = Rc::new(RefCell::new(HashMap::new()));
 
     // --- Wire callbacks --------------------------------------------------
     wire_session_callbacks(
@@ -1570,17 +1585,28 @@ pub fn run() -> Result<()> {
         tab_statuses.clone(),
         tabs_model.clone(),
         terminals_model.clone(),
+        info_tabs_model.clone(),
         handles.clone(),
         bufs.clone(),
         sftp_handles.clone(),
         sftp_last_cwd.clone(),
         sftp_entry_cache.clone(),
         sftp_sort_states.clone(),
+        sudo_states.clone(),
+    );
+    wire_system_info_callbacks(
+        &window,
+        store.clone(),
+        tab_statuses.clone(),
+        tabs_model.clone(),
+        info_tabs_model.clone(),
+        handles.clone(),
     );
     wire_sftp_callbacks(
         &window,
         store.clone(),
         sftp_handles.clone(),
+        sudo_states.clone(),
         sftp_entry_cache.clone(),
         sftp_sort_states.clone(),
     );
@@ -2867,6 +2893,11 @@ fn wire_session_callbacks(
                 sftp_tree_nodes: ModelRc::from(std::rc::Rc::new(
                     VecModel::<SftpTreeNode>::default(),
                 )),
+                sftp_current_user: session.user.trim().into(),
+                sftp_sudo_user: "root".into(),
+                sftp_sudo_active: false,
+                sftp_sudo_available: session.kind == SessionKind::Ssh
+                    && session.user.trim() != "root",
             });
             // Create vt100 parser for this tab (default 24×80; resized on first
             // terminal-resize callback). Scrollback retention is capped by the
@@ -3730,6 +3761,13 @@ fn apply_session_event_to_window(
                 refresh_sidebar(win, statuses, local, local_net_hist, bufs);
             }
         }
+        SessionEvent::SystemInfo {
+            request_id,
+            content,
+            error,
+        } => {
+            update_info_tab_content(win, &request_id, &content, &error);
+        }
 
         // --- SFTP events ---------------------------------------------------
         SessionEvent::CwdChanged(path) => {
@@ -3758,6 +3796,15 @@ fn apply_session_event_to_window(
                 t.sftp_loading = false;
             });
         }
+        SessionEvent::SftpUser { user } => {
+            update_terminal(&|t| {
+                t.sftp_current_user = user.clone().into();
+                t.sftp_sudo_available = !user.trim().eq_ignore_ascii_case("root");
+                if !t.sftp_sudo_available {
+                    t.sftp_sudo_active = false;
+                }
+            });
+        }
         SessionEvent::SftpStatus(msg) => {
             update_terminal(&|t| t.sftp_status = msg.clone().into());
         }
@@ -3779,6 +3826,7 @@ fn apply_session_event_to_window(
             if error.is_empty() {
                 // Open the built-in viewer/editor (#70).
                 win.set_editor_line_numbers(line_numbers_for(&content).into());
+                win.set_editor_tab(tab_id.into());
                 win.set_editor_path(path.into());
                 win.set_editor_name(name.into());
                 win.set_editor_content(content.into());
@@ -4324,18 +4372,77 @@ fn persist_credentials(
 // Tab callbacks
 // ---------------------------------------------------------------------------
 
+fn wire_system_info_callbacks(
+    window: &AppWindow,
+    store: Rc<RefCell<ConfigStore>>,
+    tab_statuses: TabStatuses,
+    tabs_model: Rc<VecModel<TabInfo>>,
+    info_tabs_model: Rc<VecModel<InfoState>>,
+    handles: Rc<RefCell<HashMap<String, SessionHandle>>>,
+) {
+    let weak = window.as_weak();
+    window.on_show_system_info(move || {
+        let Some(w) = weak.upgrade() else { return };
+        let source_tab = w.get_active_tab_id().to_string();
+        if source_tab == "welcome" || !handles.borrow().contains_key(&source_tab) {
+            return;
+        }
+        let title = system_info_title(&store.borrow(), &tab_statuses, &source_tab);
+        let info_id = format!("info-{}", uuid::Uuid::new_v4());
+        tabs_model.push(TabInfo {
+            id: info_id.clone().into(),
+            title: title.clone().into(),
+            kind: "info".into(),
+            connected: true,
+        });
+        info_tabs_model.push(InfoState {
+            id: info_id.clone().into(),
+            title: title.into(),
+            content: String::new().into(),
+            loading: true,
+        });
+        w.set_active_tab_id(info_id.clone().into());
+        if let Some(handle) = handles.borrow().get(&source_tab) {
+            handle.system_info(info_id);
+        }
+    });
+}
+
+fn system_info_title(store: &ConfigStore, statuses: &TabStatuses, tab_id: &str) -> String {
+    let (session_id, host) = statuses
+        .lock()
+        .ok()
+        .and_then(|m| {
+            m.get(tab_id)
+                .map(|st| (st.session_id.clone(), st.host.clone()))
+        })
+        .unwrap_or_default();
+    let name = store
+        .get(&session_id)
+        .map(|s| s.name.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(host);
+    if name.trim().is_empty() {
+        t("服务器 info", "Server info").to_string()
+    } else {
+        format!("{name} info")
+    }
+}
+
 fn wire_tab_callbacks(
     window: &AppWindow,
     store: Rc<RefCell<ConfigStore>>,
     tab_statuses: TabStatuses,
     tabs_model: Rc<VecModel<TabInfo>>,
     terminals_model: Rc<VecModel<TerminalState>>,
+    info_tabs_model: Rc<VecModel<InfoState>>,
     handles: Rc<RefCell<HashMap<String, SessionHandle>>>,
     bufs: TermBuffers,
     sftp_handles: SftpHandles,
     sftp_last_cwd: SftpLastCwd,
     sftp_entry_cache: SftpEntryCache,
     sftp_sort_states: SftpSortStates,
+    sudo_states: SudoStates,
 ) {
     // Selecting a tab is already applied inside the Slint callback; we just
     // need to keep the C++/Rust state in sync if needed.
@@ -4400,12 +4507,14 @@ fn wire_tab_callbacks(
         let tab_statuses = tab_statuses.clone();
         let tabs_model = tabs_model.clone();
         let terminals_model = terminals_model.clone();
+        let info_tabs_model = info_tabs_model.clone();
         let handles = handles.clone();
         let bufs = bufs.clone();
         let sftp_handles = sftp_handles.clone();
         let sftp_last_cwd = sftp_last_cwd.clone();
         let sftp_entry_cache = sftp_entry_cache.clone();
         let sftp_sort_states = sftp_sort_states.clone();
+        let sudo_states = sudo_states.clone();
         window.on_tab_closed(move |id: SharedString| {
             let id = id.to_string();
             if id == "welcome" {
@@ -4450,6 +4559,7 @@ fn wire_tab_callbacks(
             sftp_last_cwd.lock().unwrap().remove(&id);
             sftp_entry_cache.lock().unwrap().remove(&id);
             sftp_sort_states.lock().unwrap().remove(&id);
+            sudo_states.borrow_mut().remove(&id);
             bufs.lock().unwrap().remove(&id);
 
             // Remove from tabs + terminals models.
@@ -4480,6 +4590,20 @@ fn wire_tab_callbacks(
             }
             if let Some(i) = tidx {
                 terminals_model.remove(i);
+            }
+            let mut info_idx = None;
+            for i in 0..info_tabs_model.row_count() {
+                if info_tabs_model
+                    .row_data(i)
+                    .map(|r| r.id.as_str() == id)
+                    .unwrap_or(false)
+                {
+                    info_idx = Some(i);
+                    break;
+                }
+            }
+            if let Some(i) = info_idx {
+                info_tabs_model.remove(i);
             }
 
             // If we closed the active tab, fall back to the welcome page.
@@ -4538,6 +4662,7 @@ fn wire_sftp_callbacks(
     window: &AppWindow,
     store: Rc<RefCell<ConfigStore>>,
     sftp_handles: SftpHandles,
+    sudo_states: SudoStates,
     sftp_entry_cache: SftpEntryCache,
     sftp_sort_states: SftpSortStates,
 ) {
@@ -4593,6 +4718,7 @@ fn wire_sftp_callbacks(
 
     {
         let sftp_handles = sftp_handles.clone();
+        let sudo_states = sudo_states.clone();
         let weak = window.as_weak();
         window.on_sftp_navigate(move |tab_id: SharedString, path: SharedString| {
             let tab_id = tab_id.to_string();
@@ -4619,7 +4745,11 @@ fn wire_sftp_callbacks(
             };
             if let Ok(handles) = sftp_handles.lock() {
                 if let Some(h) = handles.get(&tab_id) {
-                    h.list_dir(resolved);
+                    if let Some(state) = active_sudo_state(&sudo_states, &tab_id) {
+                        h.sudo_list_dir(resolved, state.target_user, state.password);
+                    } else {
+                        h.list_dir(resolved);
+                    }
                 }
             }
         });
@@ -4769,12 +4899,14 @@ fn wire_sftp_callbacks(
     // Upload a local file into the current remote directory.
     {
         let sftp_handles = sftp_handles.clone();
+        let sudo_states = sudo_states.clone();
         let weak = window.as_weak();
         window.on_sftp_upload_clicked(
             move |tab_id: SharedString, remote_dir: SharedString, folder: bool| {
                 let tab_id = tab_id.to_string();
                 let remote_dir = remote_dir.to_string();
                 let sftp_handles = sftp_handles.clone();
+                let sudo_state = sudo_states.borrow().get(&tab_id).cloned();
                 // Session-sync upload (#sync): when both the sync toggle and the
                 // "sync upload" setting are on, mirror the upload to every other
                 // online session — each into *that session's own* current SFTP
@@ -4821,7 +4953,16 @@ fn wire_sftp_callbacks(
                     if let Ok(handles) = sftp_handles.lock() {
                         if let Some(h) = handles.get(&tab_id) {
                             for local in &locals {
-                                h.upload(local.clone(), remote_dir.clone());
+                                if let Some(state) = sudo_state.as_ref().filter(|s| s.active) {
+                                    h.sudo_upload(
+                                        local.clone(),
+                                        remote_dir.clone(),
+                                        state.target_user.clone(),
+                                        state.password.clone(),
+                                    );
+                                } else {
+                                    h.upload(local.clone(), remote_dir.clone());
+                                }
                             }
                         }
                         // Mirror to the other online sessions, each into its own
@@ -4839,15 +4980,105 @@ fn wire_sftp_callbacks(
         );
     }
 
+    {
+        let sudo_states = sudo_states.clone();
+        let weak = window.as_weak();
+        window.on_sftp_sudo_clicked(move |tab_id: SharedString| {
+            let tab_id = tab_id.to_string();
+            if sudo_states
+                .borrow()
+                .get(&tab_id)
+                .map(|s| s.active)
+                .unwrap_or(false)
+            {
+                sudo_states.borrow_mut().remove(&tab_id);
+                if let Some(w) = weak.upgrade() {
+                    set_terminal_row(&w, &tab_id, |row| {
+                        row.sftp_sudo_active = false;
+                        row.sftp_sudo_user = "root".into();
+                        row.sftp_status =
+                            t("已切回普通用户上传", "Switched back to normal uploads").into();
+                    });
+                }
+                return;
+            }
+            if let Some(w) = weak.upgrade() {
+                let login_user = terminal_row(&w, &tab_id)
+                    .map(|t| t.sftp_current_user.to_string())
+                    .unwrap_or_default();
+                if login_user.trim().eq_ignore_ascii_case("root") {
+                    return;
+                }
+                w.set_sudo_prompt_tab(tab_id.into());
+                w.set_sudo_login_user(login_user.into());
+                w.set_sudo_target_user("root".into());
+                w.set_sudo_password("".into());
+                w.set_sudo_prompt_open(true);
+            }
+        });
+    }
+
+    {
+        let sudo_states = sudo_states.clone();
+        let weak = window.as_weak();
+        window.on_sudo_prompt_accept(move || {
+            let Some(w) = weak.upgrade() else { return };
+            let tab_id = w.get_sudo_prompt_tab().to_string();
+            let target_user = {
+                let s = w.get_sudo_target_user().to_string();
+                if s.trim().is_empty() {
+                    "root".to_string()
+                } else {
+                    s.trim().to_string()
+                }
+            };
+            let password = w.get_sudo_password().to_string();
+            sudo_states.borrow_mut().insert(
+                tab_id.clone(),
+                SudoUploadState {
+                    active: true,
+                    target_user: target_user.clone(),
+                    password,
+                },
+            );
+            set_terminal_row(&w, &tab_id, |row| {
+                row.sftp_sudo_active = true;
+                row.sftp_sudo_user = target_user.clone().into();
+                row.sftp_status = t(
+                    "root 视角已启用，后续上传会保留普通用户归属",
+                    "Root view enabled; uploads keep the login user's ownership",
+                )
+                .into();
+            });
+            w.set_sudo_password("".into());
+            w.set_sudo_prompt_open(false);
+        });
+    }
+
+    window.on_sudo_prompt_cancel({
+        let weak = window.as_weak();
+        move || {
+            if let Some(w) = weak.upgrade() {
+                w.set_sudo_password("".into());
+                w.set_sudo_prompt_open(false);
+            }
+        }
+    });
+
     // Refresh the current directory listing.
     {
         let sftp_handles = sftp_handles.clone();
+        let sudo_states = sudo_states.clone();
         window.on_sftp_refresh(move |tab_id: SharedString, path: SharedString| {
             let tab_id = tab_id.to_string();
             let path = path.to_string();
             if let Ok(handles) = sftp_handles.lock() {
                 if let Some(h) = handles.get(&tab_id) {
-                    h.list_dir(path);
+                    if let Some(state) = active_sudo_state(&sudo_states, &tab_id) {
+                        h.sudo_list_dir(path, state.target_user, state.password);
+                    } else {
+                        h.list_dir(path);
+                    }
                 }
             }
         });
@@ -4856,13 +5087,18 @@ fn wire_sftp_callbacks(
     // Toggle tree node expand/collapse and navigate to that directory.
     {
         let sftp_handles = sftp_handles.clone();
+        let sudo_states = sudo_states.clone();
         window.on_sftp_tree_expand(move |tab_id: SharedString, path: SharedString| {
             let tab_id = tab_id.to_string();
             let path = path.to_string();
             if let Ok(handles) = sftp_handles.lock() {
                 if let Some(h) = handles.get(&tab_id) {
                     h.toggle_tree_node(path.clone());
-                    h.list_dir(path);
+                    if let Some(state) = active_sudo_state(&sudo_states, &tab_id) {
+                        h.sudo_list_dir(path, state.target_user, state.password);
+                    } else {
+                        h.list_dir(path);
+                    }
                 }
             }
         });
@@ -4907,20 +5143,37 @@ fn wire_sftp_callbacks(
     // text into the built-in editor instead of an external app (#70).
     {
         let sftp_handles = sftp_handles.clone();
+        let sudo_states = sudo_states.clone();
         window.on_sftp_view(move |tab_id: SharedString, path: SharedString| {
+            let tab_id_s = tab_id.to_string();
             if let Ok(handles) = sftp_handles.lock() {
-                if let Some(h) = handles.get(tab_id.as_str()) {
-                    h.read_text(path.to_string(), false);
+                if let Some(h) = handles.get(tab_id_s.as_str()) {
+                    if let Some(state) = active_sudo_state(&sudo_states, &tab_id_s) {
+                        h.sudo_read_text(
+                            path.to_string(),
+                            false,
+                            state.target_user,
+                            state.password,
+                        );
+                    } else {
+                        h.read_text(path.to_string(), false);
+                    }
                 }
             }
         });
     }
     {
         let sftp_handles = sftp_handles.clone();
+        let sudo_states = sudo_states.clone();
         window.on_sftp_edit(move |tab_id: SharedString, path: SharedString| {
+            let tab_id_s = tab_id.to_string();
             if let Ok(handles) = sftp_handles.lock() {
-                if let Some(h) = handles.get(tab_id.as_str()) {
-                    h.read_text(path.to_string(), true);
+                if let Some(h) = handles.get(tab_id_s.as_str()) {
+                    if let Some(state) = active_sudo_state(&sudo_states, &tab_id_s) {
+                        h.sudo_read_text(path.to_string(), true, state.target_user, state.password);
+                    } else {
+                        h.read_text(path.to_string(), true);
+                    }
                 }
             }
         });
@@ -4930,10 +5183,22 @@ fn wire_sftp_callbacks(
     // re-uploads on every change.
     {
         let sftp_handles = sftp_handles.clone();
+        let sudo_states = sudo_states.clone();
         window.on_sftp_open_external(move |tab_id: SharedString, path: SharedString| {
+            let tab_id_s = tab_id.to_string();
             if let Ok(handles) = sftp_handles.lock() {
-                if let Some(h) = handles.get(tab_id.as_str()) {
-                    h.open_temp(path.to_string(), false, None);
+                if let Some(h) = handles.get(tab_id_s.as_str()) {
+                    if let Some(state) = active_sudo_state(&sudo_states, &tab_id_s) {
+                        h.sudo_open_temp(
+                            path.to_string(),
+                            false,
+                            None,
+                            state.target_user,
+                            state.password,
+                        );
+                    } else {
+                        h.open_temp(path.to_string(), false, None);
+                    }
                 }
             }
         });
@@ -4941,13 +5206,25 @@ fn wire_sftp_callbacks(
     {
         let store = store.clone();
         let sftp_handles = sftp_handles.clone();
+        let sudo_states = sudo_states.clone();
         window.on_sftp_edit_external(move |tab_id: SharedString, path: SharedString| {
             let Some(editor) = resolve_external_editor_for_path(&store, path.as_str()) else {
                 return;
             };
+            let tab_id_s = tab_id.to_string();
             if let Ok(handles) = sftp_handles.lock() {
-                if let Some(h) = handles.get(tab_id.as_str()) {
-                    h.open_temp(path.to_string(), true, Some(editor));
+                if let Some(h) = handles.get(tab_id_s.as_str()) {
+                    if let Some(state) = active_sudo_state(&sudo_states, &tab_id_s) {
+                        h.sudo_open_temp(
+                            path.to_string(),
+                            true,
+                            Some(editor),
+                            state.target_user,
+                            state.password,
+                        );
+                    } else {
+                        h.open_temp(path.to_string(), true, Some(editor));
+                    }
                 }
             }
         });
@@ -5070,6 +5347,7 @@ fn wire_sftp_callbacks(
     // remote file (#70). Read-only (view) sessions never save.
     {
         let sftp_handles = sftp_handles.clone();
+        let sudo_states = sudo_states.clone();
         let weak = window.as_weak();
         window.on_save_file(move || {
             let Some(w) = weak.upgrade() else { return };
@@ -5078,30 +5356,23 @@ fn wire_sftp_callbacks(
             }
             let path = w.get_editor_path().to_string();
             let content = w.get_editor_content().to_string();
-            let tab_id = w.get_active_tab_id().to_string();
-            if let Ok(handles) = sftp_handles.lock() {
-                if let Some(h) = handles.get(&tab_id) {
-                    h.write_text(path, content);
-                }
-            }
+            let tab_id = w.get_editor_tab().to_string();
+            save_editor_content(&sftp_handles, &sudo_states, &tab_id, path, content);
             w.set_editor_dirty(false);
         });
     }
     // Close the editor; in edit mode upload first if there are unsaved edits.
     {
         let sftp_handles = sftp_handles.clone();
+        let sudo_states = sudo_states.clone();
         let weak = window.as_weak();
         window.on_close_editor(move || {
             let Some(w) = weak.upgrade() else { return };
             if !w.get_editor_readonly() && w.get_editor_dirty() {
                 let path = w.get_editor_path().to_string();
                 let content = w.get_editor_content().to_string();
-                let tab_id = w.get_active_tab_id().to_string();
-                if let Ok(handles) = sftp_handles.lock() {
-                    if let Some(h) = handles.get(&tab_id) {
-                        h.write_text(path, content);
-                    }
-                }
+                let tab_id = w.get_editor_tab().to_string();
+                save_editor_content(&sftp_handles, &sudo_states, &tab_id, path, content);
             }
             w.set_editor_open(false);
             w.set_editor_dirty(false);
@@ -6175,6 +6446,65 @@ fn set_terminal_row(win: &AppWindow, tab_id: &str, mutator: impl Fn(&mut Termina
                 mutator(&mut row);
                 model.set_row_data(i, row);
                 break;
+            }
+        }
+    }
+}
+
+fn terminal_row(win: &AppWindow, tab_id: &str) -> Option<TerminalState> {
+    let terminals = win.get_terminals();
+    let model = terminals
+        .as_any()
+        .downcast_ref::<VecModel<TerminalState>>()?;
+    for i in 0..model.row_count() {
+        if let Some(row) = model.row_data(i) {
+            if row.id.as_str() == tab_id {
+                return Some(row);
+            }
+        }
+    }
+    None
+}
+
+fn update_info_tab_content(win: &AppWindow, info_id: &str, content: &str, error: &str) {
+    let info_tabs = win.get_info_tabs();
+    let Some(model) = info_tabs.as_any().downcast_ref::<VecModel<InfoState>>() else {
+        return;
+    };
+    for i in 0..model.row_count() {
+        if let Some(mut row) = model.row_data(i) {
+            if row.id.as_str() == info_id {
+                row.loading = false;
+                row.content = if error.trim().is_empty() {
+                    content.into()
+                } else {
+                    format!(
+                        "{}:\n{}",
+                        t("系统信息加载失败", "Failed to load system info"),
+                        error
+                    )
+                    .into()
+                };
+                model.set_row_data(i, row);
+                break;
+            }
+        }
+    }
+}
+
+fn save_editor_content(
+    sftp_handles: &SftpHandles,
+    sudo_states: &SudoStates,
+    tab_id: &str,
+    path: String,
+    content: String,
+) {
+    if let Ok(handles) = sftp_handles.lock() {
+        if let Some(h) = handles.get(tab_id) {
+            if let Some(state) = active_sudo_state(sudo_states, tab_id) {
+                h.sudo_write_text(path, content, state.target_user, state.password);
+            } else {
+                h.write_text(path, content);
             }
         }
     }

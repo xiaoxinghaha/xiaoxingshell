@@ -46,6 +46,11 @@ struct OwnerMaps {
 pub enum SftpCommand {
     /// List the contents of a remote directory.
     ListDir(String),
+    SudoListDir {
+        path: String,
+        target_user: String,
+        password: String,
+    },
     /// Toggle a directory node in the tree (expand if collapsed, collapse if expanded).
     ToggleTreeNode(String),
     /// Download a remote file to a local directory.
@@ -54,8 +59,22 @@ pub enum SftpCommand {
     DownloadDirZip { remote: String, local_dir: String },
     /// Upload a local file into a remote directory.
     Upload { local: String, remote_dir: String },
+    /// Upload a local file through sudo by staging it in a temp path first.
+    SudoUpload {
+        local: String,
+        remote_dir: String,
+        target_user: String,
+        password: String,
+    },
     /// Upload a local file to an exact remote file path.
     UploadTo { local: String, remote_path: String },
+    SudoUploadTo {
+        local: String,
+        remote_path: String,
+        target_user: String,
+        owner_spec: String,
+        password: String,
+    },
     /// Delete a remote file (falls back to removing an empty directory).
     Delete(String),
     /// Download a file to a temp dir and open it with the OS default app
@@ -65,6 +84,13 @@ pub enum SftpCommand {
         remote: String,
         edit: bool,
         program: Option<String>,
+    },
+    SudoOpenTemp {
+        remote: String,
+        edit: bool,
+        program: Option<String>,
+        target_user: String,
+        password: String,
     },
     /// Rename / move a remote file or directory (#69).
     Rename { from: String, to: String },
@@ -76,8 +102,20 @@ pub enum SftpCommand {
     TouchFile(String),
     /// Read a remote file's text for the built-in viewer/editor (#70).
     ReadText { remote: String, edit: bool },
+    SudoReadText {
+        remote: String,
+        edit: bool,
+        target_user: String,
+        password: String,
+    },
     /// Overwrite a remote file with text from the built-in editor (#70).
     WriteText { remote: String, content: String },
+    SudoWriteText {
+        remote: String,
+        content: String,
+        target_user: String,
+        password: String,
+    },
     /// Gracefully shut down the SFTP worker.
     Close,
 }
@@ -93,6 +131,13 @@ pub struct SftpHandle {
 impl SftpHandle {
     pub fn list_dir(&self, path: String) {
         let _ = self.commands.send(SftpCommand::ListDir(path));
+    }
+    pub fn sudo_list_dir(&self, path: String, target_user: String, password: String) {
+        let _ = self.commands.send(SftpCommand::SudoListDir {
+            path,
+            target_user,
+            password,
+        });
     }
     pub fn download(&self, remote: String, local_dir: String) {
         let _ = self
@@ -114,6 +159,20 @@ impl SftpHandle {
             .commands
             .send(SftpCommand::Upload { local, remote_dir });
     }
+    pub fn sudo_upload(
+        &self,
+        local: String,
+        remote_dir: String,
+        target_user: String,
+        password: String,
+    ) {
+        let _ = self.commands.send(SftpCommand::SudoUpload {
+            local,
+            remote_dir,
+            target_user,
+            password,
+        });
+    }
     pub fn toggle_tree_node(&self, path: String) {
         let _ = self.commands.send(SftpCommand::ToggleTreeNode(path));
     }
@@ -125,6 +184,22 @@ impl SftpHandle {
             remote,
             edit,
             program,
+        });
+    }
+    pub fn sudo_open_temp(
+        &self,
+        remote: String,
+        edit: bool,
+        program: Option<String>,
+        target_user: String,
+        password: String,
+    ) {
+        let _ = self.commands.send(SftpCommand::SudoOpenTemp {
+            remote,
+            edit,
+            program,
+            target_user,
+            password,
         });
     }
     pub fn rename(&self, from: String, to: String) {
@@ -142,10 +217,38 @@ impl SftpHandle {
     pub fn read_text(&self, remote: String, edit: bool) {
         let _ = self.commands.send(SftpCommand::ReadText { remote, edit });
     }
+    pub fn sudo_read_text(
+        &self,
+        remote: String,
+        edit: bool,
+        target_user: String,
+        password: String,
+    ) {
+        let _ = self.commands.send(SftpCommand::SudoReadText {
+            remote,
+            edit,
+            target_user,
+            password,
+        });
+    }
     pub fn write_text(&self, remote: String, content: String) {
         let _ = self
             .commands
             .send(SftpCommand::WriteText { remote, content });
+    }
+    pub fn sudo_write_text(
+        &self,
+        remote: String,
+        content: String,
+        target_user: String,
+        password: String,
+    ) {
+        let _ = self.commands.send(SftpCommand::SudoWriteText {
+            remote,
+            content,
+            target_user,
+            password,
+        });
     }
     pub fn close(&self) {
         let _ = self.commands.send(SftpCommand::Close);
@@ -282,6 +385,7 @@ async fn run_sftp(
     };
 
     // --- Authenticate (same method as the shell session) -------------------
+    let effective_user: String;
     let authed = match session.auth {
         AuthMethod::Password => {
             let (mut user, mut password) =
@@ -296,6 +400,7 @@ async fn run_sftp(
                     .await
                     .context("sftp password auth failed")?;
                 if authed {
+                    effective_user = user.clone();
                     break true;
                 }
                 match crate::ssh::reprompt_credentials(
@@ -323,6 +428,7 @@ async fn run_sftp(
             else {
                 return Err(anyhow!(t("已取消登录", "login cancelled")));
             };
+            effective_user = user.clone();
             handle
                 .authenticate_publickey(&user, key_with_hash)
                 .await
@@ -333,6 +439,13 @@ async fn run_sftp(
     if !authed {
         return Err(anyhow!(t("SFTP 认证失败", "SFTP authentication failed")));
     }
+    let _ = events.send(SessionEvent::SftpUser {
+        user: effective_user.clone(),
+    });
+    let effective_owner_spec = match login_owner_spec(&mut handle, &effective_user).await {
+        Ok(spec) if !spec.trim().is_empty() => spec,
+        _ => effective_user.clone(),
+    };
 
     // --- Open the sftp subsystem channel -----------------------------------
     let channel = handle
@@ -426,6 +539,30 @@ async fn run_sftp(
                     path
                 )));
                 match list_dir_impl(&sftp, &path, &owner_maps).await {
+                    Ok(entries) => {
+                        let _ = events.send(SessionEvent::SftpEntries {
+                            path: path.clone(),
+                            entries,
+                        });
+                        let _ = events.send(SessionEvent::SftpStatus(path));
+                    }
+                    Err(e) => {
+                        let _ = events.send(SessionEvent::SftpError(list_error_msg(&path, &e)));
+                    }
+                }
+            }
+
+            SftpCommand::SudoListDir {
+                path,
+                target_user,
+                password,
+            } => {
+                let _ = events.send(SessionEvent::SftpStatus(format!(
+                    "{} {}...",
+                    t("root 加载", "Root loading"),
+                    path
+                )));
+                match sudo_list_dir_impl(&handle, &path, &target_user, &password).await {
                     Ok(entries) => {
                         let _ = events.send(SessionEvent::SftpEntries {
                             path: path.clone(),
@@ -736,6 +873,117 @@ async fn run_sftp(
                 }
             }
 
+            SftpCommand::SudoUpload {
+                local,
+                remote_dir,
+                target_user,
+                password,
+            } => {
+                let is_dir = tokio::fs::metadata(&local)
+                    .await
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false);
+                if is_dir {
+                    let _ = events.send(SessionEvent::SftpStatus(
+                        t(
+                            "root 视角暂不支持上传文件夹",
+                            "Root view does not support folder upload yet",
+                        )
+                        .into(),
+                    ));
+                    continue;
+                }
+                let filename = base_name(&local);
+                let remote_path = format!("{}/{}", remote_dir.trim_end_matches('/'), filename);
+                let tmp_path = format!(
+                    "/tmp/.meatshell-{}-{}",
+                    Uuid::new_v4(),
+                    sanitize_filename(&filename)
+                );
+                let id = Uuid::new_v4().to_string();
+                let _ = events.send(SessionEvent::SftpStatus(format!(
+                    "{} {}...",
+                    t("root 上传", "Root uploading"),
+                    filename
+                )));
+                let stage_result = upload_pipelined(
+                    &handle,
+                    &ui_tab_id,
+                    &local,
+                    &tmp_path,
+                    &filename,
+                    &id,
+                    &events,
+                    &cancelled_transfers,
+                )
+                .await;
+                let result = match stage_result {
+                    Ok(_) => {
+                        sudo_install_temp_file(
+                            &handle,
+                            &tmp_path,
+                            &remote_path,
+                            &target_user,
+                            &effective_owner_spec,
+                            &password,
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                };
+                match result {
+                    Ok(_) => {
+                        let _ = remove_remote_temp(&handle, &tmp_path).await;
+                        if let Ok(entries) =
+                            sudo_list_dir_impl(&handle, &remote_dir, &target_user, &password).await
+                        {
+                            let _ = events.send(SessionEvent::SftpEntries {
+                                path: remote_dir.clone(),
+                                entries,
+                            });
+                        }
+                        emit_transfer(
+                            &events,
+                            &id,
+                            &ui_tab_id,
+                            &filename,
+                            &local,
+                            &remote_path,
+                            true,
+                            1,
+                            1,
+                            1,
+                            &t("已通过 root 视角上传", "Uploaded through root view"),
+                        );
+                        let _ = events.send(SessionEvent::SftpStatus(format!(
+                            "{}: {}",
+                            t("root 上传完成", "Root upload complete"),
+                            filename
+                        )));
+                    }
+                    Err(e) => {
+                        let _ = remove_remote_temp(&handle, &tmp_path).await;
+                        emit_transfer(
+                            &events,
+                            &id,
+                            &ui_tab_id,
+                            &filename,
+                            &local,
+                            &remote_path,
+                            true,
+                            0,
+                            0,
+                            2,
+                            &e.to_string(),
+                        );
+                        let _ = events.send(SessionEvent::SftpStatus(format!(
+                            "{}: {e}",
+                            t("root 上传失败", "Root upload failed")
+                        )));
+                    }
+                }
+            }
+
             SftpCommand::UploadTo { local, remote_path } => {
                 let filename = base_name(&remote_path);
                 let remote_dir = parent_dir(&remote_path);
@@ -806,6 +1054,104 @@ async fn run_sftp(
                         let _ = events.send(SessionEvent::SftpStatus(format!(
                             "{}: {e}",
                             t("上传失败", "Upload failed")
+                        )));
+                    }
+                }
+            }
+
+            SftpCommand::SudoUploadTo {
+                local,
+                remote_path,
+                target_user,
+                owner_spec,
+                password,
+            } => {
+                let filename = base_name(&remote_path);
+                let remote_dir = parent_dir(&remote_path);
+                let tmp_path = format!(
+                    "/tmp/.meatshell-{}-{}",
+                    Uuid::new_v4(),
+                    sanitize_filename(&filename)
+                );
+                let id = Uuid::new_v4().to_string();
+                let _ = events.send(SessionEvent::SftpStatus(format!(
+                    "{} {}...",
+                    t("root 上传", "Root uploading"),
+                    filename
+                )));
+                let result = match upload_pipelined(
+                    &handle,
+                    &ui_tab_id,
+                    &local,
+                    &tmp_path,
+                    &filename,
+                    &id,
+                    &events,
+                    &cancelled_transfers,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        sudo_install_temp_file(
+                            &handle,
+                            &tmp_path,
+                            &remote_path,
+                            &target_user,
+                            &owner_spec,
+                            &password,
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                };
+                match result {
+                    Ok(_) => {
+                        let _ = remove_remote_temp(&handle, &tmp_path).await;
+                        if let Ok(entries) =
+                            sudo_list_dir_impl(&handle, &remote_dir, &target_user, &password).await
+                        {
+                            let _ = events.send(SessionEvent::SftpEntries {
+                                path: remote_dir.clone(),
+                                entries,
+                            });
+                        }
+                        emit_transfer(
+                            &events,
+                            &id,
+                            &ui_tab_id,
+                            &filename,
+                            &local,
+                            &remote_path,
+                            true,
+                            1,
+                            1,
+                            1,
+                            &t("root 保存已上传", "Root save uploaded"),
+                        );
+                        let _ = events.send(SessionEvent::SftpStatus(format!(
+                            "{}: {}",
+                            t("root 保存已上传", "Root save uploaded"),
+                            filename
+                        )));
+                    }
+                    Err(e) => {
+                        let _ = remove_remote_temp(&handle, &tmp_path).await;
+                        emit_transfer(
+                            &events,
+                            &id,
+                            &ui_tab_id,
+                            &filename,
+                            &local,
+                            &remote_path,
+                            true,
+                            0,
+                            0,
+                            2,
+                            &e.to_string(),
+                        );
+                        let _ = events.send(SessionEvent::SftpStatus(format!(
+                            "{}: {e}",
+                            t("root 上传失败", "Root upload failed")
                         )));
                     }
                 }
@@ -1050,6 +1396,75 @@ async fn run_sftp(
                     }
                 }
             }
+            SftpCommand::SudoOpenTemp {
+                remote,
+                edit,
+                program,
+                target_user,
+                password,
+            } => {
+                let filename = temp_edit_filename(&session, &remote, edit);
+                let tmp_dir = std::env::temp_dir().join("xiaoxingshell");
+                let _ = tokio::fs::create_dir_all(&tmp_dir).await;
+                let local = tmp_dir.join(&filename);
+                let local_str = local.to_string_lossy().to_string();
+                let _ = events.send(SessionEvent::SftpStatus(format!(
+                    "{} {}...",
+                    t("root 打开", "Root opening"),
+                    filename
+                )));
+                match sudo_read_file_to_local(&handle, &remote, &local_str, &target_user, &password)
+                    .await
+                {
+                    Ok(owner_spec) => {
+                        let launch = match program.as_deref() {
+                            Some(p) => open_with_program(p, &local_str).map(Some),
+                            None => {
+                                open_with_os(&local_str);
+                                Ok(None)
+                            }
+                        };
+                        match launch {
+                            Ok(child) => {
+                                let _ = events.send(SessionEvent::SftpStatus(format!(
+                                    "{}: {}",
+                                    if edit {
+                                        t("已打开 root 编辑", "Opened for root editing")
+                                    } else {
+                                        t("已打开", "Opened")
+                                    },
+                                    filename
+                                )));
+                                if edit {
+                                    spawn_sudo_edit_watcher(
+                                        self_tx.clone(),
+                                        local_str,
+                                        remote.clone(),
+                                        filename,
+                                        target_user,
+                                        owner_spec,
+                                        password,
+                                        events.clone(),
+                                        child,
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                let _ = events.send(SessionEvent::SftpStatus(format!(
+                                    "{}: {e}",
+                                    t("打开失败", "Open failed")
+                                )));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = events.send(SessionEvent::SftpStatus(format!(
+                            "{}: {e}",
+                            t("打开失败", "Open failed")
+                        )));
+                    }
+                }
+            }
             SftpCommand::ReadText { remote, edit } => {
                 let name = base_name(&remote);
                 let _ = events.send(SessionEvent::SftpStatus(format!(
@@ -1069,6 +1484,31 @@ async fn run_sftp(
                     error,
                 });
             }
+            SftpCommand::SudoReadText {
+                remote,
+                edit,
+                target_user,
+                password,
+            } => {
+                let name = base_name(&remote);
+                let _ = events.send(SessionEvent::SftpStatus(format!(
+                    "{} {}...",
+                    t("root 打开", "Root opening"),
+                    name
+                )));
+                let (content, error) =
+                    match sudo_read_text_guarded(&handle, &remote, &target_user, &password).await {
+                        Ok(text) => (text, String::new()),
+                        Err(msg) => (String::new(), msg),
+                    };
+                let _ = events.send(SessionEvent::SftpFileText {
+                    path: remote,
+                    name,
+                    content,
+                    edit,
+                    error,
+                });
+            }
             SftpCommand::WriteText { remote, content } => {
                 let name = base_name(&remote);
                 match write_text_file(&sftp, &remote, &content).await {
@@ -1076,6 +1516,38 @@ async fn run_sftp(
                         let _ = events.send(SessionEvent::SftpStatus(format!(
                             "{}: {}",
                             t("已保存", "Saved"),
+                            name
+                        )));
+                    }
+                    Err(e) => {
+                        let _ = events.send(SessionEvent::SftpStatus(format!(
+                            "{}: {e:#}",
+                            t("保存失败", "Save failed")
+                        )));
+                    }
+                }
+            }
+            SftpCommand::SudoWriteText {
+                remote,
+                content,
+                target_user,
+                password,
+            } => {
+                let name = base_name(&remote);
+                match sudo_write_text_preserve_owner(
+                    &sftp,
+                    &handle,
+                    &remote,
+                    &content,
+                    &target_user,
+                    &password,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        let _ = events.send(SessionEvent::SftpStatus(format!(
+                            "{}: {}",
+                            t("root 已保存", "Root saved"),
                             name
                         )));
                     }
@@ -1405,6 +1877,89 @@ fn spawn_edit_watcher(
                     let _ = events.send(SessionEvent::SftpStatus(format!(
                         "{}: {}",
                         t("编辑器关闭后已上传", "Uploaded after editor closed"),
+                        filename
+                    )));
+                }
+                break;
+            }
+        }
+    });
+}
+
+fn spawn_sudo_edit_watcher(
+    self_tx: UnboundedSender<SftpCommand>,
+    local: String,
+    remote: String,
+    filename: String,
+    target_user: String,
+    owner_spec: String,
+    password: String,
+    events: UnboundedSender<SessionEvent>,
+    child: Option<std::process::Child>,
+) {
+    tokio::spawn(async move {
+        use std::time::{Duration, Instant};
+
+        let mut last = local_mtime(local.clone()).await;
+        let mut last_content = local_bytes(local.clone()).await;
+        let mut child = child;
+        let started = Instant::now();
+        let detached_launch_grace = Duration::from_secs(10);
+        for _ in 0..1200 {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if self_tx.is_closed() {
+                break;
+            }
+            let cur = local_mtime(local.clone()).await;
+            if cur.is_some() && cur != last {
+                let cur_content = local_bytes(local.clone()).await;
+                if let Some(cur_content) = cur_content {
+                    let changed = Some(cur_content.clone()) != last_content;
+                    last = cur;
+                    if changed {
+                        last_content = Some(cur_content);
+                        let _ = self_tx.send(SftpCommand::SudoUploadTo {
+                            local: local.clone(),
+                            remote_path: remote.clone(),
+                            target_user: target_user.clone(),
+                            owner_spec: owner_spec.clone(),
+                            password: password.clone(),
+                        });
+                        let _ = events.send(SessionEvent::SftpStatus(format!(
+                            "{}: {}",
+                            t("root 已上传修改", "Root re-uploaded changes"),
+                            filename
+                        )));
+                    } else {
+                        last_content = Some(cur_content);
+                    }
+                }
+            }
+            let exited = if let Some(proc) = child.as_mut() {
+                proc.try_wait().ok().flatten().is_some()
+            } else {
+                false
+            };
+            if exited {
+                if started.elapsed() < detached_launch_grace {
+                    child = None;
+                    continue;
+                }
+                let final_content = local_bytes(local.clone()).await;
+                if final_content.is_some() && final_content != last_content {
+                    let _ = self_tx.send(SftpCommand::SudoUploadTo {
+                        local: local.clone(),
+                        remote_path: remote.clone(),
+                        target_user: target_user.clone(),
+                        owner_spec: owner_spec.clone(),
+                        password: password.clone(),
+                    });
+                    let _ = events.send(SessionEvent::SftpStatus(format!(
+                        "{}: {}",
+                        t(
+                            "root 编辑器关闭后已上传",
+                            "Root uploaded after editor closed"
+                        ),
                         filename
                     )));
                 }
@@ -1896,6 +2451,362 @@ async fn run_remote_exec(handle: &client::Handle<SftpClientHandler>, cmd: &str) 
                 Err(anyhow!(remote_zip_error_message(255, detail)))
             }
         }
+    }
+}
+
+async fn sudo_install_temp_file(
+    handle: &client::Handle<SftpClientHandler>,
+    tmp_path: &str,
+    remote_path: &str,
+    target_user: &str,
+    owner_spec: &str,
+    password: &str,
+) -> Result<()> {
+    let target = if target_user.trim().is_empty() {
+        "root"
+    } else {
+        target_user.trim()
+    };
+    let owner = owner_spec.trim();
+    let chown = if owner.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " && chown {} {}",
+            shell_quote(owner),
+            shell_quote(remote_path)
+        )
+    };
+    let inner = format!(
+        "install -m 0644 {} {}{}",
+        shell_quote(tmp_path),
+        shell_quote(remote_path),
+        chown
+    );
+    let cmd = format!(
+        "sudo -S -p '' -u {} sh -c {}",
+        shell_quote(target),
+        shell_quote(&inner)
+    );
+    run_remote_exec_with_stdin(handle, &cmd, &format!("{password}\n")).await
+}
+
+async fn login_owner_spec(
+    handle: &mut client::Handle<SftpClientHandler>,
+    user: &str,
+) -> Result<String> {
+    let user = user.trim();
+    if user.is_empty() {
+        return Ok(String::new());
+    }
+    let cmd = format!("id -gn {}", shell_quote(user));
+    let group = run_remote_exec_capture(handle, &cmd)
+        .await?
+        .trim()
+        .to_string();
+    if group.is_empty() {
+        Ok(user.to_string())
+    } else {
+        Ok(format!("{user}:{group}"))
+    }
+}
+
+async fn sudo_list_dir_impl(
+    handle: &client::Handle<SftpClientHandler>,
+    path: &str,
+    target_user: &str,
+    password: &str,
+) -> Result<Vec<RemoteEntry>> {
+    let script = format!(
+        "find {} -mindepth 1 -maxdepth 1 -printf '%f\\t%p\\t%y\\t%s\\t%T@\\t%m\\t%u:%g\\n'",
+        shell_quote(path)
+    );
+    let output = run_sudo_capture(handle, target_user, password, &script).await?;
+    parse_sudo_find_listing(&output)
+}
+
+async fn sudo_read_text_guarded(
+    handle: &client::Handle<SftpClientHandler>,
+    remote: &str,
+    target_user: &str,
+    password: &str,
+) -> std::result::Result<String, String> {
+    let script = format!(
+        "size=$(wc -c < {0}) || exit 1; [ \"$size\" -le 2097152 ] || {{ echo __MEATSHELL_TOO_LARGE__; exit 42; }}; cat -- {0}",
+        shell_quote(remote)
+    );
+    match run_sudo_capture(handle, target_user, password, &script).await {
+        Ok(text) => {
+            if text
+                .as_bytes()
+                .iter()
+                .any(|&b| (b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r') || b == 0x7f)
+            {
+                Err(t(
+                    "包含控制字符(疑似二进制),无法以文本打开,请下载查看",
+                    "Contains control characters (likely binary); download it instead",
+                )
+                .into())
+            } else {
+                Ok(text)
+            }
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("__MEATSHELL_TOO_LARGE__") {
+                Err(t(
+                    "文件过大,无法在内置编辑器中打开(上限 2 MB),请下载查看",
+                    "Too large for the built-in editor (2 MB limit); download it instead",
+                )
+                .into())
+            } else {
+                Err(msg)
+            }
+        }
+    }
+}
+
+async fn sudo_read_file_to_local(
+    handle: &client::Handle<SftpClientHandler>,
+    remote: &str,
+    local: &str,
+    target_user: &str,
+    password: &str,
+) -> Result<String> {
+    use tokio::io::AsyncWriteExt;
+    let owner = sudo_owner_spec(handle, remote, target_user, password).await?;
+    let data = run_sudo_capture_bytes(
+        handle,
+        target_user,
+        password,
+        &format!("cat -- {}", shell_quote(remote)),
+    )
+    .await?;
+    let mut f = tokio::fs::File::create(local)
+        .await
+        .with_context(|| format!("create local temp {local}"))?;
+    f.write_all(&data).await.context("write local temp")?;
+    f.flush().await.context("flush local temp")?;
+    Ok(owner)
+}
+
+async fn sudo_write_text_preserve_owner(
+    sftp: &SftpSession,
+    handle: &client::Handle<SftpClientHandler>,
+    remote: &str,
+    content: &str,
+    target_user: &str,
+    password: &str,
+) -> Result<()> {
+    let owner = sudo_owner_spec(handle, remote, target_user, password).await?;
+    let tmp = format!("/tmp/.meatshell-{}-edit", Uuid::new_v4());
+    write_text_file(sftp, &tmp, content).await?;
+    sudo_install_temp_file(handle, &tmp, remote, target_user, &owner, password).await?;
+    let _ = remove_remote_temp(handle, &tmp).await;
+    Ok(())
+}
+
+async fn sudo_owner_spec(
+    handle: &client::Handle<SftpClientHandler>,
+    remote: &str,
+    target_user: &str,
+    password: &str,
+) -> Result<String> {
+    let out = run_sudo_capture(
+        handle,
+        target_user,
+        password,
+        &format!("stat -c '%U:%G' -- {}", shell_quote(remote)),
+    )
+    .await?;
+    Ok(out.trim().to_string())
+}
+
+async fn run_sudo_capture(
+    handle: &client::Handle<SftpClientHandler>,
+    target_user: &str,
+    password: &str,
+    script: &str,
+) -> Result<String> {
+    let bytes = run_sudo_capture_bytes(handle, target_user, password, script).await?;
+    String::from_utf8(bytes).context("remote output is not UTF-8")
+}
+
+async fn run_sudo_capture_bytes(
+    handle: &client::Handle<SftpClientHandler>,
+    target_user: &str,
+    password: &str,
+    script: &str,
+) -> Result<Vec<u8>> {
+    let target = if target_user.trim().is_empty() {
+        "root"
+    } else {
+        target_user.trim()
+    };
+    let cmd = format!(
+        "sudo -S -p '' -u {} sh -c {}",
+        shell_quote(target),
+        shell_quote(script)
+    );
+    run_remote_exec_capture_with_stdin(handle, &cmd, &format!("{password}\n")).await
+}
+
+async fn run_remote_exec_capture(
+    handle: &client::Handle<SftpClientHandler>,
+    cmd: &str,
+) -> Result<String> {
+    let bytes = run_remote_exec_capture_with_stdin(handle, cmd, "").await?;
+    String::from_utf8(bytes).context("remote output is not UTF-8")
+}
+
+async fn run_remote_exec_capture_with_stdin(
+    handle: &client::Handle<SftpClientHandler>,
+    cmd: &str,
+    stdin: &str,
+) -> Result<Vec<u8>> {
+    let mut channel = handle
+        .channel_open_session()
+        .await
+        .context("open remote exec channel")?;
+    channel
+        .exec(true, cmd.as_bytes())
+        .await
+        .context("start remote exec")?;
+    if !stdin.is_empty() {
+        channel
+            .data(stdin.as_bytes())
+            .await
+            .context("write remote exec stdin")?;
+    }
+    let _ = channel.eof().await;
+
+    let mut stdout = Vec::new();
+    let mut stderr = String::new();
+    let mut exit_status: Option<u32> = None;
+    while let Some(msg) = channel.wait().await {
+        match msg {
+            ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
+            ChannelMsg::ExtendedData { data, ext: _ } => {
+                stderr.push_str(&String::from_utf8_lossy(&data));
+            }
+            ChannelMsg::ExitStatus { exit_status: code } => exit_status = Some(code),
+            ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+
+    match exit_status {
+        Some(0) => Ok(stdout),
+        Some(code) => Err(anyhow!("remote command exited {code}: {}", stderr.trim())),
+        None => Err(anyhow!("remote command failed: no exit status received")),
+    }
+}
+
+fn parse_sudo_find_listing(output: &str) -> Result<Vec<RemoteEntry>> {
+    let mut entries = Vec::new();
+    for line in output.lines() {
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() < 7 {
+            continue;
+        }
+        let name = cols[0].to_string();
+        if name == "." || name == ".." {
+            continue;
+        }
+        let full_path = cols[1].to_string();
+        let kind_char = cols[2].chars().next().unwrap_or('f');
+        let is_dir = kind_char == 'd';
+        let size = cols[3].parse::<u64>().unwrap_or(0);
+        let modified = cols[4]
+            .split('.')
+            .next()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        let mode = u32::from_str_radix(cols[5], 8).unwrap_or(0) & 0o7777;
+        let kind = match kind_char {
+            'd' => 0o040_000,
+            'l' => 0o120_000,
+            _ => 0o100_000,
+        };
+        let permissions = kind | mode;
+        entries.push(RemoteEntry {
+            file_type: file_type_label(kind, &name),
+            name,
+            full_path,
+            is_dir,
+            size,
+            modified,
+            mode,
+            mode_text: format_mode(permissions),
+            owner_group: cols[6].to_string(),
+        });
+    }
+    entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+    });
+    Ok(entries)
+}
+
+async fn remove_remote_temp(
+    handle: &client::Handle<SftpClientHandler>,
+    tmp_path: &str,
+) -> Result<()> {
+    run_remote_exec(handle, &format!("rm -f -- {}", shell_quote(tmp_path))).await
+}
+
+async fn run_remote_exec_with_stdin(
+    handle: &client::Handle<SftpClientHandler>,
+    cmd: &str,
+    stdin: &str,
+) -> Result<()> {
+    let mut channel = handle
+        .channel_open_session()
+        .await
+        .context("open remote exec channel")?;
+    channel
+        .exec(true, cmd.as_bytes())
+        .await
+        .context("start remote exec")?;
+    if !stdin.is_empty() {
+        channel
+            .data(stdin.as_bytes())
+            .await
+            .context("write remote exec stdin")?;
+    }
+    let _ = channel.eof().await;
+
+    let mut stderr = String::new();
+    let mut stdout = String::new();
+    let mut exit_status: Option<u32> = None;
+    while let Some(msg) = channel.wait().await {
+        match msg {
+            ChannelMsg::ExtendedData { data, ext: _ } => {
+                stderr.push_str(&String::from_utf8_lossy(&data));
+            }
+            ChannelMsg::Data { data } => {
+                stdout.push_str(&String::from_utf8_lossy(&data));
+            }
+            ChannelMsg::ExitStatus { exit_status: code } => {
+                exit_status = Some(code);
+            }
+            ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+
+    match exit_status {
+        Some(0) => Ok(()),
+        Some(code) => {
+            let detail = if stderr.trim().is_empty() {
+                stdout.trim()
+            } else {
+                stderr.trim()
+            };
+            Err(anyhow!("remote command exited {code}: {detail}"))
+        }
+        None => Err(anyhow!("remote command failed: no exit status received")),
     }
 }
 

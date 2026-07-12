@@ -101,6 +101,10 @@ export component TerminalView inherits Rectangle {
     in property <string>  sftp-status: "";
     in property <bool>    sftp-loading: false;
     in property <[SftpTreeNode]> sftp-tree-nodes: [];
+    in property <string> sftp-current-user: "";
+    in property <string> sftp-sudo-user: "";
+    in property <bool> sftp-sudo-active: false;
+    in property <bool> sftp-sudo-available: false;
 
     in-out property <length> sftp-panel-height: 220px;
     // Shared with the AppWindow (like sftp-panel-height) so a startup default can
@@ -138,6 +142,7 @@ export component TerminalView inherits Rectangle {
     callback sftp-download-folder-zip(string);
     callback sftp-download-range(int, int);
     callback sftp-upload-clicked(string, bool);
+    callback sftp-sudo-clicked();
     callback sftp-refresh(string);
     callback sftp-tree-expand(string);
     callback sftp-delete(string);
@@ -1116,6 +1121,10 @@ export component TerminalView inherits Rectangle {
             status:        root.sftp-status;
             loading:       root.sftp-loading;
             tree-nodes:    root.sftp-tree-nodes;
+            current-user:   root.sftp-current-user;
+            sudo-user:      root.sftp-sudo-user;
+            sudo-active:    root.sftp-sudo-active;
+            sudo-available: root.sftp-sudo-available;
             toggle-collapsed => {
                 if (root.sftp-collapsed) {
                     // Restore to the saved height.
@@ -1141,6 +1150,7 @@ export component TerminalView inherits Rectangle {
             download-folder-zip(path) => { root.sftp-download-folder-zip(path); }
             download-range(start, end) => { root.sftp-download-range(start, end); }
             upload-clicked(dir, folder) => { root.sftp-upload-clicked(dir, folder); }
+            sudo-clicked => { root.sftp-sudo-clicked(); }
             refresh(path)       => { root.sftp-refresh(path); }
             tree-expand(path)   => { root.sftp-tree-expand(path); }
             delete(path)        => { root.sftp-delete(path); }

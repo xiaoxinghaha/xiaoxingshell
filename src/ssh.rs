@@ -249,6 +249,8 @@ pub enum SessionCommand {
     RawInput(Vec<u8>),
     /// Notify the remote PTY of a terminal resize.
     Resize(u32, u32),
+    /// Collect a one-shot read-only system overview over a separate exec channel.
+    RunSystemInfo { request_id: String },
     /// Gracefully disconnect and drop the session.
     Close,
 }
@@ -369,6 +371,12 @@ pub enum SessionEvent {
         /// Per-filesystem (mount_point, available_bytes, total_bytes).
         disks: Vec<(String, u64, u64)>,
     },
+    /// One-shot remote system overview for the "server info" tab.
+    SystemInfo {
+        request_id: String,
+        content: String,
+        error: String,
+    },
 
     /// A command the user ran in the terminal, captured via the shell hook
     /// (OSC 697) so it can join the command-box history (#113).
@@ -382,6 +390,8 @@ pub enum SessionEvent {
         path: String,
         entries: Vec<RemoteEntry>,
     },
+    /// Effective SFTP login user, used by the toolbar's sudo/root upload switch.
+    SftpUser { user: String },
     /// Free-form SFTP status message (progress, errors, etc.).
     SftpStatus(String),
     /// A directory listing failed (e.g. permission denied): show the message and
@@ -431,6 +441,12 @@ impl SessionHandle {
 
     pub fn resize(&self, cols: u32, rows: u32) {
         let _ = self.commands.send(SessionCommand::Resize(cols, rows));
+    }
+
+    pub fn system_info(&self, request_id: String) {
+        let _ = self
+            .commands
+            .send(SessionCommand::RunSystemInfo { request_id });
     }
 
     pub fn close(&self) {
@@ -825,6 +841,21 @@ async fn run_session(
                     Some(SessionCommand::Resize(cols, rows)) => {
                         let _ = channel.window_change(cols, rows, 0, 0).await;
                     }
+                    Some(SessionCommand::RunSystemInfo { request_id }) => {
+                        let handle = handle.clone();
+                        let events = events.clone();
+                        tokio::spawn(async move {
+                            let (content, error) = match collect_system_info(&handle).await {
+                                Ok(text) => (text, String::new()),
+                                Err(err) => (String::new(), err.to_string()),
+                            };
+                            let _ = events.send(SessionEvent::SystemInfo {
+                                request_id,
+                                content,
+                                error,
+                            });
+                        });
+                    }
                     Some(SessionCommand::Close) | None => {
                         let _ = channel.eof().await;
                         break;
@@ -1019,6 +1050,75 @@ async fn run_session(
         t("连接已关闭", "connection closed").into(),
     ));
     Ok(())
+}
+
+async fn collect_system_info(handle: &Handle<ClientHandler>) -> Result<String> {
+    const CMD: &str = r#"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH
+printf '===== Basic =====\n'
+printf 'User: '; whoami 2>/dev/null || true
+printf 'Host: '; hostname 2>/dev/null || true
+printf 'Kernel: '; uname -a 2>/dev/null || true
+printf 'Uptime: '; (uptime -p 2>/dev/null || uptime 2>/dev/null || true)
+printf '\n===== CPU =====\n'
+(lscpu 2>/dev/null | sed -n '1,12p') || (grep -m1 'model name' /proc/cpuinfo 2>/dev/null; grep -c '^processor' /proc/cpuinfo 2>/dev/null)
+printf '\n===== Memory =====\n'
+free -h 2>/dev/null || sed -n '1,8p' /proc/meminfo 2>/dev/null
+printf '\n===== Disk =====\n'
+df -hT 2>/dev/null | sed -n '1,12p'
+printf '\n===== Network =====\n'
+(ip -brief addr 2>/dev/null || ifconfig 2>/dev/null || true) | sed -n '1,20p'
+printf '\n===== Login =====\n'
+(last -n 5 2>/dev/null || who 2>/dev/null || true)
+"#;
+    let mut channel = handle
+        .channel_open_session()
+        .await
+        .context("open system info channel")?;
+    channel
+        .exec(true, CMD.as_bytes())
+        .await
+        .context("start system info command")?;
+
+    let mut output = String::new();
+    let mut stderr = String::new();
+    let mut exit_status: Option<u32> = None;
+    while let Some(msg) = channel.wait().await {
+        match msg {
+            ChannelMsg::Data { data } => output.push_str(&String::from_utf8_lossy(&data)),
+            ChannelMsg::ExtendedData { data, ext: _ } => {
+                stderr.push_str(&String::from_utf8_lossy(&data));
+            }
+            ChannelMsg::ExitStatus { exit_status: code } => exit_status = Some(code),
+            ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+
+    match exit_status {
+        Some(0) => Ok(output),
+        Some(code) => {
+            if output.trim().is_empty() {
+                Err(anyhow!(
+                    "system info command exited {code}: {}",
+                    stderr.trim()
+                ))
+            } else {
+                Ok(format!(
+                    "{output}\n[meatshell] system info command exited {code}: {}",
+                    stderr.trim()
+                ))
+            }
+        }
+        None => {
+            if output.trim().is_empty() {
+                Err(anyhow!(
+                    "system info command failed: no exit status received"
+                ))
+            } else {
+                Ok(output)
+            }
+        }
+    }
 }
 
 /// Parse one monitor sample (a block of `/proc/stat` cpu line + `/proc/meminfo`
