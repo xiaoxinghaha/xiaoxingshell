@@ -1549,7 +1549,7 @@ export component AppWindow inherits Window {
                                     x: 0;
                                     y: 8px + ed-scroll.viewport-y;
                                     width: parent.width - 6px;
-                                    height: self.preferred-height;
+                                    height: max(24px, self.preferred-height);
                                     text: root.editor-line-numbers;
                                     horizontal-alignment: right;
                                     font-family: Theme.ui-font-family;
@@ -1560,12 +1560,12 @@ export component AppWindow inherits Window {
                             Rectangle { width: 1px; background: Theme.border-subtle; }
                             ed-scroll := ScrollView {
                                 viewport-width: max(self.visible-width, edit-input.preferred-width + 16px);
-                                viewport-height: max(self.visible-height, edit-input.preferred-height + 16px);
+                                viewport-height: max(self.visible-height, max(24px, edit-input.preferred-height) + 16px);
                                 edit-input := TextInput {
                                     x: 8px;
                                     y: 8px;
                                     width: max(parent.visible-width - 16px, self.preferred-width);
-                                    height: self.preferred-height;
+                                    height: max(24px, self.preferred-height);
                                     text <=> root.editor-content;
                                     read-only: root.editor-readonly;
                                     single-line: false;
