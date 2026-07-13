@@ -216,7 +216,8 @@ struct TabStatus {
     host: String,       // display address / endpoint
     session_id: String, // saved-session id, used to reconnect in place (#79)
     state: u8,          // 0 = connecting, 1 = connected, 2 = disconnected
-    cpu: f32,           // 0.0..1.0
+    sftp_home: String,
+    cpu: f32, // 0.0..1.0
     mem_used_kib: u64,
     mem_total_kib: u64,
     swap_used_kib: u64,
@@ -3245,9 +3246,6 @@ fn schedule_input_cd_follow(ctx: &ConnectCtx, tab_id: &str, dir: String) {
     {
         return;
     }
-    if let Ok(mut map) = ctx.sftp_last_cwd.lock() {
-        map.insert(tab_id.to_string(), dir.clone());
-    }
     schedule_sftp_follow_dir(
         ctx.runtime.clone(),
         ctx.sftp_handles.clone(),
@@ -3831,6 +3829,13 @@ fn apply_session_event_to_window(
                 t.sftp_entries = model.clone();
                 t.sftp_loading = false;
             });
+            if let Ok(mut map) = statuses.lock() {
+                if let Some(st) = map.get_mut(tab_id) {
+                    if st.sftp_home.trim().is_empty() {
+                        st.sftp_home = path.clone();
+                    }
+                }
+            }
         }
         SessionEvent::SftpUser { user } => {
             update_terminal(&|t| {
@@ -5921,8 +5926,21 @@ fn wire_key_input(
                     .lock()
                     .unwrap()
                     .get(tid.as_str())
-                    .cloned();
-                resolve_cd_follow_target(line, cwd.as_deref())
+                    .cloned()
+                    .or_else(|| {
+                        ctx.weak.upgrade().and_then(|w| {
+                            let path = active_sftp_path(&w, tid.as_str());
+                            (!path.trim().is_empty()).then_some(path)
+                        })
+                    });
+                let home = ctx
+                    .tab_statuses
+                    .lock()
+                    .unwrap()
+                    .get(tid.as_str())
+                    .map(|st| st.sftp_home.clone())
+                    .filter(|home| !home.trim().is_empty());
+                resolve_cd_follow_target(line, cwd.as_deref(), home.as_deref())
             });
             if snapped_to_live || repaint_after_local {
                 pending_ui_refresh.lock().unwrap().push(tid.clone());
@@ -7637,14 +7655,28 @@ fn cd_candidate_possible(line: &str) -> bool {
         })
 }
 
-fn resolve_cd_follow_target(cmd: &str, cwd: Option<&str>) -> Option<String> {
+fn resolve_cd_follow_target(cmd: &str, cwd: Option<&str>, home: Option<&str>) -> Option<String> {
     let words = split_shell_words(cmd);
     let first = words.first()?;
     if first != "cd" {
         return None;
     }
     let target = words.get(1).map(|s| s.as_str()).unwrap_or("");
-    if target.is_empty() || target == "-" || target.starts_with('~') {
+    if target.is_empty() || target == "-" {
+        return None;
+    }
+    if target == "~" {
+        return home.map(normalize_remote_abs_path);
+    }
+    if let Some(rest) = target.strip_prefix("~/") {
+        let home = home?;
+        return Some(normalize_remote_abs_path(&format!(
+            "{}/{}",
+            home.trim_end_matches('/'),
+            rest
+        )));
+    }
+    if target.starts_with('~') {
         return None;
     }
     if target.starts_with('/') {
@@ -8949,25 +8981,55 @@ mod key_tests {
     #[test]
     fn resolves_cd_follow_targets_for_tmux_fallback() {
         assert_eq!(
-            resolve_cd_follow_target("cd /var/log", Some("/home/demo")).as_deref(),
+            resolve_cd_follow_target("cd /var/log", Some("/home/demo"), Some("/home/demo"))
+                .as_deref(),
             Some("/var/log")
         );
         assert_eq!(
-            resolve_cd_follow_target(" cd ../etc ", Some("/home/demo/project")).as_deref(),
+            resolve_cd_follow_target(
+                " cd ../etc ",
+                Some("/home/demo/project"),
+                Some("/home/demo"),
+            )
+            .as_deref(),
             Some("/home/demo/etc")
         );
         assert_eq!(
-            resolve_cd_follow_target("cd ./src", Some("/home/demo/project")).as_deref(),
+            resolve_cd_follow_target("cd ./src", Some("/home/demo/project"), Some("/home/demo"))
+                .as_deref(),
             Some("/home/demo/project/src")
         );
         assert_eq!(
-            resolve_cd_follow_target("cd \"/opt/my app\"", Some("/home/demo")).as_deref(),
+            resolve_cd_follow_target("cd aaa", Some("/home/demo/project"), Some("/home/demo"))
+                .as_deref(),
+            Some("/home/demo/project/aaa")
+        );
+        assert_eq!(
+            resolve_cd_follow_target("cd ~", Some("/home/demo/project"), Some("/home/demo"))
+                .as_deref(),
+            Some("/home/demo")
+        );
+        assert_eq!(
+            resolve_cd_follow_target("cd ~/aaa", Some("/tmp"), Some("/home/demo")).as_deref(),
+            Some("/home/demo/aaa")
+        );
+        assert_eq!(
+            resolve_cd_follow_target("cd \"/opt/my app\"", Some("/home/demo"), Some("/home/demo"))
+                .as_deref(),
             Some("/opt/my app")
         );
-        assert!(resolve_cd_follow_target("echo cd /tmp", Some("/home/demo")).is_none());
-        assert!(resolve_cd_follow_target("cdx /tmp", Some("/home/demo")).is_none());
-        assert!(resolve_cd_follow_target("cd", Some("/home/demo")).is_none());
-        assert!(resolve_cd_follow_target("cd -", Some("/home/demo")).is_none());
+        assert!(
+            resolve_cd_follow_target("echo cd /tmp", Some("/home/demo"), Some("/home/demo"))
+                .is_none()
+        );
+        assert!(
+            resolve_cd_follow_target("cdx /tmp", Some("/home/demo"), Some("/home/demo")).is_none()
+        );
+        assert!(resolve_cd_follow_target("cd", Some("/home/demo"), Some("/home/demo")).is_none());
+        assert!(resolve_cd_follow_target("cd -", Some("/home/demo"), Some("/home/demo")).is_none());
+        assert!(
+            resolve_cd_follow_target("cd ~other", Some("/home/demo"), Some("/home/demo")).is_none()
+        );
     }
 
     #[test]
