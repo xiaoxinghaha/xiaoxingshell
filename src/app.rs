@@ -1773,10 +1773,17 @@ pub fn run() -> Result<()> {
         let minimize_resize_guard = minimize_resize_guard.clone();
         window.window().on_winit_window_event(move |_w, event| {
             match event {
+                WEvent::HoveredFile(_) => {
+                    return EventResult::PreventDefault;
+                }
+                WEvent::HoveredFileCancelled => {
+                    return EventResult::PreventDefault;
+                }
                 WEvent::DroppedFile(path) => {
                     if let Some(win) = weak.upgrade() {
                         handle_file_drop(&win, &sh, path.to_string_lossy().to_string());
                     }
+                    return EventResult::PreventDefault;
                 }
                 WEvent::Resized(_) => {
                     // Keep the maximize/restore icon (and resize-edge gating) in
@@ -2069,8 +2076,8 @@ fn cursor_pos() -> Option<(i32, i32)> {
     }
 }
 
-/// Handle an OS file drop: if it landed over the SFTP file-list area of the
-/// active session tab, upload the file to that tab's current remote directory.
+/// Handle an OS file drop: if it landed over the active tab's SFTP panel,
+/// upload the file to that tab's current remote directory.
 #[cfg(windows)]
 fn handle_file_drop(win: &AppWindow, sftp_handles: &SftpHandles, path: String) {
     let active = win.get_active_tab_id().to_string();
@@ -2092,15 +2099,15 @@ fn handle_file_drop(win: &AppWindow, sftp_handles: &SftpHandles, path: String) {
     let w_logical = size.width as f32 / scale;
     let h_logical = size.height as f32 / scale;
     let h_sftp = win.get_sftp_panel_height();
+    if win.get_sftp_collapsed() || h_sftp <= 30.0 {
+        return;
+    }
 
-    // File-list box (logical): right of the sidebar(220)+tree(160)+sep(1),
-    // below the SFTP toolbar(30)+header(20)+sep(1), above the status bar(18).
-    let zone_left = 381.0_f32;
-    let zone_top = h_logical - h_sftp + 51.0;
-    let zone_bottom = h_logical - 18.0;
-    if client_x < zone_left || client_x > w_logical || client_y < zone_top || client_y > zone_bottom
-    {
-        return; // dropped outside the file list — ignore
+    // Accept the whole bottom SFTP panel. Earlier this only accepted the file
+    // list rectangle, which made drops over the toolbar/tree look forbidden.
+    let zone_top = h_logical - h_sftp;
+    if client_x < 0.0 || client_x > w_logical || client_y < zone_top || client_y > h_logical {
+        return; // dropped outside the SFTP panel — ignore
     }
 
     let dir = active_sftp_path(win, &active);
@@ -7636,7 +7643,7 @@ fn update_pending_cd_input(
         return None;
     }
 
-    if key == "\n" {
+    if key == "\n" || key == "\r" {
         rejected.lock().unwrap().remove(tab_id);
         return pending.lock().unwrap().remove(tab_id);
     }
@@ -7654,18 +7661,24 @@ fn update_pending_cd_input(
         }
         return None;
     }
-    if key.chars().count() != 1 {
-        return None;
-    }
-    let ch = key.chars().next().unwrap();
-    if ch.is_control() {
-        return None;
-    }
-
     let mut map = pending.lock().unwrap();
     let entry = map.entry(tab_id.to_string()).or_default();
-    entry.push(ch);
-    if !cd_candidate_possible(entry) {
+    let mut invalid = false;
+    for ch in key.chars() {
+        if ch == '\n' || ch == '\r' {
+            rejected.lock().unwrap().remove(tab_id);
+            return Some(std::mem::take(entry));
+        }
+        if ch.is_control() {
+            continue;
+        }
+        entry.push(ch);
+        if !cd_candidate_possible(entry) {
+            invalid = true;
+            break;
+        }
+    }
+    if invalid {
         map.remove(tab_id);
         rejected.lock().unwrap().insert(tab_id.to_string());
     }
@@ -9081,6 +9094,19 @@ mod key_tests {
         assert!(rejected.lock().unwrap().contains("t1"));
         assert!(update_pending_cd_input(&pending, &rejected, "t1", "\n", false, false).is_none());
         assert!(!rejected.lock().unwrap().contains("t1"));
+
+        for ch in ["c", "d", " ", "a", "a", "a"] {
+            assert!(update_pending_cd_input(&pending, &rejected, "t1", ch, false, false).is_none());
+        }
+        assert_eq!(
+            update_pending_cd_input(&pending, &rejected, "t1", "\r", false, false).as_deref(),
+            Some("cd aaa")
+        );
+
+        assert_eq!(
+            update_pending_cd_input(&pending, &rejected, "t2", "cd bbb\r", false, false).as_deref(),
+            Some("cd bbb")
+        );
     }
 }
 
