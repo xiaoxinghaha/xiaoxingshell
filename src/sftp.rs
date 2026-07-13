@@ -10,6 +10,7 @@
 //! terminal tab.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -116,6 +117,10 @@ pub enum SftpCommand {
         target_user: String,
         password: String,
     },
+    /// Update the periodic SFTP refresh interval for this worker.
+    SetAutoRefreshSecs(u32),
+    /// Internal periodic refresh of the current SFTP directory.
+    RefreshCurrent,
     /// Gracefully shut down the SFTP worker.
     Close,
 }
@@ -253,6 +258,9 @@ impl SftpHandle {
     pub fn close(&self) {
         let _ = self.commands.send(SftpCommand::Close);
     }
+    pub fn set_auto_refresh_secs(&self, secs: u32) {
+        let _ = self.commands.send(SftpCommand::SetAutoRefreshSecs(secs));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -272,6 +280,7 @@ pub fn spawn_sftp(
     events: UnboundedSender<SessionEvent>,
     keepalive_interval_secs: u32,
     disconnect_retry_count: u32,
+    auto_refresh_secs: u32,
 ) -> SftpHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let self_tx = cmd_tx.clone();
@@ -288,6 +297,7 @@ pub fn spawn_sftp(
             cancelled_for_task,
             keepalive_interval_secs,
             disconnect_retry_count,
+            auto_refresh_secs,
         )
         .await
         {
@@ -357,6 +367,7 @@ async fn run_sftp(
     cancelled_transfers: Arc<Mutex<HashSet<String>>>,
     keepalive_interval_secs: u32,
     disconnect_retry_count: u32,
+    auto_refresh_secs: u32,
 ) -> Result<()> {
     let _ = events.send(SessionEvent::SftpStatus(
         t("SFTP 连接中...", "SFTP connecting...").into(),
@@ -527,6 +538,29 @@ async fn run_sftp(
         let _ = events.send(SessionEvent::SftpTreeUpdate(nodes));
     }
 
+    let mut current_dir = home.clone();
+    let mut current_sudo_dir: Option<(String, String, String)> = None;
+    let auto_refresh_secs = Arc::new(AtomicU32::new(auto_refresh_secs.clamp(10, 3600)));
+    {
+        let tx = self_tx.clone();
+        let interval = auto_refresh_secs.clone();
+        tokio::spawn(async move {
+            let mut elapsed = 0u32;
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let secs = interval.load(Ordering::Relaxed).clamp(10, 3600);
+                elapsed = elapsed.saturating_add(1);
+                if elapsed < secs {
+                    continue;
+                }
+                elapsed = 0;
+                if tx.send(SftpCommand::RefreshCurrent).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
     // --- Command loop -------------------------------------------------------
     while let Some(cmd) = commands.recv().await {
         match cmd {
@@ -544,6 +578,8 @@ async fn run_sftp(
                             path: path.clone(),
                             entries,
                         });
+                        current_dir = path.clone();
+                        current_sudo_dir = None;
                         let _ = events.send(SessionEvent::SftpStatus(path));
                     }
                     Err(e) => {
@@ -568,10 +604,48 @@ async fn run_sftp(
                             path: path.clone(),
                             entries,
                         });
+                        current_dir = path.clone();
+                        current_sudo_dir =
+                            Some((path.clone(), target_user.clone(), password.clone()));
                         let _ = events.send(SessionEvent::SftpStatus(path));
                     }
                     Err(e) => {
                         let _ = events.send(SessionEvent::SftpError(list_error_msg(&path, &e)));
+                    }
+                }
+            }
+            SftpCommand::SetAutoRefreshSecs(secs) => {
+                auto_refresh_secs.store(secs.clamp(10, 3600), Ordering::Relaxed);
+            }
+            SftpCommand::RefreshCurrent => {
+                if let Some((path, target_user, password)) = current_sudo_dir.clone() {
+                    let _ = sftp.canonicalize(".").await;
+                    match sudo_list_dir_impl(&handle, &path, &target_user, &password).await {
+                        Ok(entries) => {
+                            let _ = events.send(SessionEvent::SftpEntries {
+                                path: path.clone(),
+                                entries,
+                            });
+                            current_dir = path.clone();
+                            let _ = events.send(SessionEvent::SftpStatus(path));
+                        }
+                        Err(e) => {
+                            let _ = events.send(SessionEvent::SftpError(list_error_msg(&path, &e)));
+                        }
+                    }
+                } else {
+                    match list_dir_impl(&sftp, &current_dir, &owner_maps).await {
+                        Ok(entries) => {
+                            let _ = events.send(SessionEvent::SftpEntries {
+                                path: current_dir.clone(),
+                                entries,
+                            });
+                            let _ = events.send(SessionEvent::SftpStatus(current_dir.clone()));
+                        }
+                        Err(e) => {
+                            let _ = events
+                                .send(SessionEvent::SftpError(list_error_msg(&current_dir, &e)));
+                        }
                     }
                 }
             }

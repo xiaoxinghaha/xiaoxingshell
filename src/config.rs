@@ -390,6 +390,10 @@ pub struct ConfigFile {
     /// the SSH/SFTP connection dead. Defaults to 5.
     #[serde(default)]
     pub disconnect_retry_count: u32,
+    /// SFTP application-level auto refresh interval in seconds. 0 = built-in
+    /// default (60s). Stored globally because it applies to every SFTP panel.
+    #[serde(default)]
+    pub sftp_auto_refresh_secs: u32,
     /// Always prompt for the save location on each download instead of using the
     /// preset download dir. Defaults to false (#87).
     #[serde(default)]
@@ -896,6 +900,19 @@ impl ConfigStore {
         self.cache.disconnect_retry_count = retries.clamp(1, 20);
     }
 
+    /// SFTP application-level auto refresh interval in seconds (default 60).
+    pub fn sftp_auto_refresh_secs(&self) -> u32 {
+        if self.cache.sftp_auto_refresh_secs == 0 {
+            60
+        } else {
+            self.cache.sftp_auto_refresh_secs.clamp(10, 3600)
+        }
+    }
+
+    pub fn set_sftp_auto_refresh_secs(&mut self, secs: u32) {
+        self.cache.sftp_auto_refresh_secs = secs.clamp(10, 3600);
+    }
+
     /// Saved quick commands (#55).
     pub fn quick_commands(&self) -> &[QuickCommand] {
         &self.cache.quick_commands
@@ -1356,6 +1373,19 @@ mod tests {
 
         store.set_session_flash_ms(8_000);
         assert_eq!(store.session_flash_ms(), 5_000);
+    }
+
+    #[test]
+    fn sftp_auto_refresh_secs_defaults_and_clamps() {
+        let mut store = temp_store();
+
+        assert_eq!(store.sftp_auto_refresh_secs(), 60);
+
+        store.set_sftp_auto_refresh_secs(1);
+        assert_eq!(store.sftp_auto_refresh_secs(), 10);
+
+        store.set_sftp_auto_refresh_secs(9_999);
+        assert_eq!(store.sftp_auto_refresh_secs(), 3_600);
     }
 
     #[test]

@@ -371,6 +371,9 @@ export component AppWindow inherits Window {
     // Unanswered keepalive probes tolerated before considering the connection dead.
     in-out property <int> disconnect-retry-count: 5;
     callback set-disconnect-retry-count(int);      // apply + persist
+    // SFTP application-level refresh interval in seconds; applies immediately.
+    in-out property <int> sftp-auto-refresh-secs: 60;
+    callback set-sftp-auto-refresh(int);           // apply + persist
     // Always ask where to save on each download (#87); default off.
     in-out property <bool> download-always-ask: false;
     callback set-download-always-ask(bool);        // apply + persist
@@ -3357,6 +3360,40 @@ export component AppWindow inherits Window {
                                         text: root.lang-en
                                             ? "Used by new SSH and SFTP connections to keep idle sessions alive."
                                             : "用于新的 SSH 和 SFTP 连接，避免空闲连接被中断。";
+                                        color: Theme.text-muted;
+                                        font-size: Theme.fs-sm;
+                                        wrap: word-wrap;
+                                    }
+
+                                    VerticalLayout {
+                                        spacing: 6px;
+                                        Text {
+                                            text: root.lang-en ? "SFTP auto refresh interval" : "SFTP 定时刷新间隔";
+                                            color: Theme.text-secondary;
+                                            font-size: Theme.fs-sm;
+                                        }
+                                        HorizontalLayout {
+                                            spacing: 10px;
+                                            SpinBox {
+                                                width: 120px;
+                                                value: root.sftp-auto-refresh-secs;
+                                                minimum: 10;
+                                                maximum: 3600;
+                                                edited => { root.set-sftp-auto-refresh(self.value); }
+                                            }
+                                            Text {
+                                                text: root.sftp-auto-refresh-secs + " s";
+                                                color: Theme.text-muted;
+                                                font-size: Theme.fs-sm;
+                                                vertical-alignment: center;
+                                            }
+                                            Rectangle { horizontal-stretch: 1; }
+                                        }
+                                    }
+                                    Text {
+                                        text: root.lang-en
+                                            ? "Refreshes the current SFTP directory periodically and applies to existing SFTP panels immediately."
+                                            : "定时刷新当前 SFTP 目录，并立即应用到已打开的 SFTP 面板。";
                                         color: Theme.text-muted;
                                         font-size: Theme.fs-sm;
                                         wrap: word-wrap;

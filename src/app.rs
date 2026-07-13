@@ -674,6 +674,30 @@ pub fn run() -> Result<()> {
             }
         });
     }
+    window.set_sftp_auto_refresh_secs(store.borrow().sftp_auto_refresh_secs() as i32);
+    {
+        let store = store.clone();
+        let weak = window.as_weak();
+        let sftp_handles = sftp_handles.clone();
+        window.on_set_sftp_auto_refresh(move |secs| {
+            let secs = secs.max(10) as u32;
+            let saved = {
+                let mut s = store.borrow_mut();
+                s.set_sftp_auto_refresh_secs(secs);
+                let saved = s.sftp_auto_refresh_secs();
+                let _ = s.save();
+                saved
+            };
+            if let Ok(handles) = sftp_handles.lock() {
+                for handle in handles.values() {
+                    handle.set_auto_refresh_secs(saved);
+                }
+            }
+            if let Some(w) = weak.upgrade() {
+                w.set_sftp_auto_refresh_secs(saved as i32);
+            }
+        });
+    }
 
     // Interface setting: always ask where to save on download (#87). Read live
     // by the download handler from the window property, so just set + persist.
@@ -1636,6 +1660,7 @@ pub fn run() -> Result<()> {
             sftp_follow_cd: sftp_follow_cd.clone(),
             keepalive_interval_secs: store.borrow().keepalive_interval_secs(),
             disconnect_retry_count: store.borrow().disconnect_retry_count(),
+            sftp_auto_refresh_secs: store.borrow().sftp_auto_refresh_secs(),
         },
     );
 
@@ -2957,6 +2982,7 @@ fn wire_session_callbacks(
                 sftp_follow_cd: sftp_follow_cd.clone(),
                 keepalive_interval_secs: store.borrow().keepalive_interval_secs(),
                 disconnect_retry_count: store.borrow().disconnect_retry_count(),
+                sftp_auto_refresh_secs: store.borrow().sftp_auto_refresh_secs(),
             };
             start_session_in_tab(&tab_id, session, &ctx);
         });
@@ -2989,6 +3015,8 @@ struct ConnectCtx {
     keepalive_interval_secs: u32,
     /// Unanswered keepalive probes tolerated before disconnect.
     disconnect_retry_count: u32,
+    /// Periodic SFTP directory refresh interval in seconds.
+    sftp_auto_refresh_secs: u32,
 }
 
 /// Spawn the shell (+ SFTP) workers and their event-pump threads for an
@@ -3032,6 +3060,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
             sftp_tx,
             ctx.keepalive_interval_secs,
             ctx.disconnect_retry_count,
+            ctx.sftp_auto_refresh_secs,
         );
         ctx.sftp_handles
             .lock()
