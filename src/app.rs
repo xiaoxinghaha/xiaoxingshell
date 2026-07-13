@@ -3221,6 +3221,42 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
     }
 }
 
+fn schedule_sftp_follow_dir(
+    runtime: Arc<Runtime>,
+    sftp_handles: SftpHandles,
+    tab_id: String,
+    dir: String,
+    delay_ms: u64,
+) {
+    runtime.spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        if let Ok(handles) = sftp_handles.lock() {
+            if let Some(h) = handles.get(&tab_id) {
+                h.list_dir(dir);
+            }
+        }
+    });
+}
+
+fn schedule_input_cd_follow(ctx: &ConnectCtx, tab_id: &str, dir: String) {
+    if !ctx
+        .sftp_follow_cd
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return;
+    }
+    if let Ok(mut map) = ctx.sftp_last_cwd.lock() {
+        map.insert(tab_id.to_string(), dir.clone());
+    }
+    schedule_sftp_follow_dir(
+        ctx.runtime.clone(),
+        ctx.sftp_handles.clone(),
+        tab_id.to_string(),
+        dir,
+        700,
+    );
+}
+
 /// Map of tab-id → the SFTP panel's current path, read from the terminals
 /// model. Used as the per-session fallback dir for session-sync uploads.
 fn terminal_sftp_paths(w: &AppWindow) -> HashMap<String, String> {
@@ -5514,6 +5550,9 @@ fn wire_key_input(
         let bufs = bufs.clone();
         let sync_input = sync_input.clone();
         let pending_ui_refresh = pending_ui_refresh.clone();
+        let pending_cd_input: Arc<Mutex<HashMap<String, String>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let rejected_cd_input: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         // Shared timestamp: the last time the Shift key alone was pressed
         // (key="", shift=true).  Used by the time-based Backspace filter below.
         let last_shift_time: Arc<Mutex<Option<std::time::Instant>>> = Arc::new(Mutex::new(None));
@@ -5808,6 +5847,7 @@ fn wire_key_input(
             let mut consume_locally = false;
             let mut repaint_after_local = false;
             let mut local_mode_was_active = false;
+            let mut submitted_line_for_cd: Option<String> = None;
             {
                 let mut map = bufs.lock().unwrap();
                 if let Some(buf) = map.get_mut(tid.as_str()) {
@@ -5821,6 +5861,7 @@ fn wire_key_input(
                         } else if key_for_pty == "\n" && !ctrl && !alt {
                             if !buf.local_line.is_empty() {
                                 let committed = buf.take_local_line();
+                                submitted_line_for_cd = Some(committed.clone());
                                 buf.commit_local_line_optimistically(&committed);
                                 buf.suppress_echo = format!("{}\r", committed);
                                 locally_queued_send = Some(committed.into_bytes());
@@ -5864,6 +5905,25 @@ fn wire_key_input(
                     }
                 }
             }
+            if !local_mode_was_active {
+                submitted_line_for_cd = update_pending_cd_input(
+                    &pending_cd_input,
+                    &rejected_cd_input,
+                    tid.as_str(),
+                    key_for_pty,
+                    ctrl,
+                    alt,
+                );
+            }
+            let cd_follow_target = submitted_line_for_cd.as_deref().and_then(|line| {
+                let cwd = ctx
+                    .sftp_last_cwd
+                    .lock()
+                    .unwrap()
+                    .get(tid.as_str())
+                    .cloned();
+                resolve_cd_follow_target(line, cwd.as_deref())
+            });
             if snapped_to_live || repaint_after_local {
                 pending_ui_refresh.lock().unwrap().push(tid.clone());
             }
@@ -5896,6 +5956,9 @@ fn wire_key_input(
                 } else if let Some(handle) = handles.borrow().get(tab_id.as_str()) {
                     handle.send_raw(queued);
                 }
+                if let Some(dir) = cd_follow_target {
+                    schedule_input_cd_follow(&ctx, tid.as_str(), dir);
+                }
                 return;
             }
             if !bytes.is_empty() {
@@ -5908,6 +5971,9 @@ fn wire_key_input(
                 } else if let Some(handle) = h.get(tab_id.as_str()) {
                     handle.send_raw(bytes);
                 }
+            }
+            if let Some(dir) = cd_follow_target {
+                schedule_input_cd_follow(&ctx, tid.as_str(), dir);
             }
         });
     }
@@ -7507,6 +7573,151 @@ fn is_cd_command(cmd: &str) -> bool {
     first.trim_matches(|c: char| c == '\'' || c == '"' || c == '`') == "cd"
 }
 
+fn update_pending_cd_input(
+    pending: &Arc<Mutex<HashMap<String, String>>>,
+    rejected: &Arc<Mutex<HashSet<String>>>,
+    tab_id: &str,
+    key: &str,
+    ctrl: bool,
+    alt: bool,
+) -> Option<String> {
+    if ctrl || alt {
+        if matches!(key, "\u{0003}" | "\u{0015}" | "\u{001b}") {
+            pending.lock().unwrap().remove(tab_id);
+            rejected.lock().unwrap().remove(tab_id);
+        }
+        return None;
+    }
+
+    if key == "\n" {
+        rejected.lock().unwrap().remove(tab_id);
+        return pending.lock().unwrap().remove(tab_id);
+    }
+    if rejected.lock().unwrap().contains(tab_id) {
+        return None;
+    }
+    if key == "\u{0008}" || matches!(key, "\u{F728}" | "\u{007f}") {
+        let mut map = pending.lock().unwrap();
+        if let Some(line) = map.get_mut(tab_id) {
+            line.pop();
+            if !cd_candidate_possible(line) {
+                map.remove(tab_id);
+                rejected.lock().unwrap().insert(tab_id.to_string());
+            }
+        }
+        return None;
+    }
+    if key.chars().count() != 1 {
+        return None;
+    }
+    let ch = key.chars().next().unwrap();
+    if ch.is_control() {
+        return None;
+    }
+
+    let mut map = pending.lock().unwrap();
+    let entry = map.entry(tab_id.to_string()).or_default();
+    entry.push(ch);
+    if !cd_candidate_possible(entry) {
+        map.remove(tab_id);
+        rejected.lock().unwrap().insert(tab_id.to_string());
+    }
+    None
+}
+
+fn cd_candidate_possible(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let unquoted = trimmed.trim_start_matches(|c| c == '\'' || c == '"' || c == '`');
+    "cd".starts_with(unquoted)
+        || unquoted.strip_prefix("cd").is_some_and(|rest| {
+            rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace)
+        })
+}
+
+fn resolve_cd_follow_target(cmd: &str, cwd: Option<&str>) -> Option<String> {
+    let words = split_shell_words(cmd);
+    let first = words.first()?;
+    if first != "cd" {
+        return None;
+    }
+    let target = words.get(1).map(|s| s.as_str()).unwrap_or("");
+    if target.is_empty() || target == "-" || target.starts_with('~') {
+        return None;
+    }
+    if target.starts_with('/') {
+        return Some(normalize_remote_abs_path(target));
+    }
+    let cwd = cwd?;
+    Some(normalize_remote_abs_path(&format!(
+        "{}/{}",
+        cwd.trim_end_matches('/'),
+        target
+    )))
+}
+
+fn split_shell_words(s: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for ch in s.chars() {
+        if escaped {
+            cur.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            } else {
+                cur.push(ch);
+            }
+            continue;
+        }
+        if matches!(ch, '\'' | '"' | '`') {
+            quote = Some(ch);
+        } else if ch.is_whitespace() {
+            if !cur.is_empty() {
+                words.push(std::mem::take(&mut cur));
+            }
+        } else {
+            cur.push(ch);
+        }
+    }
+    if escaped {
+        cur.push('\\');
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    words
+}
+
+fn normalize_remote_abs_path(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    if parts.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", parts.join("/"))
+    }
+}
+
 impl TermBuffer {
     fn clear_local_input(&mut self) {
         self.local_line.clear();
@@ -8733,6 +8944,52 @@ mod key_tests {
         assert!(!is_cd_command("ls"));
         assert!(!is_cd_command("echo cd /tmp"));
         assert!(!is_cd_command("cdx /tmp"));
+    }
+
+    #[test]
+    fn resolves_cd_follow_targets_for_tmux_fallback() {
+        assert_eq!(
+            resolve_cd_follow_target("cd /var/log", Some("/home/demo")).as_deref(),
+            Some("/var/log")
+        );
+        assert_eq!(
+            resolve_cd_follow_target(" cd ../etc ", Some("/home/demo/project")).as_deref(),
+            Some("/home/demo/etc")
+        );
+        assert_eq!(
+            resolve_cd_follow_target("cd ./src", Some("/home/demo/project")).as_deref(),
+            Some("/home/demo/project/src")
+        );
+        assert_eq!(
+            resolve_cd_follow_target("cd \"/opt/my app\"", Some("/home/demo")).as_deref(),
+            Some("/opt/my app")
+        );
+        assert!(resolve_cd_follow_target("echo cd /tmp", Some("/home/demo")).is_none());
+        assert!(resolve_cd_follow_target("cdx /tmp", Some("/home/demo")).is_none());
+        assert!(resolve_cd_follow_target("cd", Some("/home/demo")).is_none());
+        assert!(resolve_cd_follow_target("cd -", Some("/home/demo")).is_none());
+    }
+
+    #[test]
+    fn pending_cd_tracker_only_returns_candidate_on_enter() {
+        let pending: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+        let rejected: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        for ch in ["c", "d", " ", "/", "t", "m", "p"] {
+            assert!(update_pending_cd_input(&pending, &rejected, "t1", ch, false, false).is_none());
+        }
+        assert_eq!(
+            update_pending_cd_input(&pending, &rejected, "t1", "\n", false, false).as_deref(),
+            Some("cd /tmp")
+        );
+        assert!(update_pending_cd_input(&pending, &rejected, "t1", "\n", false, false).is_none());
+
+        for ch in ["e", "c", "h", "o", " ", "c", "d"] {
+            assert!(update_pending_cd_input(&pending, &rejected, "t1", ch, false, false).is_none());
+        }
+        assert!(pending.lock().unwrap().get("t1").is_none());
+        assert!(rejected.lock().unwrap().contains("t1"));
+        assert!(update_pending_cd_input(&pending, &rejected, "t1", "\n", false, false).is_none());
+        assert!(!rejected.lock().unwrap().contains("t1"));
     }
 }
 
