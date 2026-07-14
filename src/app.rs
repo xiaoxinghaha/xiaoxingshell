@@ -5932,10 +5932,12 @@ fn wire_key_input(
                                 repaint_after_local = true;
                                 consume_locally = true;
                             }
-                        } else if let Some(ch) =
-                            TermBuffer::locally_bufferable_char(key_for_pty, ctrl, alt)
+                        } else if let Some(text) =
+                            TermBuffer::locally_bufferable_text(key_for_pty, ctrl, alt)
                         {
-                            buf.insert_local_char(ch);
+                            for ch in text.chars() {
+                                buf.insert_local_char(ch);
+                            }
                             repaint_after_local = true;
                             consume_locally = true;
                         } else if !buf.local_line.is_empty() {
@@ -7835,22 +7837,20 @@ impl TermBuffer {
         self.local_passthrough_until_prompt = false;
     }
 
-    fn locally_bufferable_char(key: &str, ctrl: bool, alt: bool) -> Option<char> {
+    fn locally_bufferable_text<'a>(key: &'a str, ctrl: bool, alt: bool) -> Option<&'a str> {
         if ctrl || alt {
             return None;
         }
-        let mut chars = key.chars();
-        let ch = chars.next()?;
-        if chars.next().is_some() {
+        if key.is_empty() {
             return None;
         }
-        if ch.is_control() {
+        if key
+            .chars()
+            .any(|ch| ch.is_control() || (0xE000..=0xF8FF).contains(&(ch as u32)))
+        {
             return None;
         }
-        if (0xE000..=0xF8FF).contains(&(ch as u32)) {
-            return None;
-        }
-        Some(ch)
+        Some(key)
     }
 
     fn local_char_cells(ch: char) -> i32 {
@@ -9038,6 +9038,10 @@ mod key_tests {
             Some("/home/demo/project/aaa")
         );
         assert_eq!(
+            resolve_cd_follow_target("cd frp/", Some("/root"), Some("/root")).as_deref(),
+            Some("/root/frp")
+        );
+        assert_eq!(
             resolve_cd_follow_target("cd ../", Some("/home/demo/project"), Some("/home/demo"))
                 .as_deref(),
             Some("/home/demo")
@@ -9103,6 +9107,28 @@ mod key_tests {
             update_pending_cd_input(&pending, &rejected, "t2", "cd bbb\r", false, false).as_deref(),
             Some("cd bbb")
         );
+
+        assert!(update_pending_cd_input(&pending, &rejected, "t3", "cd fr", false, false).is_none());
+        assert!(update_pending_cd_input(&pending, &rejected, "t3", "p/", false, false).is_none());
+        assert_eq!(
+            update_pending_cd_input(&pending, &rejected, "t3", "\r", false, false).as_deref(),
+            Some("cd frp/")
+        );
+    }
+
+    #[test]
+    fn locally_bufferable_text_accepts_printable_chunks() {
+        assert_eq!(
+            TermBuffer::locally_bufferable_text("p/", false, false),
+            Some("p/")
+        );
+        assert_eq!(
+            TermBuffer::locally_bufferable_text("aaa/", false, false),
+            Some("aaa/")
+        );
+        assert!(TermBuffer::locally_bufferable_text("", false, false).is_none());
+        assert!(TermBuffer::locally_bufferable_text("\n", false, false).is_none());
+        assert!(TermBuffer::locally_bufferable_text("\u{F702}", false, false).is_none());
     }
 }
 
