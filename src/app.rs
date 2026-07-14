@@ -3282,6 +3282,9 @@ fn schedule_input_cd_follow(ctx: &ConnectCtx, tab_id: &str, dir: String) {
     {
         return;
     }
+    if let Ok(mut map) = ctx.sftp_last_cwd.lock() {
+        map.insert(tab_id.to_string(), dir.clone());
+    }
     schedule_sftp_follow_dir(
         ctx.runtime.clone(),
         ctx.sftp_handles.clone(),
@@ -9028,6 +9031,16 @@ mod key_tests {
             resolve_cd_follow_target("cd aaa", Some("/home/demo/project"), Some("/home/demo"))
                 .as_deref(),
             Some("/home/demo/project/aaa")
+        );
+        assert_eq!(
+            resolve_cd_follow_target("cd aaa/", Some("/home/demo/project"), Some("/home/demo"))
+                .as_deref(),
+            Some("/home/demo/project/aaa")
+        );
+        assert_eq!(
+            resolve_cd_follow_target("cd ../", Some("/home/demo/project"), Some("/home/demo"))
+                .as_deref(),
+            Some("/home/demo")
         );
         assert_eq!(
             resolve_cd_follow_target("cd ~", Some("/home/demo/project"), Some("/home/demo"))
