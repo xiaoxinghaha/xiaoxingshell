@@ -420,7 +420,6 @@ export component TerminalView inherits Rectangle {
                                             root.selecting = false;
                                             root.autoscroll-dir = 0;
                                             root.select-line(row, col);
-                                            root.copy-terminal-text();
                                         } else {
                                             root.awaiting-third-click = false;
                                             root.selecting = true;
@@ -449,7 +448,6 @@ export component TerminalView inherits Rectangle {
                                 root.selecting = false;
                                 root.autoscroll-dir = 0;
                                 root.select-word(row, col);
-                                root.copy-terminal-text();
                                 ime-input.focus();
                             }
                             moved => {
