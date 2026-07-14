@@ -3106,8 +3106,16 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                         if let SessionEvent::CommandRan(ref cmd) = shell_evt {
                             let is_cd = is_cd_command(cmd);
                             cwd_follow_pending = is_cd && !cwd_reported_since_last_command;
-                            if is_cd && cwd_reported_since_last_command {
+                            // 用 resolve_cd_follow_target 解析 cd 命令得到目标路径，
+                            // 不依赖 OSC 7 cwd（可能在 tmux 下被截断）（#158）
+                            if is_cd {
                                 if let Some(cwd) = last_cwd_reported.clone() {
+                                    let resolved = resolve_cd_follow_target(
+                                        cmd.as_str(),
+                                        Some(&cwd),
+                                        Some(&cwd),
+                                    );
+                                    let target = resolved.unwrap_or(cwd);
                                     if follow_cd_pump.load(std::sync::atomic::Ordering::Relaxed) {
                                         if let Some(prev) = cwd_debounce.take() {
                                             prev.abort();
@@ -3121,14 +3129,14 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                                             .await;
                                             if let Ok(handles) = sftp_h.lock() {
                                                 if let Some(h) = handles.get(&tid) {
-                                                    h.list_dir(cwd);
+                                                    h.list_dir(target);
                                                 }
                                             }
                                         }));
                                     }
                                 }
                             }
-                            cwd_reported_since_last_command = false;
+                            cwd_reported_since_last_command = is_cd;
                         }
                         if let SessionEvent::CwdChanged(ref cwd) = shell_evt {
                             last_cwd_reported = Some(cwd.clone());
@@ -5892,6 +5900,7 @@ fn wire_key_input(
             let mut repaint_after_local = false;
             let mut local_mode_was_active = false;
             let mut submitted_line_for_cd: Option<String> = None;
+            let mut locally_buffered_text: Option<String> = None;
             {
                 let mut map = bufs.lock().unwrap();
                 if let Some(buf) = map.get_mut(tid.as_str()) {
@@ -5935,6 +5944,8 @@ fn wire_key_input(
                         } else if let Some(text) =
                             TermBuffer::locally_bufferable_text(key_for_pty, ctrl, alt)
                         {
+                            // 记录多字符块，用于 consume_locally return 前同步到 cd 跟随跟踪器
+                            locally_buffered_text = Some(text.to_string());
                             for ch in text.chars() {
                                 buf.insert_local_char(ch);
                             }
@@ -5985,6 +5996,18 @@ fn wire_key_input(
             });
             if snapped_to_live || repaint_after_local {
                 pending_ui_refresh.lock().unwrap().push(tid.clone());
+            }
+            if let Some(ref text) = locally_buffered_text {
+                // 多字符块被本地缓存后 consume_locally return 会跳过
+                // 常规的 update_pending_cd_input 调用，这里提前同步到跟踪器
+                update_pending_cd_input(
+                    &pending_cd_input,
+                    &rejected_cd_input,
+                    tid.as_str(),
+                    text,
+                    false,
+                    false,
+                );
             }
             if consume_locally && locally_queued_send.is_none() {
                 return;
@@ -9113,6 +9136,35 @@ mod key_tests {
         assert_eq!(
             update_pending_cd_input(&pending, &rejected, "t3", "\r", false, false).as_deref(),
             Some("cd frp/")
+        );
+
+        // 模拟 cd my_files/ 分多段输入
+        assert!(update_pending_cd_input(&pending, &rejected, "t4", "cd ", false, false).is_none());
+        assert!(update_pending_cd_input(&pending, &rejected, "t4", "my_", false, false).is_none());
+        assert!(update_pending_cd_input(&pending, &rejected, "t4", "files", false, false).is_none());
+        assert!(update_pending_cd_input(&pending, &rejected, "t4", "/", false, false).is_none());
+        assert_eq!(
+            update_pending_cd_input(&pending, &rejected, "t4", "\r", false, false).as_deref(),
+            Some("cd my_files/")
+        );
+
+        // 整体传入 cd ../
+        assert!(update_pending_cd_input(&pending, &rejected, "t5", "cd ../", false, false).is_none());
+        assert_eq!(
+            update_pending_cd_input(&pending, &rejected, "t5", "\r", false, false).as_deref(),
+            Some("cd ../")
+        );
+
+        // 关键测试：cd my_files（不带斜杠）正确，cd my_files/（带斜杠）也要正确
+        assert!(update_pending_cd_input(&pending, &rejected, "t6", "cd my_files", false, false).is_none());
+        assert_eq!(
+            update_pending_cd_input(&pending, &rejected, "t6", "\r", false, false).as_deref(),
+            Some("cd my_files")
+        );
+        assert!(update_pending_cd_input(&pending, &rejected, "t7", "cd my_files/", false, false).is_none());
+        assert_eq!(
+            update_pending_cd_input(&pending, &rejected, "t7", "\r", false, false).as_deref(),
+            Some("cd my_files/")
         );
     }
 
