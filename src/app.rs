@@ -3096,24 +3096,29 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
         std::thread::spawn(move || {
             let mut shell_rx = rx;
             let mut cwd_debounce: Option<tokio::task::JoinHandle<()>> = None;
-            let mut cwd_follow_pending = false;
             let mut last_cwd_reported: Option<String> = None;
-            let mut cwd_reported_since_last_command = false;
             loop {
                 match shell_rx.blocking_recv() {
                     None => break,
                     Some(shell_evt) => {
                         if let SessionEvent::CommandRan(ref cmd) = shell_evt {
                             let is_cd = is_cd_command(cmd);
-                            cwd_follow_pending = is_cd && !cwd_reported_since_last_command;
                             // 用 resolve_cd_follow_target 解析 cd 命令得到目标路径，
                             // 不依赖 OSC 7 cwd（可能在 tmux 下被截断）（#158）
                             if is_cd {
                                 if let Some(cwd) = last_cwd_reported.clone() {
+                                    let home = statuses_pump
+                                        .lock()
+                                        .ok()
+                                        .and_then(|m| {
+                                            m.get(tab_id_pump.as_str())
+                                                .map(|st| st.sftp_home.clone())
+                                        })
+                                        .filter(|h| !h.trim().is_empty());
                                     let resolved = resolve_cd_follow_target(
                                         cmd.as_str(),
                                         Some(&cwd),
-                                        Some(&cwd),
+                                        home.as_deref(),
                                     );
                                     let target = resolved.unwrap_or(cwd);
                                     if follow_cd_pump.load(std::sync::atomic::Ordering::Relaxed) {
@@ -3136,27 +3141,32 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                                     }
                                 }
                             }
-                            cwd_reported_since_last_command = is_cd;
                         }
                         if let SessionEvent::CwdChanged(ref cwd) = shell_evt {
                             last_cwd_reported = Some(cwd.clone());
-                            cwd_reported_since_last_command = true;
                             if let Ok(mut map) = bufs_thread.lock() {
                                 if let Some(buf) = map.get_mut(tab_id_pump.as_str()) {
                                     buf.unlock_local_input_at_prompt();
                                 }
                             }
-                            let should_follow = cwd_follow_pending;
-                            cwd_follow_pending = false;
-                            if let Ok(mut m) = sftp_last_cwd_pump.lock() {
-                                m.insert(tab_id_pump.clone(), cwd.clone());
-                            }
                             // Swallow the event entirely when follow-cd is off:
                             // forwarding it would set sftp_loading without any
                             // ListDir to clear it (the #59 stuck-"loading" trap).
-                            if !should_follow
-                                || !follow_cd_pump.load(std::sync::atomic::Ordering::Relaxed)
-                            {
+                            if !follow_cd_pump.load(std::sync::atomic::Ordering::Relaxed) {
+                                continue;
+                            }
+                            // 目录真正变化时才跟随；prompt 重复报同一目录则跳过。
+                            // OSC 7 给出绝对路径，无需解析相对路径，天然可靠。
+                            let dir_changed = {
+                                let m = sftp_last_cwd_pump.lock().ok();
+                                m.as_ref()
+                                    .and_then(|m| m.get(tab_id_pump.as_str()))
+                                    .map_or(true, |prev| prev != cwd)
+                            };
+                            if let Ok(mut m) = sftp_last_cwd_pump.lock() {
+                                m.insert(tab_id_pump.clone(), cwd.clone());
+                            }
+                            if !dir_changed {
                                 continue;
                             }
                             if let Some(prev) = cwd_debounce.take() {
