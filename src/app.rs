@@ -4757,6 +4757,25 @@ fn move_tab_after_welcome(tabs: &VecModel<TabInfo>, id: &str, to_index: i32) {
 // SFTP callbacks
 // ---------------------------------------------------------------------------
 
+/// Index of the next entry whose name starts with `needle` (already
+/// lower-cased), searching from just after `after` and wrapping around the end
+/// of the list; `after < 0` starts from the top. Case-insensitive. Returns -1
+/// when nothing matches. Backs the Windows-Explorer-style type-ahead jump.
+fn sftp_typeahead_match(entries: &[RemoteEntry], needle: &str, after: i32) -> i32 {
+    let n = entries.len();
+    if n == 0 {
+        return -1;
+    }
+    let start = (after + 1).rem_euclid(n as i32) as usize;
+    for step in 0..n {
+        let idx = (start + step) % n;
+        if entries[idx].name.to_lowercase().starts_with(needle) {
+            return idx as i32;
+        }
+    }
+    -1
+}
+
 fn wire_sftp_callbacks(
     window: &AppWindow,
     store: Rc<RefCell<ConfigStore>>,
@@ -5381,6 +5400,38 @@ fn wire_sftp_callbacks(
         window.on_sftp_copy_path(move |path: SharedString| {
             clipboard_set_text(path.to_string());
         });
+    }
+
+    // Type-ahead jump for the file list (Windows-Explorer style). Slint has no
+    // string-prefix helper, so the match happens here against the cached,
+    // already display-sorted entries. `search_start` < 0 finds the first match
+    // from the top; otherwise the next match after `search_start` (wrapping).
+    // Returns -1 when nothing matches, -2 when the key isn't a type-ahead char.
+    {
+        let sftp_entry_cache = sftp_entry_cache.clone();
+        window.on_sftp_jump_to_char(
+            move |tab_id: SharedString, ch: SharedString, search_start: i32| -> i32 {
+                // Only a single printable char triggers a jump: reject control
+                // chars, whitespace, and Slint's private-use special keys
+                // (F-keys & co arrive as U+F700..=U+F7FF).
+                let printable = ch.chars().count() == 1
+                    && ch.chars().next().is_some_and(|c| {
+                        !c.is_control()
+                            && !c.is_whitespace()
+                            && !('\u{F700}'..='\u{F7FF}').contains(&c)
+                    });
+                if !printable {
+                    return -2;
+                }
+                let needle = ch.to_lowercase();
+                let entries = match sftp_entry_cache.lock() {
+                    Ok(g) => g.get(tab_id.as_str()).cloned(),
+                    Err(_) => return -1,
+                };
+                let Some(entries) = entries else { return -1 };
+                sftp_typeahead_match(&entries, &needle, search_start)
+            },
+        );
     }
 
     // Visual chmod dialog (#84): decompose the current mode into nine bools on
@@ -9037,6 +9088,45 @@ mod key_tests {
         assert!(!is_cd_command("ls"));
         assert!(!is_cd_command("echo cd /tmp"));
         assert!(!is_cd_command("cdx /tmp"));
+    }
+
+    #[test]
+    fn typeahead_jumps_and_cycles_case_insensitively() {
+        fn entry(name: &str) -> RemoteEntry {
+            RemoteEntry {
+                name: name.to_string(),
+                full_path: format!("/{name}"),
+                is_dir: false,
+                file_type: String::new(),
+                size: 0,
+                modified: 0,
+                mode: 0,
+                mode_text: String::new(),
+                owner_group: String::new(),
+            }
+        }
+        let entries = vec![
+            entry("apple"),
+            entry("Banana"),
+            entry("apricot"),
+            entry("blueberry"),
+            entry("Avocado"),
+        ];
+        // A fresh letter starts from the top; names match case-insensitively.
+        assert_eq!(sftp_typeahead_match(&entries, "a", -1), 0); // apple
+        assert_eq!(sftp_typeahead_match(&entries, "b", -1), 1); // Banana
+        // Pressing the same letter again advances, wrapping past the end.
+        assert_eq!(sftp_typeahead_match(&entries, "a", 0), 2); // apricot
+        assert_eq!(sftp_typeahead_match(&entries, "a", 2), 4); // Avocado
+        assert_eq!(sftp_typeahead_match(&entries, "a", 4), 0); // wraps to apple
+        // Multi-character prefixes.
+        assert_eq!(sftp_typeahead_match(&entries, "ap", -1), 0);
+        assert_eq!(sftp_typeahead_match(&entries, "bl", -1), 3);
+        // No match / empty list.
+        assert_eq!(sftp_typeahead_match(&entries, "z", -1), -1);
+        assert_eq!(sftp_typeahead_match(&[], "a", -1), -1);
+        // An out-of-range start still wraps into bounds.
+        assert_eq!(sftp_typeahead_match(&entries, "a", 99), 0);
     }
 
     #[test]

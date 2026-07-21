@@ -70,6 +70,7 @@ export component SftpPanel inherits Rectangle {
     property <int> selection-anchor-row: -1;
     property <int> selection-start-row: -1;
     property <int> selection-end-row: -1;
+    property <string> last-jump-char: "";  // type-ahead: last letter jumped to ("" = none)
     // Panel-level right-click context menu (#84). One menu for the whole list:
     // an empty `menu-target` means the click landed on whitespace, which greys
     // out the item-specific actions (download/rename/…) but keeps new/refresh.
@@ -129,6 +130,12 @@ export component SftpPanel inherits Rectangle {
     callback copy-path(string);
     callback new-folder(string /* parent dir */);
     callback new-file(string /* parent dir */);
+    // Type-ahead jump (Windows-Explorer style): returns the row whose name
+    // starts with `char` (case-insensitive). `search-start` < 0 finds the first
+    // match from the top; otherwise the next match after `search-start`
+    // (wrapping). Returns -1 when nothing matches, -2 when `char` is not a
+    // type-ahead key. Implemented in Rust — Slint has no string-prefix helper.
+    callback jump-to-char(string /* char */, int /* search-start */) -> int;
 
     // -----------------------------------------------------------------------
     background: Theme.bg-panel;
@@ -141,6 +148,7 @@ export component SftpPanel inherits Rectangle {
         root.selection-anchor-row = root.selected-row;
         root.selection-start-row = root.selected-row;
         root.selection-end-row = root.selected-row;
+        root.last-jump-char = "";
         if (root.file-list-focused) {
             file-list-focus.focus();
         }
@@ -859,7 +867,7 @@ export component SftpPanel inherits Rectangle {
                 file-area := Rectangle {
                     vertical-stretch: 1;
                     clip: true;
-                    ScrollView {
+                    file-scroll := ScrollView {
                         width: parent.width;
                         height: parent.height;
                         viewport-width: self.visible-width;
@@ -1118,6 +1126,40 @@ export component SftpPanel inherits Rectangle {
                                     }
                                     return accept;
                                 }
+                            }
+                            // Type-ahead jump (Windows Explorer style): a letter/digit
+                            // selects the first entry starting with it; pressing the same
+                            // key again cycles through the remaining matches (wrapping).
+                            if (!e.modifiers.control && !e.modifiers.alt
+                                    && !root.loading
+                                    && e.text.character-count == 1) {
+                                let ch = e.text.to-lowercase();
+                                let search-start = ch == root.last-jump-char ? root.selected-row : -1;
+                                let target = root.jump-to-char(ch, search-start);
+                                if (target >= 0) {
+                                    root.last-jump-char = ch;
+                                    root.selected-row = target;
+                                    root.selection-anchor-row = target;
+                                    root.selection-start-row = target;
+                                    root.selection-end-row = target;
+                                    // Scroll the jumped-to row into view (rows are 24px tall;
+                                    // viewport-y is the negated scroll offset).
+                                    let row-top = target * 24px;
+                                    let row-bottom = row-top + 24px;
+                                    let cur-top = 0px - file-scroll.viewport-y;
+                                    let vis-h = file-scroll.visible-height;
+                                    if (row-top < cur-top) {
+                                        file-scroll.viewport-y = 0px - row-top;
+                                    } else if (row-bottom > cur-top + vis-h) {
+                                        file-scroll.viewport-y = vis-h - row-bottom;
+                                    }
+                                    return accept;
+                                }
+                                if (target == -1) {
+                                    // Printable but nothing matches — swallow the key.
+                                    return accept;
+                                }
+                                // target == -2: not a type-ahead key — fall through to reject.
                             }
                             return reject;
                         }

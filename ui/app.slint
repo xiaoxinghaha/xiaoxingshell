@@ -611,6 +611,8 @@ export component AppWindow inherits Window {
     in-out property <string> sftp-prompt-value;  // user input
     callback sftp-prompt-submit(string /* tab */, string /* kind */, string /* target */, string /* value */);
     callback sftp-copy-path(string);             // put the path on the clipboard
+    // Type-ahead prefix match for the file list (Windows-Explorer style jump).
+    callback sftp-jump-to-char(string /* tab-id */, string /* char */, int /* search-start */) -> int;
 
     // Visual chmod dialog (#84). Rust decomposes the current mode into nine
     // bools when opening and recomposes on apply (Slint has no bitwise ops).
@@ -1014,6 +1016,7 @@ export component AppWindow inherits Window {
                                 root.sftp-chmod-open(term.id, path, name, mode);
                             }
                             sftp-copy-path(path) => { root.sftp-copy-path(path); }
+                            sftp-jump-to-char(ch, start) => { return root.sftp-jump-to-char(term.id, ch, start); }
                             sftp-new-folder(dir) => {
                                 root.sftp-prompt-kind = "mkdir";
                                 root.sftp-prompt-tab = term.id;

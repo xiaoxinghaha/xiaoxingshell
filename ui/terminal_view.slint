@@ -160,6 +160,7 @@ export component TerminalView inherits Rectangle {
     callback sftp-copy-path(string);
     callback sftp-new-folder(string);
     callback sftp-new-file(string);
+    callback sftp-jump-to-char(string, int) -> int;   // type-ahead prefix match
     callback paste-from-clipboard();
     callback copy-terminal-text();
     callback clear-terminal();              // wipe this session's screen buffer
@@ -1181,6 +1182,7 @@ export component TerminalView inherits Rectangle {
             copy-path(path)     => { root.sftp-copy-path(path); }
             new-folder(dir)     => { root.sftp-new-folder(dir); }
             new-file(dir)       => { root.sftp-new-file(dir); }
+            jump-to-char(ch, start) => { return root.sftp-jump-to-char(ch, start); }
         }
     }
 }
