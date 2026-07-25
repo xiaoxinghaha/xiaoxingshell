@@ -3155,13 +3155,6 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                         }
                         if let SessionEvent::CwdChanged(ref cwd) = shell_evt {
                             last_cwd_reported = Some(cwd.clone());
-                            // OSC 7 arriving while in_tmux means tmux exited
-                            // (tmux intercepts OSC 7; only outer shell emits it).
-                            if let Ok(mut ts) = tmux_state_pump.lock() {
-                                if let Some(state) = ts.get_mut(tab_id_pump.as_str()) {
-                                    state.0 = false;
-                                }
-                            }
                             if let Ok(mut map) = bufs_thread.lock() {
                                 if let Some(buf) = map.get_mut(tab_id_pump.as_str()) {
                                     buf.unlock_local_input_at_prompt();
@@ -3201,6 +3194,14 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                                     }
                                 }
                             }));
+                        }
+                        if let SessionEvent::TmuxExited = shell_evt {
+                            // tmux exec query failed → tmux no longer running.
+                            if let Ok(mut ts) = tmux_state_pump.lock() {
+                                if let Some(state) = ts.get_mut(tab_id_pump.as_str()) {
+                                    state.0 = false;
+                                }
+                            }
                         }
                         let weak_evt = weak_inner.clone();
                         let tid = tab_id_pump.clone();
@@ -4150,6 +4151,8 @@ fn apply_session_event_to_window(
                 }
             });
         }
+        // Handled entirely in the pump thread (clears in_tmux flag).
+        SessionEvent::TmuxExited => {}
     }
 }
 
@@ -6074,27 +6077,11 @@ fn wire_key_input(
                 resolve_cd_follow_target(line, cwd.as_deref(), home.as_deref())
             });
             // --- tmux directory follow ---
+            // Detect tmux entry to set the in_tmux flag (no immediate follow).
             if let Some(ref line) = submitted_line_for_cd {
-                let trimmed = line.trim();
-                let mut ts = ctx.tmux_state.lock().unwrap();
-                let entry = ts.entry(tid.clone()).or_insert((false, None));
-                if is_tmux_command(trimmed) {
-                    // Entering tmux: save current cwd, query tmux dir after startup
-                    let cur_cwd = ctx
-                        .sftp_last_cwd
-                        .lock()
-                        .unwrap()
-                        .get(tid.as_str())
-                        .cloned();
-                    entry.0 = true;
-                    entry.1 = cur_cwd.clone();
-                    drop(ts);
-                    schedule_tmux_cwd_query(&ctx, tid.as_str(), 1500, cur_cwd);
-                } else if entry.0 && is_exit_command(trimmed) {
-                    // Possible tmux exit: query after delay; fallback = pre-tmux cwd
-                    let fallback = entry.1.clone();
-                    drop(ts);
-                    schedule_tmux_cwd_query(&ctx, tid.as_str(), 1000, fallback);
+                if is_tmux_command(line.trim()) {
+                    let mut ts = ctx.tmux_state.lock().unwrap();
+                    ts.entry(tid.clone()).or_insert((false, None)).0 = true;
                 }
             }
             // While in tmux, query directory after EVERY Enter press (not just cd).
@@ -7815,12 +7802,6 @@ fn is_tmux_command(cmd: &str) -> bool {
         return false;
     };
     first == "tmux"
-}
-
-/// Detect commands that might exit tmux: `exit`, `logout`, Ctrl-D (empty line).
-fn is_exit_command(cmd: &str) -> bool {
-    let trimmed = cmd.trim();
-    trimmed == "exit" || trimmed == "logout"
 }
 
 /// Shell command to query the active tmux pane's working directory.
@@ -10028,14 +10009,4 @@ mod selection_tests {
         assert!(!is_tmux_command("cd /tmp"));
     }
 
-    #[test]
-    fn exit_command_detection() {
-        assert!(is_exit_command("exit"));
-        assert!(is_exit_command("logout"));
-        assert!(is_exit_command("  exit  "));
-        assert!(!is_exit_command("exit 1"));
-        assert!(!is_exit_command("echo exit"));
-        assert!(!is_exit_command(""));
-        assert!(!is_exit_command("cd"));
-    }
 }

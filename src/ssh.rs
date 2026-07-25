@@ -385,6 +385,8 @@ pub enum SessionEvent {
     // --- SFTP events -------------------------------------------------------
     /// The shell's current working directory changed (parsed from OSC 7).
     CwdChanged(String),
+    /// The tmux exec query failed — tmux is no longer running.
+    TmuxExited,
     /// SFTP directory listing arrived.
     SftpEntries {
         path: String,

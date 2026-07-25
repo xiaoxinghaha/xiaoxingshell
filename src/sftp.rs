@@ -673,11 +673,15 @@ async fn run_sftp(
                                 let _ = ev.send(SessionEvent::CwdChanged(path));
                             } else if let Some(fb) = fallback {
                                 let _ = ev.send(SessionEvent::CwdChanged(fb));
+                            } else {
+                                let _ = ev.send(SessionEvent::TmuxExited);
                             }
                         }
                         Err(_) => {
                             if let Some(fb) = fallback {
                                 let _ = ev.send(SessionEvent::CwdChanged(fb));
+                            } else {
+                                let _ = ev.send(SessionEvent::TmuxExited);
                             }
                         }
                     }
