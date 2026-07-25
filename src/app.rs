@@ -7518,13 +7518,18 @@ const WIDE_CONT_PLACEHOLDER: char = '\u{FDD0}';
 /// Returns true when a line's content fills the entire grid width (i.e. the
 /// terminal soft-wrapped at the right margin).  Used to set `Line::wrapped`
 /// on the *next* row and by the reflow engine.
+///
+/// `build_row` always produces exactly `cols` characters (one per cell, with
+/// WIDE_CONT_PLACEHOLDER for wide-char continuation cells).  A line is "full"
+/// when it has no trailing spaces — meaning content occupied the last cell.
 fn line_is_full(line: &Line, cols: u16) -> bool {
-    let effective: usize = line.text.chars().filter(|&ch| ch != WIDE_CONT_PLACEHOLDER).count();
-    if effective == 0 {
+    let char_count = line.text.chars().count();
+    if char_count < cols as usize {
         return false;
     }
-    let trimmed_len = line.text.trim_end().chars().filter(|&ch| ch != WIDE_CONT_PLACEHOLDER).count();
-    trimmed_len >= effective && effective >= cols as usize
+    // Full means no trailing spaces.  WIDE_CONT_PLACEHOLDER at the end is NOT
+    // a space — it means a CJK glyph occupies the last two cells → full.
+    !line.text.ends_with(' ')
 }
 
 /// Build one screen row into `(plain_text, coloured_runs)`.  `plain` carries one
@@ -7991,11 +7996,21 @@ impl TermBuffer {
                 });
                 continue;
             }
-            let num_rows = (total_cells + nc - 1) / nc;
             let chars: Vec<char> = lg.text.chars().collect();
-            for row in 0..num_rows {
-                let start = row * nc;
-                let end = (start + nc).min(total_cells);
+            let mut start = 0usize;
+            let mut row = 0usize;
+            while start < total_cells {
+                let mut end = (start + nc).min(total_cells);
+                // Avoid splitting a wide (CJK) char from its continuation
+                // placeholder: if the next row would start with a placeholder,
+                // back up so the pair stays together in the next row.
+                if end < total_cells && chars[end] == WIDE_CONT_PLACEHOLDER {
+                    end -= 1;
+                }
+                // Safety: ensure we always make progress.
+                if end <= start {
+                    end = (start + nc).min(total_cells);
+                }
                 let row_text: String = chars[start..end].iter().collect();
 
                 // Collect spans that overlap [start, end) and remap col.
@@ -8036,6 +8051,8 @@ impl TermBuffer {
                     spans: row_spans,
                     wrapped: row > 0, // continuation rows marked wrapped
                 });
+                start = end;
+                row += 1;
             }
         }
 
@@ -9832,5 +9849,54 @@ mod selection_tests {
         assert_eq!(buf.history[1].spans[0].col, 0);
         assert_eq!(buf.history[1].spans[0].cells, 5);
         assert_eq!(buf.history[1].spans[0].text, "FGHIJ");
+    }
+
+    #[test]
+    fn reflow_does_not_split_wide_char_placeholder_pair() {
+        // 6-col terminal.  Text: "AB你CD" where 你 occupies 2 cells
+        // (char + WIDE_CONT_PLACEHOLDER).  Total chars in text = 6.
+        // Reflow to 3 cols: naive split at 3 would cut between 你 and its
+        // placeholder.  The fix backs up so the pair stays together.
+        let ph = '\u{FDD0}'; // WIDE_CONT_PLACEHOLDER
+        let text = format!("AB你{}CD", ph); // 5 visible chars + 1 placeholder = 6 chars
+        let mut buf = make_buf(5, 6, &[], &["prompt"], 0);
+        buf.history = vec![Line {
+            text: text.clone(),
+            spans: Vec::new(),
+            wrapped: false,
+        }];
+
+        buf.reflow_history(3);
+        // The split must NOT start a row with the placeholder.
+        for line in &buf.history {
+            assert!(
+                !line.text.starts_with(ph),
+                "row must not start with WIDE_CONT_PLACEHOLDER: {:?}",
+                line.text
+            );
+        }
+        // All original characters preserved.
+        let rejoined: String = buf.history.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(rejoined, text);
+    }
+
+    #[test]
+    fn line_is_full_detects_cjk_at_right_edge() {
+        // A 6-col line ending with a CJK char + placeholder is full.
+        let ph = '\u{FDD0}';
+        let full_cjk = Line {
+            text: format!("ABCD你{}", ph), // 6 chars, last is placeholder (not space)
+            spans: Vec::new(),
+            wrapped: false,
+        };
+        assert!(line_is_full(&full_cjk, 6));
+
+        // A 6-col line with trailing space is NOT full.
+        let not_full = Line {
+            text: "ABCDE ".to_string(),
+            spans: Vec::new(),
+            wrapped: false,
+        };
+        assert!(!line_is_full(&not_full, 6));
     }
 }
