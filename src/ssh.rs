@@ -210,6 +210,49 @@ pub fn extract_osc_command(text: &str) -> Option<(String, std::ops::Range<usize>
     None
 }
 
+/// True if `s` (which is known to start at an `ESC ]` sequence) already contains
+/// a terminator: BEL (`0x07`) or ST (`ESC \`).
+fn osc_has_terminator(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x07 {
+            return true;
+        }
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// If `s` ends with an `ESC ]` … sequence that has no terminator yet, return the
+/// byte index where that incomplete sequence starts, so the caller can hold it
+/// and prepend it to the next data chunk. Returns `None` when every `ESC ]`
+/// sequence in `s` is complete (or there is none).
+///
+/// This is what lets OSC 7 (cwd) / OSC 697 (command) sequences survive being
+/// split across two `channel.wait()` data reads — without it, a split sequence
+/// is dropped entirely, which is the "吃字符 / 目录跟随失败" symptom (#158).
+fn find_incomplete_osc_tail(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut last: Option<usize> = None;
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == 0x1b && bytes[i + 1] == b']' {
+            last = Some(i);
+        }
+        i += 1;
+    }
+    let start = last?;
+    if osc_has_terminator(&s[start..]) {
+        None
+    } else {
+        Some(start)
+    }
+}
+
 /// Percent-decode a URL path segment (e.g. `%20` → space).
 fn url_decode(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
@@ -700,6 +743,10 @@ async fn run_session(
     // Buffers output while `suppress_echo` so the (long) echoed setup line can be
     // stripped even when it splits across reads (#98).
     let mut echo_buf = String::new();
+    // Holds an `ESC ]` … sequence that was split at the end of a data read and
+    // has no terminator yet. Prepended to the next chunk so OSC 7 / OSC 697
+    // sequences are never dropped at chunk boundaries (#158).
+    let mut osc_carry = String::new();
     // After a ZMODEM transfer finishes we briefly ignore ZMODEM detection so the
     // sender's lingering close frames can't spawn a spurious second receive (#76).
     let mut zmodem_done_at: Option<std::time::Instant> = None;
@@ -948,7 +995,27 @@ async fn run_session(
                                 continue; // keep buffering; show nothing yet
                             }
                         } else {
-                            chunk
+                            // Outside the setup window, every data read is shown.
+                            // But an OSC 7 / OSC 697 sequence can be split across
+                            // the boundary between this `chunk` and the previous
+                            // read, in which case the tail of the previous read was
+                            // already lost. Carry any `ESC ]` … run that has no
+                            // terminator yet, prepend it here, and hold the new
+                            // incomplete tail for the next chunk (#158).
+                            let combined = if osc_carry.is_empty() {
+                                chunk
+                            } else {
+                                let mut s = std::mem::take(&mut osc_carry);
+                                s.push_str(&chunk);
+                                s
+                            };
+                            match find_incomplete_osc_tail(&combined) {
+                                Some(start) => {
+                                    osc_carry = combined[start..].to_string();
+                                    combined[..start].to_string()
+                                }
+                                None => combined,
+                            }
                         };
 
                         // Capture commands run in the terminal via our OSC 697
@@ -1628,7 +1695,7 @@ fn _assert_handle_send() {
 
 #[cfg(test)]
 mod osc_command_tests {
-    use super::extract_osc_command;
+    use super::{extract_osc_command, find_incomplete_osc_tail, osc_has_terminator};
 
     #[test]
     fn extracts_and_locates_bel_terminated() {
@@ -1655,6 +1722,42 @@ mod osc_command_tests {
         // No terminator yet → wait for more.
         assert!(extract_osc_command("\u{1b}]697;ls").is_none());
         assert!(extract_osc_command("plain text").is_none());
+    }
+
+    #[test]
+    fn osc_has_terminator_detects_bel_and_st() {
+        assert!(osc_has_terminator("\u{1b}]7;file:///x\u{07}"));
+        assert!(osc_has_terminator("\u{1b}]697;ls\u{1b}\\"));
+        assert!(!osc_has_terminator("\u{1b}]7;file:///x"));
+        assert!(!osc_has_terminator("plain"));
+    }
+
+    #[test]
+    fn split_osc7_is_detected_as_incomplete_tail() {
+        // Shell printed `cd /root/` and the OSC 7 cwd got cut right after the
+        // path, before the BEL terminator. The trailing run must be held.
+        let chunk = "user@host:~# cd /root/\r\n\u{1b}]7;file://host/root";
+        let tail = find_incomplete_osc_tail(chunk);
+        assert_eq!(tail, Some(chunk.len() - "\u{1b}]7;file://host/root".len()));
+        // The carried tail, once the terminator arrives, reassembles a valid
+        // OSC 7 that extract_osc7_path can read.
+        let carried = &chunk[tail.unwrap()..];
+        let completed = format!("{carried}\u{07}");
+        assert!(super::extract_osc7_path(&completed).is_some());
+    }
+
+    #[test]
+    fn complete_osc_has_no_incomplete_tail() {
+        let chunk = "\u{1b}]7;file://host/root\u{07}prompt$ ";
+        assert!(find_incomplete_osc_tail(chunk).is_none());
+        // A lone ESC at the very end (start of a sequence split mid-stream).
+        let tail = find_incomplete_osc_tail("text\u{1b}]");
+        assert_eq!(tail, Some("text".len()));
+    }
+
+    #[test]
+    fn plain_text_has_no_incomplete_tail() {
+        assert!(find_incomplete_osc_tail("just normal output").is_none());
     }
 }
 
