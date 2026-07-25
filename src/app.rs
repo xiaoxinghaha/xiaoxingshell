@@ -484,8 +484,8 @@ pub fn run() -> Result<()> {
     let sftp_last_cwd: SftpLastCwd = Arc::new(Mutex::new(HashMap::new()));
     let sftp_entry_cache: SftpEntryCache = Arc::new(Mutex::new(HashMap::new()));
     let sftp_sort_states: SftpSortStates = Arc::new(Mutex::new(HashMap::new()));
-    // Per-tab tmux state: (in_tmux, pre_tmux_cwd) for SFTP directory follow.
-    let tmux_state: Arc<Mutex<HashMap<String, (bool, Option<String>)>>> =
+    // Per-tab tmux state: (in_tmux, consecutive_exec_fail_count).
+    let tmux_state: Arc<Mutex<HashMap<String, (bool, u8)>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let pending_ui_refresh: PendingUiRefresh = Arc::new(Mutex::new(Vec::new()));
 
@@ -2284,7 +2284,7 @@ fn wire_session_callbacks(
     local_snap: LocalSnap,
     local_net_hist: NetHist,
     sftp_follow_cd: Arc<std::sync::atomic::AtomicBool>,
-    tmux_state: Arc<Mutex<HashMap<String, (bool, Option<String>)>>>,
+    tmux_state: Arc<Mutex<HashMap<String, (bool, u8)>>>,
 ) {
     let group_options_model = |store: &ConfigStore| -> ModelRc<SharedString> {
         ModelRc::from(Rc::new(VecModel::from(
@@ -3032,8 +3032,8 @@ struct ConnectCtx {
     disconnect_retry_count: u32,
     /// Periodic SFTP directory refresh interval in seconds.
     sftp_auto_refresh_secs: u32,
-    /// Per-tab tmux state: (in_tmux, pre_tmux_cwd).
-    tmux_state: Arc<Mutex<HashMap<String, (bool, Option<String>)>>>,
+    /// Per-tab tmux state: (in_tmux, consecutive_exec_fail_count).
+    tmux_state: Arc<Mutex<HashMap<String, (bool, u8)>>>,
 }
 
 /// Spawn the shell (+ SFTP) workers and their event-pump threads for an
@@ -3155,9 +3155,25 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                         }
                         if let SessionEvent::CwdChanged(ref cwd) = shell_evt {
                             last_cwd_reported = Some(cwd.clone());
-                            if let Ok(mut map) = bufs_thread.lock() {
-                                if let Some(buf) = map.get_mut(tab_id_pump.as_str()) {
-                                    buf.unlock_local_input_at_prompt();
+                            // Reset tmux exec failure counter on any successful
+                            // CwdChanged (proves the query path is working).
+                            if let Ok(mut ts) = tmux_state_pump.lock() {
+                                if let Some(state) = ts.get_mut(tab_id_pump.as_str()) {
+                                    state.1 = 0;
+                                }
+                            }
+                            // Only re-enable local buffering when NOT in tmux.
+                            // In tmux the echo behaviour breaks type-ahead.
+                            let in_tmux = tmux_state_pump
+                                .lock()
+                                .ok()
+                                .and_then(|ts| ts.get(tab_id_pump.as_str()).map(|s| s.0))
+                                .unwrap_or(false);
+                            if !in_tmux {
+                                if let Ok(mut map) = bufs_thread.lock() {
+                                    if let Some(buf) = map.get_mut(tab_id_pump.as_str()) {
+                                        buf.unlock_local_input_at_prompt();
+                                    }
                                 }
                             }
                             // Swallow the event entirely when follow-cd is off:
@@ -3196,10 +3212,15 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                             }));
                         }
                         if let SessionEvent::TmuxExited = shell_evt {
-                            // tmux exec query failed → tmux no longer running.
+                            // tmux exec query failed. Only clear in_tmux after
+                            // 2 consecutive failures to tolerate transient errors.
                             if let Ok(mut ts) = tmux_state_pump.lock() {
                                 if let Some(state) = ts.get_mut(tab_id_pump.as_str()) {
-                                    state.0 = false;
+                                    state.1 = state.1.saturating_add(1);
+                                    if state.1 >= 2 {
+                                        state.0 = false;
+                                        state.1 = 0;
+                                    }
                                 }
                             }
                         }
@@ -6045,14 +6066,26 @@ fn wire_key_input(
                 }
             }
             if !local_mode_was_active {
-                submitted_line_for_cd = update_pending_cd_input(
-                    &pending_cd_input,
-                    &rejected_cd_input,
-                    tid.as_str(),
-                    key_for_pty,
-                    ctrl,
-                    alt,
-                );
+                // Skip local cd-input tracking while in tmux — the exec-query
+                // mechanism handles directory follow there, and the tracker
+                // can interfere with tmux's input handling.
+                let already_in_tmux = ctx
+                    .tmux_state
+                    .lock()
+                    .unwrap()
+                    .get(tid.as_str())
+                    .map(|s| s.0)
+                    .unwrap_or(false);
+                if !already_in_tmux {
+                    submitted_line_for_cd = update_pending_cd_input(
+                        &pending_cd_input,
+                        &rejected_cd_input,
+                        tid.as_str(),
+                        key_for_pty,
+                        ctrl,
+                        alt,
+                    );
+                }
             }
             let cd_follow_target = submitted_line_for_cd.as_deref().and_then(|line| {
                 let cwd = ctx
@@ -6081,7 +6114,13 @@ fn wire_key_input(
             if let Some(ref line) = submitted_line_for_cd {
                 if is_tmux_command(line.trim()) {
                     let mut ts = ctx.tmux_state.lock().unwrap();
-                    ts.entry(tid.clone()).or_insert((false, None)).0 = true;
+                    ts.entry(tid.clone()).or_insert((false, 0)).0 = true;
+                    // Disable local buffering inside tmux — its echo behaviour
+                    // breaks the type-ahead echo suppression and eats chars.
+                    drop(ts);
+                    if let Some(buf) = bufs.lock().unwrap().get_mut(tid.as_str()) {
+                        buf.lock_local_input_until_prompt();
+                    }
                 }
             }
             // While in tmux, query directory after EVERY Enter press (not just cd).
@@ -7806,7 +7845,7 @@ fn is_tmux_command(cmd: &str) -> bool {
 
 /// Shell command to query the active tmux pane's working directory.
 const TMUX_CWD_QUERY: &str =
-    "tmux display-message -p '#{pane_current_path}' 2>/dev/null || tmux list-panes -F '#{pane_current_path}' 2>/dev/null | head -1";
+    "tmux display-message -p '#{pane_current_path}' 2>/dev/null || tmux list-panes -a -F '#{pane_current_path}' 2>/dev/null | head -1";
 
 /// Schedule a tmux cwd query via the SFTP exec channel after `delay_ms`.
 /// If `fallback` is Some and the query fails, CwdChanged fires with fallback.
