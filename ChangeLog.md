@@ -31,7 +31,22 @@
 - 影响：
   非 tmux 下的 `cd` 跟随与命令捕获在序列被分片时不再丢目录；任何能到达 OSC 解析器的 OSC 7 序列均稳定。
 - 说明：
-  本修复解决的是“序列被切断”这一类吃字符，但 tmux 内部 pane 为全新 shell、未安装 `__ms7` 钩子故根本不发 OSC 7，那一类 cd 跟随失败需另做“tmux 内部钩子注入”（见后续计划）。
+  本修复解决的是“序列被切断”这一类吃字符，但 tmux 内部 pane 为全新 shell、未安装 `__ms7` 钩子故根本不发 OSC 7，那一类 cd 跟随失败需另做“tmux 内部钩子注入”（见下方）。
+
+#### 4. tmux 内 cd 跟随改为可靠的 OSC 7 通道（彻底修复 /roo 类丢字符，#158）
+
+- 根因：
+  tmux 内部 pane 是全新 shell，没有 meatshell 在连接时注入的 `__ms7` 钩子，根本不发 OSC 7，于是退化到解析本地按键的 `cd` 命令路径，快速输入/粘贴或末字符与回车竞态时会丢尾字符（`cd /root/` → `cd /roo`）。
+- 修复：
+  检测到进入 tmux（`tmux` / `tmux attach` / `tmux new` 等）时，通过 SFTP 通道把 `__ms7` 钩子写入远程 `~/.cache/meatshell/hook.sh`，并向 `~/.bashrc` / `~/.zshrc` / `~/.bash_profile` 追加带标记的 `source` 行（幂等，已存在则跳过）。
+- 修复：
+  当前 pane 在进入 tmux 后延迟约 600ms 自动补发一次 `source ~/.cache/meatshell/hook.sh`，使当前 shell 立即开始发 OSC 7；之后每个提示符（含 `cd`）都经 OSC 7 上报真实绝对路径，SFTP 面板可靠跟随，路径一致不操作。
+- 调整：
+  移除 tmux 内“必须手敲 `pwd` 才跟随”的限制与基于独立 exec 通道查询 `pane_current_path` 的不可靠逻辑（该通道无 tmux 上下文会查错 pane）。新 pane（split/新建窗口）因 rc 已被注入也自动带钩子。
+- 调整：
+  退出 tmux（`exit` / `logout`）时清除 in_tmux 标志并恢复本地输入缓冲，回到外层 shell 的原有跟随行为。
+- 影响：
+  tmux 内 cd 跟随现在与 tmux 外一样走 OSC 7，零按键解析、零丢字符，达到“像 Windows hook 监控目录改变”的稳定效果。
 
 ### 本次新增内容
 
