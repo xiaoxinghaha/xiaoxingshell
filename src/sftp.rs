@@ -121,6 +121,10 @@ pub enum SftpCommand {
     SetAutoRefreshSecs(u32),
     /// Internal periodic refresh of the current SFTP directory.
     RefreshCurrent,
+    /// Run a command via exec channel; report trimmed stdout as CwdChanged.
+    /// If the command fails and `fallback` is Some, report the fallback instead.
+    /// Used for tmux pane_current_path queries and tmux-exit detection.
+    ExecQueryCwd { cmd: String, fallback: Option<String> },
     /// Gracefully shut down the SFTP worker.
     Close,
 }
@@ -260,6 +264,10 @@ impl SftpHandle {
     }
     pub fn set_auto_refresh_secs(&self, secs: u32) {
         let _ = self.commands.send(SftpCommand::SetAutoRefreshSecs(secs));
+    }
+    /// Run a command via exec channel and report stdout as CwdChanged.
+    pub fn exec_query_cwd(&self, cmd: String, fallback: Option<String>) {
+        let _ = self.commands.send(SftpCommand::ExecQueryCwd { cmd, fallback });
     }
 }
 
@@ -645,6 +653,24 @@ async fn run_sftp(
                         Err(e) => {
                             let _ = events
                                 .send(SessionEvent::SftpError(list_error_msg(&current_dir, &e)));
+                        }
+                    }
+                }
+            }
+
+            SftpCommand::ExecQueryCwd { cmd, fallback } => {
+                match run_remote_exec_capture(&handle, &cmd).await {
+                    Ok(output) => {
+                        let path = output.trim().to_string();
+                        if !path.is_empty() && path.starts_with('/') {
+                            let _ = events.send(SessionEvent::CwdChanged(path));
+                        } else if let Some(fb) = fallback {
+                            let _ = events.send(SessionEvent::CwdChanged(fb));
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(fb) = fallback {
+                            let _ = events.send(SessionEvent::CwdChanged(fb));
                         }
                     }
                 }

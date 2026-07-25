@@ -484,6 +484,9 @@ pub fn run() -> Result<()> {
     let sftp_last_cwd: SftpLastCwd = Arc::new(Mutex::new(HashMap::new()));
     let sftp_entry_cache: SftpEntryCache = Arc::new(Mutex::new(HashMap::new()));
     let sftp_sort_states: SftpSortStates = Arc::new(Mutex::new(HashMap::new()));
+    // Per-tab tmux state: (in_tmux, pre_tmux_cwd) for SFTP directory follow.
+    let tmux_state: Arc<Mutex<HashMap<String, (bool, Option<String>)>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     let pending_ui_refresh: PendingUiRefresh = Arc::new(Mutex::new(Vec::new()));
 
     // Per-tab vt100 parsers + history logs (Arc<Mutex> so they can be cloned
@@ -948,6 +951,7 @@ pub fn run() -> Result<()> {
         local_snap.clone(),
         local_net_hist.clone(),
         sftp_follow_cd.clone(),
+        tmux_state.clone(),
     );
 
     {
@@ -1661,6 +1665,7 @@ pub fn run() -> Result<()> {
             keepalive_interval_secs: store.borrow().keepalive_interval_secs(),
             disconnect_retry_count: store.borrow().disconnect_retry_count(),
             sftp_auto_refresh_secs: store.borrow().sftp_auto_refresh_secs(),
+            tmux_state: tmux_state.clone(),
         },
     );
 
@@ -2279,6 +2284,7 @@ fn wire_session_callbacks(
     local_snap: LocalSnap,
     local_net_hist: NetHist,
     sftp_follow_cd: Arc<std::sync::atomic::AtomicBool>,
+    tmux_state: Arc<Mutex<HashMap<String, (bool, Option<String>)>>>,
 ) {
     let group_options_model = |store: &ConfigStore| -> ModelRc<SharedString> {
         ModelRc::from(Rc::new(VecModel::from(
@@ -2855,6 +2861,7 @@ fn wire_session_callbacks(
         let local_snap = local_snap.clone();
         let local_net_hist = local_net_hist.clone();
         let sftp_follow_cd = sftp_follow_cd.clone();
+        let tmux_state = tmux_state.clone();
         window.on_connect_session(move |id: SharedString| {
             let id = id.to_string();
             let session = match store.borrow().get(&id).cloned() {
@@ -2990,6 +2997,7 @@ fn wire_session_callbacks(
                 keepalive_interval_secs: store.borrow().keepalive_interval_secs(),
                 disconnect_retry_count: store.borrow().disconnect_retry_count(),
                 sftp_auto_refresh_secs: store.borrow().sftp_auto_refresh_secs(),
+                tmux_state: tmux_state.clone(),
             };
             start_session_in_tab(&tab_id, session, &ctx);
         });
@@ -3024,6 +3032,8 @@ struct ConnectCtx {
     disconnect_retry_count: u32,
     /// Periodic SFTP directory refresh interval in seconds.
     sftp_auto_refresh_secs: u32,
+    /// Per-tab tmux state: (in_tmux, pre_tmux_cwd).
+    tmux_state: Arc<Mutex<HashMap<String, (bool, Option<String>)>>>,
 }
 
 /// Spawn the shell (+ SFTP) workers and their event-pump threads for an
@@ -3093,6 +3103,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
         let sftp_cache_pump = ctx.sftp_entry_cache.clone();
         let sftp_sort_pump = ctx.sftp_sort_states.clone();
         let hidden_transfer_ids_pump = ctx.hidden_transfer_ids.clone();
+        let tmux_state_pump = ctx.tmux_state.clone();
         std::thread::spawn(move || {
             let mut shell_rx = rx;
             let mut cwd_debounce: Option<tokio::task::JoinHandle<()>> = None;
@@ -3144,6 +3155,13 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                         }
                         if let SessionEvent::CwdChanged(ref cwd) = shell_evt {
                             last_cwd_reported = Some(cwd.clone());
+                            // OSC 7 arriving while in_tmux means tmux exited
+                            // (tmux intercepts OSC 7; only outer shell emits it).
+                            if let Ok(mut ts) = tmux_state_pump.lock() {
+                                if let Some(state) = ts.get_mut(tab_id_pump.as_str()) {
+                                    state.0 = false;
+                                }
+                            }
                             if let Ok(mut map) = bufs_thread.lock() {
                                 if let Some(buf) = map.get_mut(tab_id_pump.as_str()) {
                                     buf.unlock_local_input_at_prompt();
@@ -6055,6 +6073,34 @@ fn wire_key_input(
                     .filter(|home| !home.trim().is_empty());
                 resolve_cd_follow_target(line, cwd.as_deref(), home.as_deref())
             });
+            // --- tmux directory follow ---
+            if let Some(ref line) = submitted_line_for_cd {
+                let trimmed = line.trim();
+                let mut ts = ctx.tmux_state.lock().unwrap();
+                let entry = ts.entry(tid.clone()).or_insert((false, None));
+                if is_tmux_command(trimmed) {
+                    // Entering tmux: save current cwd, query tmux dir after startup
+                    let cur_cwd = ctx
+                        .sftp_last_cwd
+                        .lock()
+                        .unwrap()
+                        .get(tid.as_str())
+                        .cloned();
+                    entry.0 = true;
+                    entry.1 = cur_cwd.clone();
+                    drop(ts);
+                    schedule_tmux_cwd_query(&ctx, tid.as_str(), 1500, cur_cwd);
+                } else if entry.0 && is_exit_command(trimmed) {
+                    // Possible tmux exit: query after delay; fallback = pre-tmux cwd
+                    let fallback = entry.1.clone();
+                    drop(ts);
+                    schedule_tmux_cwd_query(&ctx, tid.as_str(), 1000, fallback);
+                } else if entry.0 && cd_follow_target.is_some() {
+                    // cd inside tmux: query tmux for the real directory
+                    drop(ts);
+                    schedule_tmux_cwd_query(&ctx, tid.as_str(), 800, None);
+                }
+            }
             if snapped_to_live || repaint_after_local {
                 pending_ui_refresh.lock().unwrap().push(tid.clone());
             }
@@ -7737,6 +7783,52 @@ fn is_cd_command(cmd: &str) -> bool {
         return false;
     };
     first.trim_matches(|c: char| c == '\'' || c == '"' || c == '`') == "cd"
+}
+
+/// Detect commands that enter tmux: `tmux`, `tmux attach`, `tmux new`, etc.
+fn is_tmux_command(cmd: &str) -> bool {
+    let trimmed = cmd.trim();
+    let Some(first) = trimmed.split_whitespace().next() else {
+        return false;
+    };
+    first == "tmux"
+}
+
+/// Detect commands that might exit tmux: `exit`, `logout`, Ctrl-D (empty line).
+fn is_exit_command(cmd: &str) -> bool {
+    let trimmed = cmd.trim();
+    trimmed == "exit" || trimmed == "logout"
+}
+
+/// Shell command to query the active tmux pane's working directory.
+const TMUX_CWD_QUERY: &str =
+    "tmux display-message -p '#{pane_current_path}' 2>/dev/null || tmux list-panes -F '#{pane_current_path}' 2>/dev/null | head -1";
+
+/// Schedule a tmux cwd query via the SFTP exec channel after `delay_ms`.
+/// If `fallback` is Some and the query fails, CwdChanged fires with fallback.
+fn schedule_tmux_cwd_query(
+    ctx: &ConnectCtx,
+    tab_id: &str,
+    delay_ms: u64,
+    fallback: Option<String>,
+) {
+    if !ctx
+        .sftp_follow_cd
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return;
+    }
+    let sftp_h = ctx.sftp_handles.clone();
+    let tid = tab_id.to_string();
+    let fb = fallback;
+    ctx.runtime.spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        if let Ok(handles) = sftp_h.lock() {
+            if let Some(h) = handles.get(&tid) {
+                h.exec_query_cwd(TMUX_CWD_QUERY.to_string(), fb);
+            }
+        }
+    });
 }
 
 fn update_pending_cd_input(
@@ -9898,5 +9990,29 @@ mod selection_tests {
             wrapped: false,
         };
         assert!(!line_is_full(&not_full, 6));
+    }
+
+    #[test]
+    fn tmux_command_detection() {
+        assert!(is_tmux_command("tmux"));
+        assert!(is_tmux_command("tmux attach"));
+        assert!(is_tmux_command("tmux new-session"));
+        assert!(is_tmux_command("tmux a"));
+        assert!(is_tmux_command("  tmux  "));
+        assert!(!is_tmux_command("echo tmux"));
+        assert!(!is_tmux_command("tmuxinator"));
+        assert!(!is_tmux_command(""));
+        assert!(!is_tmux_command("cd /tmp"));
+    }
+
+    #[test]
+    fn exit_command_detection() {
+        assert!(is_exit_command("exit"));
+        assert!(is_exit_command("logout"));
+        assert!(is_exit_command("  exit  "));
+        assert!(!is_exit_command("exit 1"));
+        assert!(!is_exit_command("echo exit"));
+        assert!(!is_exit_command(""));
+        assert!(!is_exit_command("cd"));
     }
 }
