@@ -6210,7 +6210,13 @@ fn wire_key_input(
                             let s = buf.parser.screen();
                             (0..scroll).map(|r| build_row(s, r, old_cols)).collect()
                         };
-                        for line in saved {
+                        for mut line in saved {
+                            let prev_full = buf
+                                .history
+                                .last()
+                                .map(|last| line_is_full(last, old_cols))
+                                .unwrap_or(false);
+                            line.wrapped = prev_full;
                             buf.history.push(line);
                         }
                         buf.trim_history_to_limit();
@@ -6222,6 +6228,11 @@ fn wire_key_input(
                 // scroll-detection snapshot so the next output isn't mis-read as
                 // a scroll (which would double-capture lines).
                 buf.prev.clear();
+                // Reflow scrollback when the column count changed so wrapped
+                // lines re-adapt to the new width (like a web page reflow).
+                if cols as u16 != old_cols {
+                    buf.reflow_history(cols as u16);
+                }
             }
             pending_ui_refresh.lock().unwrap().push(tab_id.to_string());
         });
@@ -7489,12 +7500,32 @@ struct HistSpan {
 }
 
 /// A rendered line: plain text (one char per cell, for find/selection) + runs.
-type Line = (String, Vec<HistSpan>);
+/// `wrapped` is true when this row is a soft-wrap continuation of the previous
+/// row (its content touched the right edge of the grid).  Used by reflow to
+/// merge continuation rows back into one logical line before re-wrapping.
+#[derive(Clone)]
+struct Line {
+    text: String,
+    spans: Vec<HistSpan>,
+    wrapped: bool,
+}
 
 /// Placeholder stored in plain-text rows for the trailing cell of a wide glyph.
 /// It keeps selection indices aligned to terminal cells without leaking extra
 /// text into the copied result.
 const WIDE_CONT_PLACEHOLDER: char = '\u{FDD0}';
+
+/// Returns true when a line's content fills the entire grid width (i.e. the
+/// terminal soft-wrapped at the right margin).  Used to set `Line::wrapped`
+/// on the *next* row and by the reflow engine.
+fn line_is_full(line: &Line, cols: u16) -> bool {
+    let effective: usize = line.text.chars().filter(|&ch| ch != WIDE_CONT_PLACEHOLDER).count();
+    if effective == 0 {
+        return false;
+    }
+    let trimmed_len = line.text.trim_end().chars().filter(|&ch| ch != WIDE_CONT_PLACEHOLDER).count();
+    trimmed_len >= effective && effective >= cols as usize
+}
 
 /// Build one screen row into `(plain_text, coloured_runs)`.  `plain` carries one
 /// char per cell (space for blanks) so a char index equals the grid column.
@@ -7594,7 +7625,11 @@ fn build_row(screen: &vt100::Screen, r: u16, cols: u16) -> Line {
             cells,
         });
     }
-    (plain, runs)
+    Line {
+        text: plain,
+        spans: runs,
+        wrapped: false,
+    }
 }
 
 /// Detect how many lines scrolled off the top between two screen snapshots by
@@ -7605,7 +7640,7 @@ fn detect_scroll(prev: &[Line], curr: &[Line]) -> usize {
     let mut best_len = 0usize;
     for k in 0..prev.len() {
         let mut p = 0usize;
-        while k + p < prev.len() && p < curr.len() && prev[k + p].0 == curr[p].0 {
+        while k + p < prev.len() && p < curr.len() && prev[k + p].text == curr[p].text {
             p += 1;
         }
         if p > best_len {
@@ -7902,6 +7937,112 @@ impl TermBuffer {
         self.clamp_view_offset();
     }
 
+    /// Reflow scrollback history to a new column width.
+    ///
+    /// 1. Merge consecutive rows marked `wrapped` back into logical lines.
+    /// 2. Re-split each logical line at `new_cols` cells.
+    /// 3. Remap HistSpan col/cells into the new row layout.
+    fn reflow_history(&mut self, new_cols: u16) {
+        let nc = new_cols as usize;
+        if nc == 0 {
+            return;
+        }
+        let old = std::mem::take(&mut self.history);
+        if old.is_empty() {
+            return;
+        }
+
+        // --- Phase 1: merge wrapped continuations into logical lines ---------
+        struct Logical {
+            text: String,
+            spans: Vec<HistSpan>, // col adjusted to absolute offset
+        }
+        let mut logicals: Vec<Logical> = Vec::new();
+        for line in &old {
+            if line.wrapped && !logicals.is_empty() {
+                // Continuation: append to the current logical line.
+                let lg = logicals.last_mut().unwrap();
+                let offset = lg.text.chars().count();
+                lg.text.push_str(&line.text);
+                for sp in &line.spans {
+                    lg.spans.push(HistSpan {
+                        col: sp.col + offset as i32,
+                        ..sp.clone()
+                    });
+                }
+            } else {
+                // Start of a new logical line.
+                logicals.push(Logical {
+                    text: line.text.clone(),
+                    spans: line.spans.clone(),
+                });
+            }
+        }
+
+        // --- Phase 2: re-split each logical line at new_cols -----------------
+        let mut out: Vec<Line> = Vec::with_capacity(old.len());
+        for lg in &logicals {
+            let total_cells = lg.text.chars().count();
+            if total_cells == 0 {
+                out.push(Line {
+                    text: String::new(),
+                    spans: Vec::new(),
+                    wrapped: false,
+                });
+                continue;
+            }
+            let num_rows = (total_cells + nc - 1) / nc;
+            let chars: Vec<char> = lg.text.chars().collect();
+            for row in 0..num_rows {
+                let start = row * nc;
+                let end = (start + nc).min(total_cells);
+                let row_text: String = chars[start..end].iter().collect();
+
+                // Collect spans that overlap [start, end) and remap col.
+                let mut row_spans: Vec<HistSpan> = Vec::new();
+                for sp in &lg.spans {
+                    let sp_start = sp.col as usize;
+                    let sp_end = sp_start + sp.cells as usize;
+                    if sp_end <= start || sp_start >= end {
+                        continue; // entirely outside this row
+                    }
+                    let clipped_start = sp_start.max(start);
+                    let clipped_end = sp_end.min(end);
+                    let new_col = (clipped_start - start) as i32;
+                    let new_cells = (clipped_end - clipped_start) as i32;
+                    if new_cells <= 0 {
+                        continue;
+                    }
+                    // Clip the span text to the visible portion.
+                    let text_start = clipped_start - sp_start;
+                    let text_end = clipped_end - sp_start;
+                    let sp_chars: Vec<char> = sp.text.chars().collect();
+                    let clipped_text: String = sp_chars
+                        [text_start.min(sp_chars.len())..text_end.min(sp_chars.len())]
+                        .iter()
+                        .collect();
+                    row_spans.push(HistSpan {
+                        text: clipped_text,
+                        fg: sp.fg,
+                        bg: sp.bg,
+                        bold: sp.bold,
+                        col: new_col,
+                        cells: new_cells,
+                    });
+                }
+
+                out.push(Line {
+                    text: row_text,
+                    spans: row_spans,
+                    wrapped: row > 0, // continuation rows marked wrapped
+                });
+            }
+        }
+
+        self.history = out;
+        self.trim_history_to_limit();
+    }
+
     fn clamp_view_offset(&mut self) {
         let max_offset = if self.parser.screen().alternate_screen() {
             0
@@ -8106,7 +8247,7 @@ impl TermBuffer {
         let live: Vec<Line> = (0..rows).map(|r| build_row(s, r, cols)).collect();
         let used = live
             .iter()
-            .rposition(|(_, runs)| !runs.is_empty())
+            .rposition(|l| !l.spans.is_empty())
             .map(|i| i + 1)
             .unwrap_or(0);
         (live, used)
@@ -8139,8 +8280,8 @@ impl TermBuffer {
     fn combined_plain_lines(&self) -> Vec<String> {
         let (live, live_used) = self.live_rows();
         let mut out = Vec::with_capacity(self.history.len() + live_used);
-        out.extend(self.history.iter().map(|(text, _)| text.clone()));
-        out.extend(live.into_iter().take(live_used).map(|(text, _)| text));
+        out.extend(self.history.iter().map(|l| l.text.clone()));
+        out.extend(live.into_iter().take(live_used).map(|l| l.text));
         out
     }
 
@@ -8268,9 +8409,9 @@ impl TermBuffer {
         let mut all_full = true;
         for r in lo_r..=hi_r {
             let line: &str = if r < hist_len {
-                &self.history[r].0
+                &self.history[r].text
             } else if r - hist_len < live.len() {
-                &live[r - hist_len].0
+                &live[r - hist_len].text
             } else {
                 ""
             };
@@ -8448,7 +8589,15 @@ impl TermBuffer {
         if !self.prev.is_empty() {
             let k = detect_scroll(&self.prev, &curr);
             for line in self.prev.iter().take(k) {
-                self.history.push(line.clone());
+                let mut l = line.clone();
+                // Mark as wrapped (continuation) if the preceding line was full.
+                let prev_full = self
+                    .history
+                    .last()
+                    .map(|last| line_is_full(last, cols))
+                    .unwrap_or(false);
+                l.wrapped = prev_full;
+                self.history.push(l);
             }
             self.trim_history_to_limit();
         }
@@ -8473,11 +8622,11 @@ impl TermBuffer {
             let mut last_content = 0i32;
             let s = self.parser.screen();
             for r in 0..rows {
-                let (plain, runs) = build_row(s, r, cols);
-                if !runs.is_empty() {
+                let line = build_row(s, r, cols);
+                if !line.spans.is_empty() {
                     last_content = r as i32;
                 }
-                for hs in runs {
+                for hs in line.spans {
                     spans.push(TermSpan {
                         cjk: contains_cjk(&hs.text),
                         text: hs.text.into(),
@@ -8489,7 +8638,7 @@ impl TermBuffer {
                         cells: hs.cells,
                     });
                 }
-                displayed.push(plain.trim_end().to_string());
+                displayed.push(line.text.trim_end().to_string());
             }
             self.displayed_text = displayed;
             let mut rows_used = if is_alt {
@@ -8570,7 +8719,7 @@ impl TermBuffer {
             } else {
                 &live[idx - hist_len]
             };
-            for hs in &line.1 {
+            for hs in &line.spans {
                 spans.push(TermSpan {
                     text: hs.text.clone().into(),
                     fg: vt_color_to_slint(hs.fg, hs.bold, self.is_dark),
@@ -8582,7 +8731,7 @@ impl TermBuffer {
                     cjk: contains_cjk(&hs.text),
                 });
             }
-            displayed.push(line.0.trim_end().to_string());
+            displayed.push(line.text.trim_end().to_string());
         }
         while displayed.len() < win {
             displayed.push(String::new());
@@ -9329,7 +9478,11 @@ mod selection_tests {
     use super::*;
 
     fn hist_line(s: &str) -> Line {
-        (s.to_string(), Vec::new())
+        Line {
+            text: s.to_string(),
+            spans: Vec::new(),
+            wrapped: false,
+        }
     }
 
     /// A TermBuffer whose live screen (rows×cols) shows `live_lines`, with the
@@ -9589,5 +9742,95 @@ mod selection_tests {
         assert!(!buf.delete_local_char());
         assert_eq!(buf.local_line, "ab");
         assert_eq!(buf.local_cursor_chars, 2);
+    }
+
+    // --- Reflow tests ---
+
+    fn reflow_line(text: &str, wrapped: bool) -> Line {
+        Line {
+            text: text.to_string(),
+            spans: Vec::new(),
+            wrapped,
+        }
+    }
+
+    #[test]
+    fn reflow_merges_wrapped_lines_and_resplits() {
+        // Simulate a 10-col terminal with a 25-char logical line split into
+        // 3 rows: "AAAAAAAAAA" (full, wrapped), "BBBBBBBBBB" (full, wrapped),
+        // "CCCCC" (tail).
+        let mut buf = make_buf(5, 10, &[], &["prompt"], 0);
+        buf.history = vec![
+            reflow_line("AAAAAAAAAA", false),
+            reflow_line("BBBBBBBBBB", true),
+            reflow_line("CCCCC", true),
+        ];
+
+        // Reflow to 20 cols → 25 chars fit in 2 rows: 20 + 5.
+        buf.reflow_history(20);
+        assert_eq!(buf.history.len(), 2);
+        assert_eq!(buf.history[0].text, "AAAAAAAAAABBBBBBBBBB");
+        assert!(!buf.history[0].wrapped);
+        assert_eq!(buf.history[1].text, "CCCCC");
+        assert!(buf.history[1].wrapped);
+    }
+
+    #[test]
+    fn reflow_narrower_splits_further() {
+        // A 10-char logical line at 10 cols (1 row). Reflow to 5 cols → 2 rows.
+        let mut buf = make_buf(5, 10, &[], &["prompt"], 0);
+        buf.history = vec![reflow_line("ABCDEFGHIJ", false)];
+
+        buf.reflow_history(5);
+        assert_eq!(buf.history.len(), 2);
+        assert_eq!(buf.history[0].text, "ABCDE");
+        assert!(!buf.history[0].wrapped);
+        assert_eq!(buf.history[1].text, "FGHIJ");
+        assert!(buf.history[1].wrapped);
+    }
+
+    #[test]
+    fn reflow_preserves_independent_lines() {
+        // Two independent short lines (not wrapped) stay separate.
+        let mut buf = make_buf(5, 20, &[], &["prompt"], 0);
+        buf.history = vec![
+            reflow_line("hello", false),
+            reflow_line("world", false),
+        ];
+
+        buf.reflow_history(40);
+        assert_eq!(buf.history.len(), 2);
+        assert_eq!(buf.history[0].text, "hello");
+        assert_eq!(buf.history[1].text, "world");
+        assert!(!buf.history[1].wrapped);
+    }
+
+    #[test]
+    fn reflow_remaps_spans_correctly() {
+        // A 10-col row with a span at col 5..10. Reflow to 5 cols:
+        // the span should land entirely in the second row at col 0..5.
+        let mut buf = make_buf(5, 10, &[], &["prompt"], 0);
+        buf.history = vec![Line {
+            text: "ABCDEFGHIJ".to_string(),
+            spans: vec![HistSpan {
+                text: "FGHIJ".to_string(),
+                fg: vt100::Color::Default,
+                bg: vt100::Color::Default,
+                bold: true,
+                col: 5,
+                cells: 5,
+            }],
+            wrapped: false,
+        }];
+
+        buf.reflow_history(5);
+        assert_eq!(buf.history.len(), 2);
+        // First row "ABCDE" has no spans.
+        assert!(buf.history[0].spans.is_empty());
+        // Second row "FGHIJ" has the span at col 0.
+        assert_eq!(buf.history[1].spans.len(), 1);
+        assert_eq!(buf.history[1].spans[0].col, 0);
+        assert_eq!(buf.history[1].spans[0].cells, 5);
+        assert_eq!(buf.history[1].spans[0].text, "FGHIJ");
     }
 }
