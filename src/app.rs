@@ -6100,7 +6100,7 @@ fn wire_key_input(
             // While in tmux, query directory after EVERY Enter press (not just cd).
             // This catches cd, pushd, popd, scripts that chdir, etc.
             // The pump thread deduplicates same-directory results.
-            if (key_for_pty == "\n" || key_for_pty == "\r") && !ctrl && !alt {
+            let in_tmux_now = if (key_for_pty == "\n" || key_for_pty == "\r") && !ctrl && !alt {
                 let in_tmux = ctx
                     .tmux_state
                     .lock()
@@ -6111,7 +6111,15 @@ fn wire_key_input(
                 if in_tmux {
                     schedule_tmux_cwd_query(&ctx, tid.as_str(), 500, None);
                 }
-            }
+                in_tmux
+            } else {
+                ctx.tmux_state
+                    .lock()
+                    .unwrap()
+                    .get(tid.as_str())
+                    .map(|s| s.0)
+                    .unwrap_or(false)
+            };
             if snapped_to_live || repaint_after_local {
                 pending_ui_refresh.lock().unwrap().push(tid.clone());
             }
@@ -6157,7 +6165,9 @@ fn wire_key_input(
                     handle.send_raw(queued);
                 }
                 if let Some(dir) = cd_follow_target {
-                    schedule_input_cd_follow(&ctx, tid.as_str(), dir);
+                    if !in_tmux_now {
+                        schedule_input_cd_follow(&ctx, tid.as_str(), dir);
+                    }
                 }
                 return;
             }
@@ -6173,7 +6183,9 @@ fn wire_key_input(
                 }
             }
             if let Some(dir) = cd_follow_target {
-                schedule_input_cd_follow(&ctx, tid.as_str(), dir);
+                if !in_tmux_now {
+                    schedule_input_cd_follow(&ctx, tid.as_str(), dir);
+                }
             }
         });
     }
