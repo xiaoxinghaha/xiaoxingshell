@@ -2,6 +2,16 @@
 
 ## 2026-07-25
 
+### 修复 SFTP 右键修改权限后文件变成 0 字节
+
+- 修复：
+  SFTP 面板右键「权限」修改文件权限后，文件内容被清空为 0 字节。
+  原 chmod 用 `FileAttributes::default()` 构造属性，会将 `size` 设为 `Some(0)`，
+  SETSTAT 报文序列化后远程服务器据此把文件截断为 0 字节，同时会误改 uid/gid/时间戳。
+- 修复：
+  `src/sftp.rs` 的 `Chmod` 分支改用语义正确的 `FileAttributes::empty()` 仅设置 `permissions`，
+  不再发送 size/owner/time 等字段，文件内容得到保留。
+
 ### 本次修复内容
 
 #### 1. 修复 tmux 内 cd 跟随只有第一次成功、后续失败的问题
