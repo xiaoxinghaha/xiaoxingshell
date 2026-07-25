@@ -1,5 +1,20 @@
 # ChangeLog
 
+## 2026-07-25
+
+### 本次新增内容
+
+#### 1. tmux 内 SFTP 目录跟随
+
+- 新增：
+  进入 tmux 后，SFTP 面板会自动查询 tmux 当前 pane 的工作目录并同步显示（延迟 1.5s 等待 tmux 启动）。
+- 新增：
+  在 tmux 内执行 cd 切换目录后，SFTP 面板会通过 tmux 查询真实目录并跟随（延迟 800ms）。
+- 新增：
+  退出 tmux 后，SFTP 面板自动恢复到进入 tmux 前的目录（若外层 shell 有 OSC 7 则直接跟随，否则 fallback 到进入前的目录）。
+- 说明：
+  由于 tmux 会拦截 OSC 7 / OSC 697 序列不转发给外层终端，因此通过 SFTP 连接的独立 exec channel 执行 `tmux display-message -p '#{pane_current_path}'` 来获取目录。
+
 ## 2026-07-21
 
 ### 本次新增内容
