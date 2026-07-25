@@ -6098,42 +6098,78 @@ fn wire_key_input(
                 resolve_cd_follow_target(line, cwd.as_deref(), home.as_deref())
             });
             // --- tmux directory follow ---
-            // Detect tmux entry to set the in_tmux flag (no immediate follow).
+            // Detect tmux entry: set the in_tmux flag, install the cwd hook so
+            // the inner pane's shell emits OSC 7 (the reliable, parse-free
+            // follow path), and source it in the *current* pane so following
+            // starts immediately. Leaving tmux (exit/logout) restores the
+            // outer-shell behaviour (#158).
             if let Some(ref line) = submitted_line_for_cd {
-                if is_tmux_command(line.trim()) {
-                    let mut ts = ctx.tmux_state.lock().unwrap();
-                    ts.entry(tid.clone()).or_insert((false, 0)).0 = true;
-                    // Disable local buffering inside tmux — its echo behaviour
-                    // breaks the type-ahead echo suppression and eats chars.
-                    drop(ts);
-                    if let Some(buf) = bufs.lock().unwrap().get_mut(tid.as_str()) {
-                        buf.lock_local_input_until_prompt();
-                    }
-                }
-            }
-            // In tmux, only follow when the user explicitly types `pwd` + Enter.
-            // The pump thread deduplicates: if the path is unchanged, no action.
-            let in_tmux_now = {
-                let in_tmux = ctx
+                let in_tmux_already = ctx
                     .tmux_state
                     .lock()
                     .unwrap()
                     .get(tid.as_str())
                     .map(|s| s.0)
                     .unwrap_or(false);
-                if in_tmux
-                    && (key_for_pty == "\n" || key_for_pty == "\r")
-                    && !ctrl
-                    && !alt
-                {
-                    if let Some(ref line) = submitted_line_for_cd {
-                        if line.trim() == "pwd" {
-                            schedule_tmux_cwd_query(&ctx, tid.as_str(), 500, None);
-                        }
+                if is_tmux_command(line.trim()) {
+                    {
+                        let mut ts = ctx.tmux_state.lock().unwrap();
+                        ts.entry(tid.clone()).or_insert((false, 0)).0 = true;
+                    }
+                    // Disable local buffering inside tmux — its echo behaviour
+                    // breaks the type-ahead echo suppression and eats chars.
+                    if let Some(buf) = bufs.lock().unwrap().get_mut(tid.as_str()) {
+                        buf.lock_local_input_until_prompt();
+                    }
+                    // Install the hook (writes the script + a guarded `source`
+                    // into the shell rc files) so every pane — current and future
+                    // — emits OSC 7, then source it in the live pane a moment after
+                    // tmux starts so the SFTP panel follows without a restart.
+                    install_tmux_cwd_hook(&ctx, tid.as_str());
+                    if let Some(cmd) = handles
+                        .borrow()
+                        .get(tid.as_str())
+                        .map(|h| h.commands.clone())
+                    {
+                        let home = ctx
+                            .tab_statuses
+                            .lock()
+                            .unwrap()
+                            .get(tid.as_str())
+                            .map(|st| st.sftp_home.clone())
+                            .filter(|h| !h.trim().is_empty())
+                            .unwrap_or_else(|| "/root".to_string());
+                        let file = format!(
+                            "{}/.cache/meatshell/hook.sh",
+                            home.trim_end_matches('/')
+                        );
+                        let source_keys = format!("source '{}'\r", file);
+                        let rt = ctx.runtime.clone();
+                        rt.spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                            let _ = cmd.send(crate::ssh::SessionCommand::RawInput(
+                                source_keys.into_bytes(),
+                            ));
+                        });
+                    }
+                } else if in_tmux_already && is_tmux_exit_command(line.trim()) {
+                    // User left tmux; restore outer-shell behaviour.
+                    {
+                        let mut ts = ctx.tmux_state.lock().unwrap();
+                        ts.entry(tid.clone()).or_insert((false, 0)).0 = false;
+                    }
+                    if let Some(buf) = bufs.lock().unwrap().get_mut(tid.as_str()) {
+                        buf.unlock_local_input_at_prompt();
                     }
                 }
-                in_tmux
-            };
+            }
+            let in_tmux_now = ctx
+                .tmux_state
+                .lock()
+                .unwrap()
+                .get(tid.as_str())
+                .map(|s| s.0)
+                .unwrap_or(false);
             if snapped_to_live || repaint_after_local {
                 pending_ui_refresh.lock().unwrap().push(tid.clone());
             }
@@ -7831,12 +7867,51 @@ fn is_tmux_command(cmd: &str) -> bool {
     first == "tmux"
 }
 
+/// Detect commands that leave the current shell/pane: `exit`, `logout`.
+/// Used to clear the `in_tmux` flag so outer-shell behaviour is restored (#158).
+fn is_tmux_exit_command(cmd: &str) -> bool {
+    let t = cmd.trim();
+    t == "exit" || t == "logout"
+}
+
+/// Install the meatshell cwd hook on the remote so tmux inner panes emit OSC 7.
+///
+/// Writes `~/.cache/meatshell/hook.sh` and appends a guarded `source` line to
+/// the user's shell rc files (via the SFTP worker). Once sourced, every prompt
+/// in every pane reports the real cwd via OSC 7 — the reliable, parse-free
+/// "directory changed" signal that drives SFTP following (#158).
+fn install_tmux_cwd_hook(ctx: &ConnectCtx, tab_id: &str) {
+    let home = ctx
+        .tab_statuses
+        .lock()
+        .unwrap()
+        .get(tab_id)
+        .map(|st| st.sftp_home.clone())
+        .filter(|h| !h.trim().is_empty())
+        .unwrap_or_else(|| "/root".to_string());
+    let home = home.trim_end_matches('/').to_string();
+    let rel = crate::ssh::MEATSHELL_HOOK_REL;
+    let file = format!("{home}/{rel}");
+    let dir = file[..file.rfind('/').unwrap_or(file.len())].to_string();
+    let content = crate::ssh::cwd_hook_script();
+    if let Ok(handles) = ctx.sftp_handles.lock() {
+        if let Some(h) = handles.get(tab_id) {
+            h.install_cwd_hook(home, dir, file, content);
+        }
+    }
+}
+
 /// Shell command to query the active tmux pane's working directory.
+/// Retained as a fallback; the primary tmux follow path is OSC 7 from the
+/// inner shell's hook (see `install_tmux_cwd_hook`, #158).
+#[allow(dead_code)]
 const TMUX_CWD_QUERY: &str =
     "tmux display-message -p '#{pane_current_path}' 2>/dev/null || tmux list-panes -a -F '#{pane_current_path}' 2>/dev/null | head -1";
 
 /// Schedule a tmux cwd query via the SFTP exec channel after `delay_ms`.
 /// If `fallback` is Some and the query fails, CwdChanged fires with fallback.
+/// Currently unused (OSC 7 drives tmux follow); kept as a fallback (#158).
+#[allow(dead_code)]
 fn schedule_tmux_cwd_query(
     ctx: &ConnectCtx,
     tab_id: &str,
@@ -9424,6 +9499,20 @@ mod key_tests {
         assert!(!is_cd_command("ls"));
         assert!(!is_cd_command("echo cd /tmp"));
         assert!(!is_cd_command("cdx /tmp"));
+    }
+
+    #[test]
+    fn tmux_entry_and_exit_are_detected() {
+        // Entering tmux sets the in_tmux flag (hook gets installed).
+        assert!(is_tmux_command("tmux"));
+        assert!(is_tmux_command("tmux attach"));
+        assert!(is_tmux_command("  tmux new -s dev "));
+        assert!(!is_tmux_command("tmuxx")); // not a prefix-command
+        assert!(!is_tmux_command("echo tmux"));
+        // Leaving the pane restores outer-shell behaviour.
+        assert!(is_tmux_exit_command("exit"));
+        assert!(is_tmux_exit_command("logout"));
+        assert!(!is_tmux_exit_command("cd /root"));
     }
 
     #[test]

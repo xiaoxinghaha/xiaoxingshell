@@ -121,6 +121,10 @@ pub enum SftpCommand {
     SetAutoRefreshSecs(u32),
     /// Internal periodic refresh of the current SFTP directory.
     RefreshCurrent,
+    /// Silently install the meatshell cwd-hook so shells (including tmux inner
+    /// panes) emit OSC 7. Writes the hook script and appends a guarded `source`
+    /// line to the user's shell rc files. No UI status event (#158).
+    InstallCwdHook { home: String, dir: String, file: String, content: String },
     /// Run a command via exec channel; report trimmed stdout as CwdChanged.
     /// If the command fails and `fallback` is Some, report the fallback instead.
     /// Used for tmux pane_current_path queries and tmux-exit detection.
@@ -244,6 +248,13 @@ impl SftpHandle {
         let _ = self
             .commands
             .send(SftpCommand::WriteText { remote, content });
+    }
+    /// Silently install the cwd-hook script used to make tmux inner panes emit
+    /// OSC 7. Does not surface a "saved" status to the user (#158).
+    pub fn install_cwd_hook(&self, home: String, dir: String, file: String, content: String) {
+        let _ = self
+            .commands
+            .send(SftpCommand::InstallCwdHook { home, dir, file, content });
     }
     pub fn sudo_write_text(
         &self,
@@ -1639,6 +1650,24 @@ async fn run_sftp(
                     }
                 }
             }
+            SftpCommand::InstallCwdHook { home, dir, file, content } => {
+                // Best-effort: write the hook script, then make every login shell
+                // source it (tmux inner panes included) by appending a guarded
+                // marker block to the common rc files. Failures are silent — tmux
+                // follow simply falls back to the (lossy) path if it can't install
+                // (#158).
+                let _ = ensure_remote_dir(&sftp, &dir).await;
+                let _ = write_text_file(&sftp, &file, &content).await;
+                let home = home.trim_end_matches('/');
+                let rc_candidates = [
+                    format!("{home}/.bashrc"),
+                    format!("{home}/.zshrc"),
+                    format!("{home}/.bash_profile"),
+                ];
+                for rc in rc_candidates {
+                    let _ = ensure_rc_hook(&sftp, &rc, &file).await;
+                }
+            }
             SftpCommand::SudoWriteText {
                 remote,
                 content,
@@ -1740,6 +1769,68 @@ async fn write_text_file(sftp: &SftpSession, remote: &str, content: &str) -> Res
     f.flush().await.context("flush remote file")?;
     let _ = f.shutdown().await;
     Ok(())
+}
+
+/// Create `dir` on the remote, creating any missing parents (like mkdir -p).
+/// Errors are ignored: the caller treats hook installation as best-effort.
+async fn ensure_remote_dir(sftp: &SftpSession, dir: &str) -> bool {
+    let dir = dir.trim_end_matches('/');
+    if dir.is_empty() || dir == "/" {
+        return true;
+    }
+    // Walk from the root, creating each component that doesn't yet exist.
+    let mut built = String::new();
+    let mut ok = true;
+    for part in dir.split('/') {
+        if part.is_empty() {
+            // Leading slash: start an absolute path.
+            if built.is_empty() {
+                built.push('/');
+            }
+            continue;
+        }
+        if built == "/" {
+            built.push_str(part);
+        } else {
+            built.push('/');
+            built.push_str(part);
+        }
+        if sftp.metadata(&built).await.is_ok() {
+            continue;
+        }
+        if sftp.create_dir(&built).await.is_err() {
+            ok = false;
+            break;
+        }
+    }
+    ok
+}
+
+/// Marker comment used to make the rc-file edit idempotent and removable.
+const RC_HOOK_MARKER: &str = "# >>> meatshell shell integration (auto-added)";
+
+/// Append a guarded `source <hook_file>` line to a shell rc file if it isn't
+/// already present, so every new shell (tmux panes included) emits OSC 7 (#158).
+/// Creating a missing rc file with just the hook line is also acceptable.
+async fn ensure_rc_hook(sftp: &SftpSession, rc: &str, hook_file: &str) -> bool {
+    let existing = match read_text_guarded(sftp, rc).await {
+        Ok(text) => text,
+        Err(_) => String::new(),
+    };
+    if existing.contains(RC_HOOK_MARKER) {
+        return true; // already installed
+    }
+    // `[ -f '<hook>' ] && source '<hook>'` is safe even under `set -e`/non-login
+    // shells, and only activates when the hook file exists.
+    let block = format!(
+        "\n{RC_HOOK_MARKER}\n[ -f '{hook_file}' ] && source '{hook_file}'\n"
+    );
+    let new_content = if existing.is_empty() {
+        block
+    } else {
+        format!("{existing}{block}")
+    };
+    write_text_file(sftp, rc, &new_content).await.is_ok()
 }
 
 /// File name component of a path.  Handles both remote (`/`) and local Windows

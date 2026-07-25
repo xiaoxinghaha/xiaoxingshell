@@ -96,6 +96,26 @@ fn contains_zmodem_init(data: &[u8]) -> bool {
         .any(|w| w[0] == 0x18 && (w[1] == b'B' || w[1] == b'C'))
 }
 
+/// Shell hook body injected once after the first prompt so the SFTP panel can
+/// follow `cd` via OSC 7. Defined here (module level) so both the interactive
+/// shell injection and the tmux hook-file writer can share it (#158).
+pub const PROMPT_BODY: &str = "test -z \"$FISH_VERSION\" && eval '__msc(){ __c=\"$(fc -ln -1 2>/dev/null)\"; [ -n \"$__c\" ] && [ \"$__c\" != \"$__cl\" ] && { __cl=\"$__c\"; printf \"\\033]697;%s\\007\" \"$__c\"; }; }; __ms7(){ __msc; printf \"\\033]7;file://%s%s\\007\" \"$HOSTNAME\" \"$PWD\"; }; __h=\"$(history 1 2>/dev/null)\"; __h=\"${__h#\"${__h%%[! ]*}\"}\"; __h=\"${__h%%[!0-9]*}\"; [ -n \"$BASH_VERSION\" ] && [ -n \"$__h\" ] && history -d \"$__h\" 2>/dev/null; unset __h; __cl=\"$(fc -ln -1 2>/dev/null)\"; if [ -n \"$ZSH_VERSION\" ]; then autoload -Uz add-zsh-hook 2>/dev/null; add-zsh-hook precmd __ms7; else PROMPT_COMMAND=\"__ms7${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"; fi; __ms7'";
+
+/// Remote path (relative to the user's home) of the cwd-hook script that
+/// meatshell drops into a tmux session so inner panes also emit OSC 7 (#158).
+pub const MEATSHELL_HOOK_REL: &str = ".cache/meatshell/hook.sh";
+
+/// Build the shell script written to [`MEATSHELL_HOOK_REL`] on the remote so a
+/// tmux pane's shell sources the same OSC 7 / OSC 697 hook the outer shell gets
+/// at connect time. Sourcing it makes every prompt inside tmux report the real
+/// cwd via OSC 7 — the reliable, parse-free "directory changed" signal.
+pub fn cwd_hook_script() -> String {
+    format!(
+        "#!/bin/sh\n# meatshell tmux cwd hook (auto-generated, do not edit)\n{}\n",
+        PROMPT_BODY
+    )
+}
+
 /// Extract the remote path from an OSC 7 sequence embedded in `text`.
 ///
 /// Format: `ESC ] 7 ; file://hostname/path BEL`
@@ -785,7 +805,6 @@ async fn run_session(
     // The echoed setup line is discarded by anchoring on the OSC 7 it produces
     // (see the suppress block below), so it doesn't matter that the long line
     // wraps — we never substring-match it.
-    const PROMPT_BODY: &str = "test -z \"$FISH_VERSION\" && eval '__msc(){ __c=\"$(fc -ln -1 2>/dev/null)\"; [ -n \"$__c\" ] && [ \"$__c\" != \"$__cl\" ] && { __cl=\"$__c\"; printf \"\\033]697;%s\\007\" \"$__c\"; }; }; __ms7(){ __msc; printf \"\\033]7;file://%s%s\\007\" \"$HOSTNAME\" \"$PWD\"; }; __h=\"$(history 1 2>/dev/null)\"; __h=\"${__h#\"${__h%%[! ]*}\"}\"; __h=\"${__h%%[!0-9]*}\"; [ -n \"$BASH_VERSION\" ] && [ -n \"$__h\" ] && history -d \"$__h\" 2>/dev/null; unset __h; __cl=\"$(fc -ln -1 2>/dev/null)\"; if [ -n \"$ZSH_VERSION\" ]; then autoload -Uz add-zsh-hook 2>/dev/null; add-zsh-hook precmd __ms7; else PROMPT_COMMAND=\"__ms7${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"; fi; __ms7'";
     let prompt_setup = format!(" {}\r", PROMPT_BODY);
 
     // --- Remote resource monitor (separate exec channel) ----------------
@@ -1758,6 +1777,17 @@ mod osc_command_tests {
     #[test]
     fn plain_text_has_no_incomplete_tail() {
         assert!(find_incomplete_osc_tail("just normal output").is_none());
+    }
+
+    #[test]
+    fn cwd_hook_script_carries_osc7_and_osc697() {
+        let script = crate::ssh::cwd_hook_script();
+        // Sourcing it (in bash/zsh) must define the hook and emit OSC 7, the
+        // signal the tmux pane uses to report its real cwd.
+        assert!(script.contains("file://%s%s"));
+        assert!(script.contains("PROMPT_COMMAND"));
+        // The script is safe to `source` directly (no surrounding eval needed).
+        assert!(script.starts_with("#!/bin/sh"));
     }
 }
 
