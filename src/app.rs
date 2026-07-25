@@ -6066,26 +6066,14 @@ fn wire_key_input(
                 }
             }
             if !local_mode_was_active {
-                // Skip local cd-input tracking while in tmux — the exec-query
-                // mechanism handles directory follow there, and the tracker
-                // can interfere with tmux's input handling.
-                let already_in_tmux = ctx
-                    .tmux_state
-                    .lock()
-                    .unwrap()
-                    .get(tid.as_str())
-                    .map(|s| s.0)
-                    .unwrap_or(false);
-                if !already_in_tmux {
-                    submitted_line_for_cd = update_pending_cd_input(
-                        &pending_cd_input,
-                        &rejected_cd_input,
-                        tid.as_str(),
-                        key_for_pty,
-                        ctrl,
-                        alt,
-                    );
-                }
+                submitted_line_for_cd = update_pending_cd_input(
+                    &pending_cd_input,
+                    &rejected_cd_input,
+                    tid.as_str(),
+                    key_for_pty,
+                    ctrl,
+                    alt,
+                );
             }
             let cd_follow_target = submitted_line_for_cd.as_deref().and_then(|line| {
                 let cwd = ctx
@@ -6123,10 +6111,9 @@ fn wire_key_input(
                     }
                 }
             }
-            // While in tmux, query directory after EVERY Enter press (not just cd).
-            // This catches cd, pushd, popd, scripts that chdir, etc.
-            // The pump thread deduplicates same-directory results.
-            let in_tmux_now = if (key_for_pty == "\n" || key_for_pty == "\r") && !ctrl && !alt {
+            // In tmux, only follow when the user explicitly types `pwd` + Enter.
+            // The pump thread deduplicates: if the path is unchanged, no action.
+            let in_tmux_now = {
                 let in_tmux = ctx
                     .tmux_state
                     .lock()
@@ -6134,17 +6121,18 @@ fn wire_key_input(
                     .get(tid.as_str())
                     .map(|s| s.0)
                     .unwrap_or(false);
-                if in_tmux {
-                    schedule_tmux_cwd_query(&ctx, tid.as_str(), 500, None);
+                if in_tmux
+                    && (key_for_pty == "\n" || key_for_pty == "\r")
+                    && !ctrl
+                    && !alt
+                {
+                    if let Some(ref line) = submitted_line_for_cd {
+                        if line.trim() == "pwd" {
+                            schedule_tmux_cwd_query(&ctx, tid.as_str(), 500, None);
+                        }
+                    }
                 }
                 in_tmux
-            } else {
-                ctx.tmux_state
-                    .lock()
-                    .unwrap()
-                    .get(tid.as_str())
-                    .map(|s| s.0)
-                    .unwrap_or(false)
             };
             if snapped_to_live || repaint_after_local {
                 pending_ui_refresh.lock().unwrap().push(tid.clone());
@@ -7938,10 +7926,17 @@ fn cd_candidate_possible(line: &str) -> bool {
         return true;
     }
     let unquoted = trimmed.trim_start_matches(|c| c == '\'' || c == '"' || c == '`');
-    "cd".starts_with(unquoted)
+    // Accept "cd" prefix (local cd follow).
+    let is_cd = "cd".starts_with(unquoted)
         || unquoted.strip_prefix("cd").is_some_and(|rest| {
             rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace)
-        })
+        });
+    // Accept "pwd" prefix (tmux directory follow trigger).
+    let is_pwd = "pwd".starts_with(unquoted)
+        || unquoted.strip_prefix("pwd").is_some_and(|rest| {
+            rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace)
+        });
+    is_cd || is_pwd
 }
 
 fn resolve_cd_follow_target(cmd: &str, cwd: Option<&str>, home: Option<&str>) -> Option<String> {
