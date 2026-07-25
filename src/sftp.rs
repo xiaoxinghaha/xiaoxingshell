@@ -1357,7 +1357,7 @@ async fn run_sftp(
                 let refresh = parent_dir(&path);
                 let attrs = FileAttributes {
                     permissions: Some(mode),
-                    ..Default::default()
+                    ..FileAttributes::empty()
                 };
                 match sftp.set_metadata(&path, attrs).await {
                     Ok(_) => {
