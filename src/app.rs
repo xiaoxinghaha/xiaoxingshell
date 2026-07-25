@@ -8239,6 +8239,13 @@ impl TermBuffer {
 
     /// Extract the selected text from the combined buffer (whole selection,
     /// even the parts currently scrolled out of view).
+    ///
+    /// Soft-wrap aware: when every row before the last is "full" (its content
+    /// reaches the right edge of the terminal grid), the rows are treated as
+    /// soft wraps of a single long line and joined WITHOUT newlines.  The last
+    /// row is exempt — it's the tail of the wrapped content and rarely full.
+    /// If any preceding row is not full, all rows are joined with newlines
+    /// (original behavior).
     fn extract_selection_text(&self) -> String {
         let (Some((ar, ac)), Some((fr, fc))) = (self.sel_anchor, self.sel_focus) else {
             return String::new();
@@ -8254,7 +8261,11 @@ impl TermBuffer {
         // Clamp into real content so a focus parked on a blank row below the
         // prompt doesn't emit trailing empty lines.
         let hi_r = hi_r.min(combined_len.saturating_sub(1));
-        let mut out = String::new();
+
+        // First pass: extract segments and determine if every row is "full"
+        // (content touches the right edge → soft wrap, no real newline).
+        let mut segs: Vec<String> = Vec::with_capacity(hi_r.saturating_sub(lo_r) + 1);
+        let mut all_full = true;
         for r in lo_r..=hi_r {
             let line: &str = if r < hist_len {
                 &self.history[r].0
@@ -8283,12 +8294,41 @@ impl TermBuffer {
             } else {
                 String::new()
             };
-            out.push_str(seg.trim_end());
+
+            // A row is "full" when its trimmed plain text length equals the
+            // effective character count of the entire row (total cells minus
+            // wide-continuation placeholders).  This means content occupied
+            // the last cell → the terminal soft-wrapped, no real newline.
+            // Only check rows before the last one — the last row is the tail
+            // of the wrapped content and is almost certainly not full.
             if r != hi_r {
-                out.push('\n');
+                let full_chars: Vec<char> = chars
+                    .iter()
+                    .copied()
+                    .filter(|&ch| ch != WIDE_CONT_PLACEHOLDER)
+                    .collect();
+                let effective_width = full_chars.len();
+                let trimmed_len = full_chars
+                    .iter()
+                    .collect::<String>()
+                    .trim_end()
+                    .chars()
+                    .count();
+                if effective_width == 0 || trimmed_len < effective_width {
+                    all_full = false;
+                }
             }
+
+            segs.push(seg.trim_end().to_string());
         }
-        out
+
+        // Second pass: join.  All rows full → single long line (no newlines).
+        // Otherwise → original behavior with newlines between rows.
+        if all_full && segs.len() > 1 {
+            segs.join("")
+        } else {
+            segs.join("\n")
+        }
     }
 
     /// Feed bytes to vt100 and capture scrolled-off lines into history.
@@ -9464,6 +9504,34 @@ mod selection_tests {
         assert_eq!(buf.extract_selection_text(), "second");
         buf.select_line_at(3);
         assert_eq!(buf.extract_selection_text(), "third");
+    }
+
+    #[test]
+    fn soft_wrap_full_rows_copy_without_newlines() {
+        // Terminal is 10 columns wide.  History lines padded to 10 chars
+        // simulate rows whose content touched the right edge (soft wrap).
+        let full0 = "ABCDEFGHIJ"; // 10 chars = full
+        let full1 = "KLMNOPQRST"; // 10 chars = full
+        let tail = "UVW"; // last row, short — exempt from check
+        let mut buf = make_buf(5, 10, &[full0, full1, tail], &["prompt"], 3);
+        buf.sel_anchor = Some((0, 0));
+        buf.sel_focus = Some((2, 2));
+        // All rows before the last are full → no newlines.
+        assert_eq!(buf.extract_selection_text(), "ABCDEFGHIJKLMNOPQRSTUVW");
+    }
+
+    #[test]
+    fn soft_wrap_mixed_rows_copy_with_newlines() {
+        // Terminal is 10 columns wide.  First row is full, second is NOT
+        // full (only 5 chars + 5 trailing spaces) → real newline between.
+        let full0 = "ABCDEFGHIJ"; // 10 chars = full
+        let short1 = "HELLO     "; // 5 content + 5 spaces = NOT full
+        let tail = "WORLD";
+        let mut buf = make_buf(5, 10, &[full0, short1, tail], &["prompt"], 3);
+        buf.sel_anchor = Some((0, 0));
+        buf.sel_focus = Some((2, 4));
+        // A preceding row is not full → keep newlines.
+        assert_eq!(buf.extract_selection_text(), "ABCDEFGHIJ\nHELLO\nWORLD");
     }
 
     #[test]
