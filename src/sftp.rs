@@ -570,6 +570,8 @@ async fn run_sftp(
     }
 
     // --- Command loop -------------------------------------------------------
+    // Wrap handle in Arc so ExecQueryCwd can spawn a non-blocking task.
+    let handle = Arc::new(handle);
     while let Some(cmd) = commands.recv().await {
         match cmd {
             SftpCommand::Close => break,
@@ -659,21 +661,27 @@ async fn run_sftp(
             }
 
             SftpCommand::ExecQueryCwd { cmd, fallback } => {
-                match run_remote_exec_capture(&handle, &cmd).await {
-                    Ok(output) => {
-                        let path = output.trim().to_string();
-                        if !path.is_empty() && path.starts_with('/') {
-                            let _ = events.send(SessionEvent::CwdChanged(path));
-                        } else if let Some(fb) = fallback {
-                            let _ = events.send(SessionEvent::CwdChanged(fb));
+                // Spawn a separate task so the exec channel query does not
+                // block the SFTP command loop (which would freeze the panel).
+                let h = handle.clone();
+                let ev = events.clone();
+                tokio::spawn(async move {
+                    match run_remote_exec_capture(&h, &cmd).await {
+                        Ok(output) => {
+                            let path = output.trim().to_string();
+                            if !path.is_empty() && path.starts_with('/') {
+                                let _ = ev.send(SessionEvent::CwdChanged(path));
+                            } else if let Some(fb) = fallback {
+                                let _ = ev.send(SessionEvent::CwdChanged(fb));
+                            }
+                        }
+                        Err(_) => {
+                            if let Some(fb) = fallback {
+                                let _ = ev.send(SessionEvent::CwdChanged(fb));
+                            }
                         }
                     }
-                    Err(_) => {
-                        if let Some(fb) = fallback {
-                            let _ = events.send(SessionEvent::CwdChanged(fb));
-                        }
-                    }
-                }
+                });
             }
 
             SftpCommand::ToggleTreeNode(path) => {

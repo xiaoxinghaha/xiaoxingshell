@@ -6095,10 +6095,21 @@ fn wire_key_input(
                     let fallback = entry.1.clone();
                     drop(ts);
                     schedule_tmux_cwd_query(&ctx, tid.as_str(), 1000, fallback);
-                } else if entry.0 && cd_follow_target.is_some() {
-                    // cd inside tmux: query tmux for the real directory
-                    drop(ts);
-                    schedule_tmux_cwd_query(&ctx, tid.as_str(), 800, None);
+                }
+            }
+            // While in tmux, query directory after EVERY Enter press (not just cd).
+            // This catches cd, pushd, popd, scripts that chdir, etc.
+            // The pump thread deduplicates same-directory results.
+            if (key_for_pty == "\n" || key_for_pty == "\r") && !ctrl && !alt {
+                let in_tmux = ctx
+                    .tmux_state
+                    .lock()
+                    .unwrap()
+                    .get(tid.as_str())
+                    .map(|s| s.0)
+                    .unwrap_or(false);
+                if in_tmux {
+                    schedule_tmux_cwd_query(&ctx, tid.as_str(), 500, None);
                 }
             }
             if snapped_to_live || repaint_after_local {
@@ -7840,7 +7851,7 @@ fn update_pending_cd_input(
     alt: bool,
 ) -> Option<String> {
     if ctrl || alt {
-        if matches!(key, "\u{0003}" | "\u{0015}" | "\u{001b}") {
+        if matches!(key, "\u{0003}" | "\u{0015}" | "\u{001b}" | "\u{0002}") {
             pending.lock().unwrap().remove(tab_id);
             rejected.lock().unwrap().remove(tab_id);
         }
