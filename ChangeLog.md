@@ -2,6 +2,24 @@
 
 ## 2026-07-26
 
+### 修复 tmux 内右键 SFTP Follow 不跟随（hook 未传播到 tmux pane）
+
+- 根因：
+  `PROMPT_COMMAND` 是 shell 变量，**不会被子进程继承**。tmux 内每个 pane 都是
+  独立的 shell 进程（由 tmux server 启动），不会继承外层 SSH shell 的
+  `PROMPT_COMMAND`。之前只在检测到 `tmux` 命令时才安装 hook 到 `.bashrc`，
+  但此时 tmux 已经启动，时机太晚 —— 第一个 pane 的 shell 已经运行，
+  不会重新 source `.bashrc`，hook 不生效，`pane_cwd` 文件不更新，
+  右键 follow 跳到进入 tmux 之前的路径。
+- 修复：
+  SFTP 连接建立并完成首次目录列表后，**立即**将 `hook.sh` 写入远程
+  `~/.cache/meatshell/` 并追加 guarded `source` 行到 `.bashrc` / `.zshrc` /
+  `.bash_profile`。用户后续进入 tmux 时，新 pane 的 shell 启动时 source rc
+  文件自动获得 hook，每个 prompt 都把 `$PWD` 写到 `pane_cwd`，右键 SFTP
+  跟随即可读到 tmux 内真实当前路径。
+- 涉及文件：
+  `src/sftp.rs`（SFTP worker 首次列表后自动安装 hook）
+
 ### 修复右键 SFTP Follow 永远跳到 home 目录（exec channel pwd 返回 home）
 
 - 根因：
