@@ -5725,6 +5725,7 @@ fn wire_key_input(
     // Forward each keystroke as raw bytes to the SSH PTY. The server's bash /
     // readline handles echo, history (↑↓), Tab completion, Ctrl+C, etc.
     let sftp_h_for_follow = ctx.sftp_handles.clone();
+    let tmux_state_for_follow = ctx.tmux_state.clone();
     {
         let handles = handles.clone();
         let bufs = bufs.clone();
@@ -6579,14 +6580,30 @@ fn wire_key_input(
         });
     }
 
-    // Context menu → SFTP Follow: exec pwd, navigate SFTP to the result.
+    // Context menu → SFTP Follow: exec a cwd query, navigate SFTP to the result.
+    // Inside tmux the exec channel is a fresh SSH channel (not the user's tmux
+    // pane), so `pwd` would return $HOME instead of the pane's cwd. The OSC 7
+    // hook writes the active pane's $PWD to /tmp/.meatshell_pane_cwd on every
+    // prompt; read that inside tmux, fall back to `pwd` otherwise.
     {
         let sftp_h = sftp_h_for_follow.clone();
+        let tmux_state = tmux_state_for_follow.clone();
         window.on_sftp_follow_terminal(move |tab_id: SharedString| {
             let tid = tab_id.to_string();
+            let in_tmux = tmux_state
+                .lock()
+                .ok()
+                .and_then(|m| m.get(tid.as_str()).map(|s| s.0))
+                .unwrap_or(false);
+            let cmd = if in_tmux {
+                "cat /tmp/.meatshell_pane_cwd 2>/dev/null || pwd"
+            } else {
+                "pwd"
+            }
+            .to_string();
             if let Ok(handles) = sftp_h.lock() {
                 if let Some(h) = handles.get(&tid) {
-                    h.follow_terminal_cwd();
+                    h.follow_terminal_cwd(cmd);
                 }
             }
         });

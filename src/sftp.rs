@@ -129,8 +129,10 @@ pub enum SftpCommand {
     /// If the command fails and `fallback` is Some, report the fallback instead.
     /// Used for tmux pane_current_path queries and tmux-exit detection.
     ExecQueryCwd { cmd: String, fallback: Option<String> },
-    /// Run `pwd` via exec channel and navigate SFTP to the result (right-click follow).
-    FollowTerminalCwd,
+    /// Run `pwd` (or a tmux-aware variant) via exec channel and navigate SFTP
+    /// to the result (right-click follow). `cmd` lets the caller pick a
+    /// tmux-pane-aware query when the terminal is inside tmux.
+    FollowTerminalCwd { cmd: String },
     /// Gracefully shut down the SFTP worker.
     Close,
 }
@@ -283,9 +285,10 @@ impl SftpHandle {
     pub fn exec_query_cwd(&self, cmd: String, fallback: Option<String>) {
         let _ = self.commands.send(SftpCommand::ExecQueryCwd { cmd, fallback });
     }
-    /// Run `pwd` via exec channel and navigate SFTP to the result.
-    pub fn follow_terminal_cwd(&self) {
-        let _ = self.commands.send(SftpCommand::FollowTerminalCwd);
+    /// Run `cmd` via exec channel and navigate SFTP to the result. The caller
+    /// picks the command: `pwd` outside tmux, a pane-aware query inside tmux.
+    pub fn follow_terminal_cwd(&self, cmd: String) {
+        let _ = self.commands.send(SftpCommand::FollowTerminalCwd { cmd });
     }
 }
 
@@ -711,12 +714,12 @@ async fn run_sftp(
                 });
             }
 
-            SftpCommand::FollowTerminalCwd => {
+            SftpCommand::FollowTerminalCwd { cmd } => {
                 let h = handle.clone();
                 let ev = events.clone();
                 let tx = self_tx.clone();
                 tokio::spawn(async move {
-                    if let Ok(output) = run_remote_exec_capture(&h, "pwd").await {
+                    if let Ok(output) = run_remote_exec_capture(&h, &cmd).await {
                         let path = output.trim().to_string();
                         if !path.is_empty() && path.starts_with('/') {
                             let _ = ev.send(SessionEvent::CwdChanged(path.clone()));

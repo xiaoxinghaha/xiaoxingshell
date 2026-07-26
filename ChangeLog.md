@@ -2,6 +2,24 @@
 
 ## 2026-07-26
 
+### 修复 tmux 内右键 SFTP Follow 跳到 home 目录
+
+- 根因：
+  右键 `FollowTerminalCwd` 通过 SFTP 的独立 exec channel 执行 `pwd`。这个
+  exec channel 是新开的 SSH 通道，不是用户 tmux 终端里的 shell，起始工作目录
+  是用户 home，所以 `pwd` 返回 home，SFTP 跳到 home 而不是 tmux 窗格的当前
+  目录，表现为"跟随失败/没跟过去"。
+- 修复：
+  `on_sftp_follow_terminal` handler 根据 `tmux_state` 判断是否在 tmux 内：
+  - tmux 内：命令改为 `cat /tmp/.meatshell_pane_cwd 2>/dev/null || pwd`，
+    读 OSC 7 hook 在每个 prompt 写入的活动窗格 PWD（hook 未装上则回退 pwd）；
+  - 非 tmux：命令保持 `pwd`，行为不变。
+  为此 `SftpCommand::FollowTerminalCwd` 变体加 `cmd` 字段，`follow_terminal_cwd`
+  方法接受命令参数，由调用方决定查询命令。
+- 涉及文件：
+  `src/sftp.rs`（FollowTerminalCwd 变体 + handler + 方法签名）、
+  `src/app.rs`（on_sftp_follow_terminal handler 按 tmux 状态选命令）
+
 ### 修复右键 SFTP Follow 在 follow-cd 关闭时卡在"加载中"
 
 - 根因：
