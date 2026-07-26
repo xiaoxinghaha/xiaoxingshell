@@ -17,18 +17,19 @@
      目录）。pump 线程收到 `CwdChanged` 时**无条件**更新它（在 follow-cd 的
      `continue` 之前），保证它始终是终端真实当前目录，不受 follow-cd 开关影响。
   2. `on_sftp_follow_terminal` handler 改为**不依赖 in_tmux 分流**的统一逻辑：
-     - 命令 `cat /tmp/.meatshell_pane_cwd 2>/dev/null`（不带 `|| pwd`，让失败
-       暴露出来）；`terminal_cwd` 作为 fallback 传给 sftp worker。
-     - sftp worker 先 exec cat：tmux 内 hook 写了文件 → 成功 → 用 cat 结果
-       （tmux 窗格真实 PWD）；非 tmux 文件不存在 → exec 失败 → 用 fallback
-       （OSC 7 路径）。
-     - 去掉 `in_tmux` 分支，避免依赖 `tmux_state` 检测（输入 tmux 命令才置
-       true，时序/检测遗漏会走错分支）。
+     - `terminal_cwd`（OSC 7 路径）作为 fallback 传给 sftp worker。
+     - sftp worker 用 **SFTP 协议直接读取** `/tmp/.meatshell_pane_cwd`（不用 exec
+       channel）：tmux 内 hook 写了文件 → 读取成功 → 用文件内容（tmux 窗格真实
+       PWD）；非 tmux 文件不存在 → 读取失败 → 用 fallback（OSC 7 路径）。
+     - 之前用 exec `cat` 读取，但 exec channel 的 `pwd` 恒返回 home，且 `cat`
+       可能因 restricted shell / `ForceCommand` / PATH 失败，导致 exec 结果为空、
+       静默回退到 fallback（进入 tmux 前的路径）。改用 SFTP 协议读文件彻底绕开
+       exec channel，不再依赖 shell 执行环境。
 - 涉及文件：
   `src/app.rs`（ConnectCtx 加 terminal_cwd 字段 + pump 线程更新 + handler
   统一逻辑 + wire_session_callbacks 透传 terminal_cwd）、
-  `src/sftp.rs`（FollowTerminalCwd { cmd, fallback } 变体 + handler exec
-  失败用 fallback）
+  `src/sftp.rs`（FollowTerminalCwd { fallback } 变体 + handler 用 sftp.open
+  读取 hook 文件，失败用 fallback）
 
 ### 修复右键 SFTP Follow 在 follow-cd 关闭时卡在"加载中"
 

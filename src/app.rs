@@ -6602,32 +6602,24 @@ fn wire_key_input(
     }
 
     // Context menu → SFTP Follow: jump the SFTP panel to the terminal's cwd.
-    // The exec channel's `pwd` always returns $HOME, so we instead cat the
-    // hook-written /tmp/.meatshell_pane_cwd (authoritative inside tmux, where
-    // OSC 7 is swallowed by tmux). When that file is absent (outside tmux),
-    // the exec fails and we fall back to the OSC 7 cwd recorded in
-    // `terminal_cwd` — no `in_tmux` flag needed, so the detection can't go
-    // wrong and send us down the wrong branch.
+    // The sftp worker reads /tmp/.meatshell_pane_cwd via SFTP — the hook
+    // writes the active pane's $PWD there on every tmux prompt, so inside
+    // tmux (where OSC 7 is swallowed by tmux) it's authoritative. Outside
+    // tmux the file is absent, so `terminal_cwd` (OSC 7) is the fallback.
+    // No exec channel / `in_tmux` flag involved — both are unreliable here.
     {
         let sftp_h = sftp_h_for_follow.clone();
         let terminal_cwd = terminal_cwd_for_follow.clone();
         window.on_sftp_follow_terminal(move |tab_id: SharedString| {
             let tid = tab_id.to_string();
-            // OSC 7 cwd as fallback (reliable outside tmux, where the hook
-            // file doesn't exist so the exec below fails).
             let fallback = terminal_cwd
                 .lock()
                 .ok()
                 .and_then(|m| m.get(tid.as_str()).cloned())
                 .filter(|p| !p.is_empty() && p.starts_with('/'));
-            // Inside tmux the hook writes the active pane's $PWD to this file
-            // on every prompt; `2>/dev/null` keeps exec exit-code clean when
-            // it's missing. No `|| pwd` — that would mask the failure with
-            // $HOME and shadow the OSC 7 fallback.
-            let cmd = "cat /tmp/.meatshell_pane_cwd 2>/dev/null".to_string();
             if let Ok(handles) = sftp_h.lock() {
                 if let Some(h) = handles.get(&tid) {
-                    h.follow_terminal_cwd(cmd, fallback);
+                    h.follow_terminal_cwd(fallback);
                 }
             }
         });
