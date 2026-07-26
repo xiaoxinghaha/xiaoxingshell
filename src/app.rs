@@ -5747,6 +5747,7 @@ fn wire_key_input(
     // readline handles echo, history (↑↓), Tab completion, Ctrl+C, etc.
     let sftp_h_for_follow = ctx.sftp_handles.clone();
     let terminal_cwd_for_follow = ctx.terminal_cwd.clone();
+    let tmux_state_for_follow = ctx.tmux_state.clone();
     {
         let handles = handles.clone();
         let bufs = bufs.clone();
@@ -6602,14 +6603,14 @@ fn wire_key_input(
     }
 
     // Context menu → SFTP Follow: jump the SFTP panel to the terminal's cwd.
-    // The sftp worker reads ~/.cache/meatshell/pane_cwd via SFTP — the hook
-    // writes $PWD there on every prompt (inside and outside tmux), so it's
-    // authoritative. Falls back to `terminal_cwd` (OSC 7) only if the hook
-    // file is missing (e.g. hook not yet installed). No exec channel /
-    // `in_tmux` flag involved — both are unreliable here.
+    // Inside tmux, the sftp worker queries tmux directly for the active pane's
+    // cwd (tmux tracks it natively — reliable, no shell-hook dependency).
+    // Outside tmux, it reads the hook-written ~/.cache/meatshell/pane_cwd via
+    // SFTP. `terminal_cwd` (OSC 7) is the final fallback.
     {
         let sftp_h = sftp_h_for_follow.clone();
         let terminal_cwd = terminal_cwd_for_follow.clone();
+        let tmux_state = tmux_state_for_follow.clone();
         window.on_sftp_follow_terminal(move |tab_id: SharedString| {
             let tid = tab_id.to_string();
             let fallback = terminal_cwd
@@ -6617,9 +6618,15 @@ fn wire_key_input(
                 .ok()
                 .and_then(|m| m.get(tid.as_str()).cloned())
                 .filter(|p| !p.is_empty() && p.starts_with('/'));
+            let in_tmux = tmux_state
+                .lock()
+                .ok()
+                .and_then(|m| m.get(tid.as_str()).copied())
+                .map(|(in_tmux, _)| in_tmux)
+                .unwrap_or(false);
             if let Ok(handles) = sftp_h.lock() {
                 if let Some(h) = handles.get(&tid) {
-                    h.follow_terminal_cwd(fallback);
+                    h.follow_terminal_cwd(fallback, in_tmux);
                 }
             }
         });
