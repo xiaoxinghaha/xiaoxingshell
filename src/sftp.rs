@@ -531,6 +531,34 @@ async fn run_sftp(
         }
     }
 
+    // Install the cwd hook at connect time so that shells started later inside
+    // tmux (which source .bashrc/.zshrc) emit OSC 7 + write pane_cwd from their
+    // very first prompt. PROMPT_COMMAND is a shell variable and is NOT inherited
+    // by tmux pane processes, so injecting it only into the outer shell leaves
+    // every inner pane without the hook — the pane_cwd file goes stale and
+    // right-click SFTP-follow jumps to the pre-tmux directory. Best-effort:
+    // failures are silent (follow falls back to the outer-shell OSC 7 cwd).
+    {
+        let hook_file = format!(
+            "{}/{}",
+            home.trim_end_matches('/'),
+            crate::ssh::MEATSHELL_HOOK_REL
+        );
+        let hook_dir =
+            hook_file[..hook_file.rfind('/').unwrap_or(hook_file.len())].to_string();
+        let hook_content = crate::ssh::cwd_hook_script();
+        let _ = ensure_remote_dir(&sftp, &hook_dir).await;
+        let _ = write_text_file(&sftp, &hook_file, &hook_content).await;
+        let home_t = home.trim_end_matches('/');
+        for rc in [
+            format!("{home_t}/.bashrc"),
+            format!("{home_t}/.zshrc"),
+            format!("{home_t}/.bash_profile"),
+        ] {
+            let _ = ensure_rc_hook(&sftp, &rc, &hook_file).await;
+        }
+    }
+
     // --- Directory tree initialization -------------------------------------
     // tree_dirs: path -> [(child_name, child_full_path)] for directories only
     // tree_expanded: set of paths currently shown as expanded
