@@ -677,25 +677,37 @@ async fn run_sftp(
                 let h = handle.clone();
                 let ev = events.clone();
                 tokio::spawn(async move {
-                    match run_remote_exec_capture(&h, &cmd).await {
-                        Ok(output) => {
-                            let path = output.trim().to_string();
-                            if !path.is_empty() && path.starts_with('/') {
-                                let _ = ev.send(SessionEvent::CwdChanged(path));
-                            } else if let Some(fb) = fallback {
-                                let _ = ev.send(SessionEvent::CwdChanged(fb));
-                            } else {
-                                let _ = ev.send(SessionEvent::TmuxExited);
-                            }
-                        }
-                        Err(_) => {
-                            if let Some(fb) = fallback {
-                                let _ = ev.send(SessionEvent::CwdChanged(fb));
-                            } else {
-                                let _ = ev.send(SessionEvent::TmuxExited);
-                            }
-                        }
+                    let output = run_remote_exec_capture(&h, &cmd).await;
+                    let path = match &output {
+                        Ok(o) => o.trim().to_string(),
+                        Err(_) => String::new(),
+                    };
+                    if !path.is_empty() && path.starts_with('/') {
+                        let _ = ev.send(SessionEvent::CwdChanged(path));
+                        return;
                     }
+                    if path == "__TMUX_GONE__" {
+                        let _ = ev.send(SessionEvent::TmuxExited);
+                        return;
+                    }
+                    // Transient failure (binary not found, channel error, etc.).
+                    // Retry once after 700ms before giving up silently.
+                    if let Some(fb) = fallback {
+                        let _ = ev.send(SessionEvent::CwdChanged(fb));
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+                    let retry = run_remote_exec_capture(&h, &cmd).await;
+                    let rpath = match &retry {
+                        Ok(o) => o.trim().to_string(),
+                        Err(_) => String::new(),
+                    };
+                    if !rpath.is_empty() && rpath.starts_with('/') {
+                        let _ = ev.send(SessionEvent::CwdChanged(rpath));
+                    } else if rpath == "__TMUX_GONE__" {
+                        let _ = ev.send(SessionEvent::TmuxExited);
+                    }
+                    // Still empty → silently ignore; next Enter retries.
                 });
             }
 

@@ -7916,8 +7916,12 @@ fn install_tmux_cwd_hook(ctx: &ConnectCtx, tab_id: &str) {
 /// tmux; read that first. Fall back to list-panes for the active pane.
 /// `display-message -p` is NOT used: it requires $TMUX client context which
 /// the exec channel does not have.
+/// Output contract:
+///   - A path starting with '/' → success.
+///   - "__TMUX_GONE__" → tmux server confirmed not running.
+///   - Empty → transient failure (binary not found, etc.); caller retries.
 const TMUX_CWD_QUERY: &str =
-    "{ tmux has 2>/dev/null && { p=$(cat /tmp/.meatshell_pane_cwd 2>/dev/null); [ -n \"$p\" ] && printf '%s\\n' \"$p\" && exit 0; }; tmux list-panes -a -F '#{?pane_active,#{pane_current_path},}' 2>/dev/null | sed '/^$/d' | head -1; }";
+    "T=\"\"; for p in /usr/bin/tmux /usr/local/bin/tmux /bin/tmux /sbin/tmux /opt/homebrew/bin/tmux; do [ -x \"$p\" ] && T=\"$p\" && break; done; [ -z \"$T\" ] && T=$(command -v tmux 2>/dev/null); [ -z \"$T\" ] && exit 0; if ! \"$T\" has 2>/dev/null; then printf '__TMUX_GONE__\\n'; exit 0; fi; p=$(cat /tmp/.meatshell_pane_cwd 2>/dev/null); [ -n \"$p\" ] && printf '%s\\n' \"$p\" && exit 0; \"$T\" list-panes -a -F '#{?pane_active,#{pane_current_path},}' 2>/dev/null | sed '/^$/d' | head -1";
 
 /// Schedule a tmux cwd query via the SFTP exec channel after `delay_ms`.
 /// If `fallback` is Some and the query fails, CwdChanged fires with fallback.

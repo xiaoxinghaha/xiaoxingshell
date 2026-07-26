@@ -2,6 +2,23 @@
 
 ## 2026-07-26
 
+### 修复 tmux cd 跟随：exec 通道找不到 tmux 二进制 + 误判 TmuxExited
+
+- 根因：
+  SFTP exec 通道以最小 PATH（`/usr/bin:/bin`）执行命令，tmux 常安装在
+  `/usr/local/bin`，导致 `tmux has` / `tmux list-panes` 静默失败、输出为空。
+  旧逻辑将空输出等同于 "tmux 已退出"，连续 2 次后 `in_tmux=false` →
+  本地缓冲重新启用 → 吞字符 + SFTP 不再跟随。
+- 修复：
+  1. `TMUX_CWD_QUERY` 改为遍历 `/usr/bin`、`/usr/local/bin`、`/bin`、`/sbin`、
+     `/opt/homebrew/bin` 查找 tmux 二进制，最后回退 `command -v`。
+  2. 输出协议：路径（成功）/ `__TMUX_GONE__`（tmux 服务确认不在）/ 空（瞬态失败）。
+  3. `ExecQueryCwd` handler 仅在收到 `__TMUX_GONE__` 时发送 `TmuxExited`；
+     空输出/错误视为瞬态失败，700ms 后重试一次，仍失败则静默忽略（下次回车再试），
+     不再误触发 `in_tmux=false`。
+- 涉及文件：
+  `src/app.rs`（TMUX_CWD_QUERY 重写）、`src/sftp.rs`（ExecQueryCwd handler 重写）
+
 ### 修复 tmux 内 cd 跟随完全失效（exec 查询无 $TMUX 上下文）
 
 - 根因：
