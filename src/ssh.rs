@@ -99,7 +99,7 @@ fn contains_zmodem_init(data: &[u8]) -> bool {
 /// Shell hook body injected once after the first prompt so the SFTP panel can
 /// follow `cd` via OSC 7. Defined here (module level) so both the interactive
 /// shell injection and the tmux hook-file writer can share it (#158).
-pub const PROMPT_BODY: &str = "test -z \"$FISH_VERSION\" && eval '__msc(){ __c=\"$(fc -ln -1 2>/dev/null)\"; [ -n \"$__c\" ] && [ \"$__c\" != \"$__cl\" ] && { __cl=\"$__c\"; printf \"\\033]697;%s\\007\" \"$__c\"; }; }; __ms7(){ __msc; printf \"\\033]7;file://%s%s\\007\" \"$HOSTNAME\" \"$PWD\"; mkdir -p \"$HOME/.cache/meatshell\" 2>/dev/null; printf \"%s\" \"$PWD\" > \"$HOME/.cache/meatshell/pane_cwd\" 2>/dev/null; }; __h=\"$(history 1 2>/dev/null)\"; __h=\"${__h#\"${__h%%[! ]*}\"}\"; __h=\"${__h%%[!0-9]*}\"; [ -n \"$BASH_VERSION\" ] && [ -n \"$__h\" ] && history -d \"$__h\" 2>/dev/null; unset __h; __cl=\"$(fc -ln -1 2>/dev/null)\"; if [ -n \"$ZSH_VERSION\" ]; then autoload -Uz add-zsh-hook 2>/dev/null; add-zsh-hook precmd __ms7; else PROMPT_COMMAND=\"__ms7${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"; fi; __ms7'";
+pub const PROMPT_BODY: &str = "test -z \"$FISH_VERSION\" && eval '__msc(){ __c=\"$(fc -ln -1 2>/dev/null)\"; [ -n \"$__c\" ] && [ \"$__c\" != \"$__cl\" ] && { __cl=\"$__c\"; printf \"\\033]697;%s\\007\" \"$__c\"; }; }; __ms7(){ __msc; printf \"\\033]7;file://%s%s\\007\" \"$HOSTNAME\" \"$PWD\"; mkdir -p \"$HOME/.cache/meatshell\" 2>/dev/null; printf \"%s\" \"$PWD\" > \"$HOME/.cache/meatshell/pane_cwd\" 2>/dev/null; }; __h=\"$(history 1 2>/dev/null)\"; __h=\"${__h#\"${__h%%[! ]*}\"}\"; __h=\"${__h%%[!0-9]*}\"; [ -n \"$BASH_VERSION\" ] && [ -n \"$__h\" ] && history -d \"$__h\" 2>/dev/null; unset __h; __cl=\"$(fc -ln -1 2>/dev/null)\"; if [ -n \"$ZSH_VERSION\" ]; then autoload -Uz add-zsh-hook 2>/dev/null; add-zsh-hook precmd __ms7; else PROMPT_COMMAND=\"__ms7${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"; fi; __ms7; printf \"\\033]99;__msh_hk\\007\"'";
 
 /// Remote path (relative to the user's home) of the cwd-hook script that
 /// meatshell drops into a tmux session so inner panes also emit OSC 7 (#158).
@@ -186,6 +186,31 @@ fn extract_osc7_end(text: &str) -> Option<(String, usize)> {
         i = end + term_len.max(1);
     }
     None
+}
+
+/// Unique marker our injected setup command prints at its very end
+/// (`ESC ] 99 ; __msh_hk BEL`). It is used to know when the setup line has
+/// finished executing so its server-side echo can be stripped (#98). We anchor
+/// on THIS marker rather than on the OSC 7 (`ESC ] 7 ; file://…`) because
+/// modern shells/dotfiles already emit OSC 7 on every prompt for terminal
+/// integration — anchoring on the first OSC 7 would end suppression too early
+/// (on the shell's own OSC 7, which precedes our injected command), leaving
+/// the echoed setup line visible.
+const HOOK_DONE_MARKER: &[u8] = b"\x1b]99;__msh_hk\x07";
+
+/// Return the byte index just past [`HOOK_DONE_MARKER`] in `text`, if present.
+/// Used by the connect-time echo suppression to find where our setup command
+/// ended so everything before it (the echoed command + its OSC output) can be
+/// discarded (#98).
+fn find_hook_done_marker(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    if bytes.len() < HOOK_DONE_MARKER.len() {
+        return None;
+    }
+    bytes
+        .windows(HOOK_DONE_MARKER.len())
+        .position(|w| w == HOOK_DONE_MARKER)
+        .map(|i| i + HOOK_DONE_MARKER.len())
 }
 
 /// Find a meatshell command-capture sequence (`ESC ] 697 ; <command> BEL|ST`)
@@ -1005,12 +1030,16 @@ async fn run_session(
                         let mut text = if suppress_echo {
                             echo_buf.push_str(&chunk);
                             const ECHO_BUF_CAP: usize = 1 << 14; // 16 KiB
-                            if let Some((cwd, seq_end)) = extract_osc7_end(&echo_buf) {
+                            if let Some(marker_end) = find_hook_done_marker(&echo_buf) {
                                 suppress_echo = false;
                                 flush_pending_input = true;
-                                tracing::debug!("OSC7 cwd={:?}", cwd);
-                                let _ = events.send(SessionEvent::CwdChanged(cwd));
-                                let rest = echo_buf[seq_end..].to_string();
+                                // Extract the cwd from the OSC 7 our hook emitted
+                                // in the (now-discarded) region before the marker.
+                                if let Some(cwd) = extract_osc7_path(&echo_buf[..marker_end]) {
+                                    tracing::debug!("OSC7 cwd={:?}", cwd);
+                                    let _ = events.send(SessionEvent::CwdChanged(cwd));
+                                }
+                                let rest = echo_buf[marker_end..].to_string();
                                 echo_buf.clear();
                                 rest
                             } else if echo_buf.len() >= ECHO_BUF_CAP {
@@ -1809,6 +1838,41 @@ mod osc_command_tests {
         assert!(script.contains("PROMPT_COMMAND"));
         // The script is safe to `source` directly (no surrounding eval needed).
         assert!(script.starts_with("#!/bin/sh"));
+    }
+
+    #[test]
+    fn hook_done_marker_anchors_suppression_past_server_osc7() {
+        // Simulate a server that already emits OSC 7 on its prompt (modern
+        // dotfiles / oh-my-zsh). The echoed setup command follows, then our
+        // unique done-marker. Suppression must end on the marker, NOT on the
+        // server's own OSC 7, so the echoed command is fully discarded.
+        let echoed = "root@host:~#  test -z \"$FISH_VERSION\" && eval '...'";
+        let server_osc7 = "\u{1b}]7;file://host/root\u{07}";
+        let our_osc7 = "\u{1b}]7;file://host/root\u{07}";
+        let marker = "\u{1b}]99;__msh_hk\u{07}";
+        let prompt = "root@host:~# ";
+        let buf = format!("{server_osc7}{echoed}{our_osc7}{marker}{prompt}");
+
+        // The marker is found and sits AFTER the echoed command, so everything
+        // up to it (including the server's OSC 7 and the echoed command) is the
+        // part we discard.
+        let marker_end = super::find_hook_done_marker(&buf).expect("marker present");
+        let discarded = &buf[..marker_end];
+        assert!(discarded.contains(&echoed), "echoed command must be stripped");
+        assert!(discarded.contains(server_osc7), "server OSC7 must be stripped");
+        let rest = &buf[marker_end..];
+        assert_eq!(rest, prompt, "only the fresh prompt survives");
+
+        // cwd is still recoverable from the discarded region (our OSC 7).
+        assert_eq!(super::extract_osc7_path(discarded), Some("/root".to_string()));
+    }
+
+    #[test]
+    fn hook_done_marker_absent_until_setup_runs() {
+        // Before our setup emits the marker, it must not be found (so buffering
+        // continues and nothing is shown prematurely).
+        assert!(super::find_hook_done_marker("root@host:~# some unrelated output").is_none());
+        assert!(super::find_hook_done_marker("").is_none());
     }
 }
 
