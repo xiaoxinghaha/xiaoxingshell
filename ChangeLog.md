@@ -16,8 +16,10 @@
   3. `ExecQueryCwd` handler 仅在收到 `__TMUX_GONE__` 时发送 `TmuxExited`；
      空输出/错误视为瞬态失败，700ms 后重试一次，仍失败则静默忽略（下次回车再试），
      不再误触发 `in_tmux=false`。
+  4. 检测 `Ctrl+b d` detach：pump 线程监听输出中的 `[detached (from session`
+     字符串，检测到后立即 `in_tmux=false` 并解锁本地缓冲，恢复外层 shell 跟随。
 - 涉及文件：
-  `src/app.rs`（TMUX_CWD_QUERY 重写）、`src/sftp.rs`（ExecQueryCwd handler 重写）
+  `src/app.rs`（TMUX_CWD_QUERY 重写 + detach 检测）、`src/sftp.rs`（ExecQueryCwd handler 重写）
 
 ### 修复 tmux 内 cd 跟随完全失效（exec 查询无 $TMUX 上下文）
 

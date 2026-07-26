@@ -3225,6 +3225,27 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                                 }
                             }
                         }
+                        // Detect tmux detach (Ctrl+b d): the outer terminal
+                        // receives "[detached (from session ...)]".
+                        if let SessionEvent::Output(ref chunk) = shell_evt {
+                            if chunk.contains("[detached (from session") {
+                                if let Ok(mut ts) = tmux_state_pump.lock() {
+                                    if let Some(state) =
+                                        ts.get_mut(tab_id_pump.as_str())
+                                    {
+                                        state.0 = false;
+                                        state.1 = 0;
+                                    }
+                                }
+                                if let Ok(mut map) = bufs_thread.lock() {
+                                    if let Some(buf) =
+                                        map.get_mut(tab_id_pump.as_str())
+                                    {
+                                        buf.unlock_local_input_at_prompt();
+                                    }
+                                }
+                            }
+                        }
                         let weak_evt = weak_inner.clone();
                         let tid = tab_id_pump.clone();
                         let bufs_evt = bufs_thread.clone();
