@@ -3183,7 +3183,8 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                                 continue;
                             }
                             // 目录真正变化时才跟随；prompt 重复报同一目录则跳过。
-                            // OSC 7 给出绝对路径，无需解析相对路径，天然可靠。
+                            // tmux 内 CwdChanged 来自 exec 查询（tmux 拦截 OSC 7），
+                            // 路径可靠；tmux 外来自 OSC 7 绝对路径，同样可靠。
                             let dir_changed = {
                                 let m = sftp_last_cwd_pump.lock().ok();
                                 m.as_ref()
@@ -6170,6 +6171,12 @@ fn wire_key_input(
                 .get(tid.as_str())
                 .map(|s| s.0)
                 .unwrap_or(false);
+            // tmux intercepts OSC 7 / OSC 697 and does not forward them, so
+            // the only reliable follow channel is an exec query that asks tmux
+            // for the active pane's working directory (#158).
+            if in_tmux_now && (key_for_pty == "\n" || key_for_pty == "\r") && !ctrl && !alt {
+                schedule_tmux_cwd_query(&ctx, tid.as_str(), 500, None);
+            }
             if snapped_to_live || repaint_after_local {
                 pending_ui_refresh.lock().unwrap().push(tid.clone());
             }
@@ -7902,16 +7909,16 @@ fn install_tmux_cwd_hook(ctx: &ConnectCtx, tab_id: &str) {
 }
 
 /// Shell command to query the active tmux pane's working directory.
-/// Retained as a fallback; the primary tmux follow path is OSC 7 from the
-/// inner shell's hook (see `install_tmux_cwd_hook`, #158).
-#[allow(dead_code)]
+/// Primary tmux follow path: tmux intercepts OSC 7 / OSC 697 and does NOT
+/// forward them to the outer terminal, so the only reliable channel is an
+/// exec query via the SFTP connection (#158).
 const TMUX_CWD_QUERY: &str =
     "tmux display-message -p '#{pane_current_path}' 2>/dev/null || tmux list-panes -a -F '#{pane_current_path}' 2>/dev/null | head -1";
 
 /// Schedule a tmux cwd query via the SFTP exec channel after `delay_ms`.
 /// If `fallback` is Some and the query fails, CwdChanged fires with fallback.
-/// Currently unused (OSC 7 drives tmux follow); kept as a fallback (#158).
-#[allow(dead_code)]
+/// This is the primary tmux follow path because tmux intercepts OSC 7 / OSC 697
+/// and does not forward them to the outer terminal (#158).
 fn schedule_tmux_cwd_query(
     ctx: &ConnectCtx,
     tab_id: &str,

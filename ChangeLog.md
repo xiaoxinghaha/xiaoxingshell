@@ -1,5 +1,26 @@
 # ChangeLog
 
+## 2026-07-26
+
+### 彻底修复 tmux 内 cd 跟随截断路径问题（`cd /root/` → `/roo`）
+
+- 根因：
+  tmux 会拦截 OSC 7 / OSC 697 序列不转发给外层终端，之前的 OSC 7 钩子注入方案
+  在 tmux 内实际收不到序列；同时本地按键追踪在 tmux 内被禁用（`!in_tmux_now`），
+  导致 tmux 内所有 cd 跟随通道均不可靠，快速输入时末字符与回车竞态丢尾字符
+  （`cd /root/` → `cd /roo`）。
+- 修复：
+  恢复 `schedule_tmux_cwd_query` 为 tmux 内主跟随通道——每次回车后延迟 500ms
+  通过 SFTP exec 通道执行 `tmux display-message -p '#{pane_current_path}'`
+  获取真实目录，不受 tmux OSC 拦截影响。
+- 修复：
+  `find_incomplete_osc_tail` 新增对 chunk 末尾孤立 `ESC`（0x1b）的检测，
+  防止 OSC 序列恰好在 `ESC` 处被数据块切断时整条丢失。
+- 调整：
+  OSC 7 钩子注入保留为辅助通道（适用于配置了 `allow-passthrough on` 的 tmux 3.3+）。
+- 涉及文件：
+  `src/app.rs`、`src/ssh.rs`
+
 ## 2026-07-25
 
 ### 修复 SFTP 右键修改权限后文件变成 0 字节

@@ -265,6 +265,12 @@ fn find_incomplete_osc_tail(s: &str) -> Option<usize> {
         }
         i += 1;
     }
+    // A lone ESC at the very end may be the first byte of an OSC sequence
+    // whose `]…` arrives in the next data read. Hold it back so the
+    // reassembled sequence is not dropped (#158).
+    if bytes.last() == Some(&0x1b) {
+        return Some(bytes.len() - 1);
+    }
     let start = last?;
     if osc_has_terminator(&s[start..]) {
         None
@@ -1777,6 +1783,20 @@ mod osc_command_tests {
     #[test]
     fn plain_text_has_no_incomplete_tail() {
         assert!(find_incomplete_osc_tail("just normal output").is_none());
+    }
+
+    #[test]
+    fn lone_esc_at_end_is_held_back() {
+        // ESC alone at the end of a chunk: the `]7;…` half arrives in the
+        // next read. Must be carried so the reassembled OSC 7 is not lost.
+        let chunk = "cd /root/\r\n\u{1b}";
+        let tail = find_incomplete_osc_tail(chunk);
+        assert_eq!(tail, Some(chunk.len() - 1));
+        // Prepending the carried ESC to the next chunk reassembles a valid
+        // OSC 7 that extract_osc7_path can read.
+        let carried = &chunk[tail.unwrap()..];
+        let completed = format!("{carried}]7;file://host/root\u{07}");
+        assert!(super::extract_osc7_path(&completed).is_some());
     }
 
     #[test]
