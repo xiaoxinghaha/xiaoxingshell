@@ -16,17 +16,19 @@
   1. 新增共享状态 `ConnectCtx::terminal_cwd`（per-tab，OSC 7 报告的终端当前
      目录）。pump 线程收到 `CwdChanged` 时**无条件**更新它（在 follow-cd 的
      `continue` 之前），保证它始终是终端真实当前目录，不受 follow-cd 开关影响。
-  2. `on_sftp_follow_terminal` handler 重新设计：
-     - 非 tmux 且 `terminal_cwd` 有效：直接 `list_dir(path)`，用 OSC 7 已知
-       路径跳转，不走 exec channel（避免 pwd 返回 home）；
-     - tmux 内（OSC 7 被 tmux 拦截，`terminal_cwd` 不可靠）：exec 查询
-       `cat /tmp/.meatshell_pane_cwd 2>/dev/null || pwd`（hook 在每个 tmux
-       prompt 写入活动窗格 PWD）；
-     - 非 tmux 且 `terminal_cwd` 无效（刚连接还没出 prompt）：回退 `pwd`。
+  2. `on_sftp_follow_terminal` handler 改为**不依赖 in_tmux 分流**的统一逻辑：
+     - 命令 `cat /tmp/.meatshell_pane_cwd 2>/dev/null`（不带 `|| pwd`，让失败
+       暴露出来）；`terminal_cwd` 作为 fallback 传给 sftp worker。
+     - sftp worker 先 exec cat：tmux 内 hook 写了文件 → 成功 → 用 cat 结果
+       （tmux 窗格真实 PWD）；非 tmux 文件不存在 → exec 失败 → 用 fallback
+       （OSC 7 路径）。
+     - 去掉 `in_tmux` 分支，避免依赖 `tmux_state` 检测（输入 tmux 命令才置
+       true，时序/检测遗漏会走错分支）。
 - 涉及文件：
   `src/app.rs`（ConnectCtx 加 terminal_cwd 字段 + pump 线程更新 + handler
-  按 tmux 状态分流 + wire_session_callbacks 透传 terminal_cwd）、
-  `src/sftp.rs`（保留 FollowTerminalCwd { cmd } 变体，tmux 分支使用）
+  统一逻辑 + wire_session_callbacks 透传 terminal_cwd）、
+  `src/sftp.rs`（FollowTerminalCwd { cmd, fallback } 变体 + handler exec
+  失败用 fallback）
 
 ### 修复右键 SFTP Follow 在 follow-cd 关闭时卡在"加载中"
 

@@ -5746,7 +5746,6 @@ fn wire_key_input(
     // Forward each keystroke as raw bytes to the SSH PTY. The server's bash /
     // readline handles echo, history (↑↓), Tab completion, Ctrl+C, etc.
     let sftp_h_for_follow = ctx.sftp_handles.clone();
-    let tmux_state_for_follow = ctx.tmux_state.clone();
     let terminal_cwd_for_follow = ctx.terminal_cwd.clone();
     {
         let handles = handles.clone();
@@ -6603,50 +6602,32 @@ fn wire_key_input(
     }
 
     // Context menu → SFTP Follow: jump the SFTP panel to the terminal's cwd.
-    // The exec channel is a fresh SSH channel whose `pwd` always returns
-    // $HOME, so outside tmux we use the cwd OSC 7 already reported to us
-    // (kept in `terminal_cwd`, updated regardless of the follow-cd setting).
-    // Inside tmux OSC 7 is swallowed by tmux, so we fall back to reading the
-    // hook-written /tmp/.meatshell_pane_cwd via an exec round-trip.
+    // The exec channel's `pwd` always returns $HOME, so we instead cat the
+    // hook-written /tmp/.meatshell_pane_cwd (authoritative inside tmux, where
+    // OSC 7 is swallowed by tmux). When that file is absent (outside tmux),
+    // the exec fails and we fall back to the OSC 7 cwd recorded in
+    // `terminal_cwd` — no `in_tmux` flag needed, so the detection can't go
+    // wrong and send us down the wrong branch.
     {
         let sftp_h = sftp_h_for_follow.clone();
-        let tmux_state = tmux_state_for_follow.clone();
         let terminal_cwd = terminal_cwd_for_follow.clone();
         window.on_sftp_follow_terminal(move |tab_id: SharedString| {
             let tid = tab_id.to_string();
-            let in_tmux = tmux_state
+            // OSC 7 cwd as fallback (reliable outside tmux, where the hook
+            // file doesn't exist so the exec below fails).
+            let fallback = terminal_cwd
                 .lock()
                 .ok()
-                .and_then(|m| m.get(tid.as_str()).map(|s| s.0))
-                .unwrap_or(false);
-            // Outside tmux: trust OSC 7's cwd if we have one.
-            if !in_tmux {
-                let cwd = terminal_cwd
-                    .lock()
-                    .ok()
-                    .and_then(|m| m.get(tid.as_str()).cloned())
-                    .unwrap_or_default();
-                if !cwd.is_empty() && cwd.starts_with('/') {
-                    if let Ok(handles) = sftp_h.lock() {
-                        if let Some(h) = handles.get(&tid) {
-                            h.list_dir(cwd);
-                        }
-                    }
-                    return;
-                }
-            }
-            // tmux (OSC 7 swallowed) or no OSC 7 yet: exec-query the remote.
-            // /tmp/.meatshell_pane_cwd is written by the hook on every tmux
-            // prompt; `pwd` is a last-resort fallback (returns $HOME).
-            let cmd = if in_tmux {
-                "cat /tmp/.meatshell_pane_cwd 2>/dev/null || pwd"
-            } else {
-                "pwd"
-            }
-            .to_string();
+                .and_then(|m| m.get(tid.as_str()).cloned())
+                .filter(|p| !p.is_empty() && p.starts_with('/'));
+            // Inside tmux the hook writes the active pane's $PWD to this file
+            // on every prompt; `2>/dev/null` keeps exec exit-code clean when
+            // it's missing. No `|| pwd` — that would mask the failure with
+            // $HOME and shadow the OSC 7 fallback.
+            let cmd = "cat /tmp/.meatshell_pane_cwd 2>/dev/null".to_string();
             if let Ok(handles) = sftp_h.lock() {
                 if let Some(h) = handles.get(&tid) {
-                    h.follow_terminal_cwd(cmd);
+                    h.follow_terminal_cwd(cmd, fallback);
                 }
             }
         });
