@@ -2,24 +2,25 @@
 
 ## 2026-07-26
 
-### 修复 tmux cd 跟随：exec 通道找不到 tmux 二进制 + 误判 TmuxExited
+### 重写 tmux cd 跟随：后台轮询代替回车触发
 
 - 根因：
-  SFTP exec 通道以最小 PATH（`/usr/bin:/bin`）执行命令，tmux 常安装在
-  `/usr/local/bin`，导致 `tmux has` / `tmux list-panes` 静默失败、输出为空。
-  旧逻辑将空输出等同于 "tmux 已退出"，连续 2 次后 `in_tmux=false` →
-  本地缓冲重新启用 → 吞字符 + SFTP 不再跟随。
+  旧方案在每次回车后延迟 500ms 做一次 exec 查询。存在多个致命问题：
+  1. exec 通道 PATH 极简（`/usr/bin:/bin`），tmux 常在 `/usr/local/bin` 找不到；
+  2. 查询失败被误判为 "tmux 已退出"，连续 2 次后关闭跟随 + 重启本地缓冲 → 吞字符；
+  3. 回车触发时机不稳定（快速输入、网络延迟）。
 - 修复：
-  1. `TMUX_CWD_QUERY` 改为遍历 `/usr/bin`、`/usr/local/bin`、`/bin`、`/sbin`、
-     `/opt/homebrew/bin` 查找 tmux 二进制，最后回退 `command -v`。
-  2. 输出协议：路径（成功）/ `__TMUX_GONE__`（tmux 服务确认不在）/ 空（瞬态失败）。
-  3. `ExecQueryCwd` handler 仅在收到 `__TMUX_GONE__` 时发送 `TmuxExited`；
-     空输出/错误视为瞬态失败，700ms 后重试一次，仍失败则静默忽略（下次回车再试），
-     不再误触发 `in_tmux=false`。
-  4. 检测 `Ctrl+b d` detach：pump 线程监听输出中的 `[detached (from session`
-     字符串，检测到后立即 `in_tmux=false` 并解锁本地缓冲，恢复外层 shell 跟随。
+  1. 改为后台轮询：进入 tmux 后启动异步任务，首次 1s 后查询（同步初始 `~` 路径），
+     之后每 3s 查询一次。路径变化 → CwdChanged → SFTP 跟随；不变 → 无事发生。
+  2. `TMUX_CWD_QUERY` 遍历 `/usr/bin`、`/usr/local/bin`、`/bin`、`/sbin`、
+     `/opt/homebrew/bin` 查找 tmux 二进制，回退 `command -v`。
+  3. 输出协议：路径（成功）/ `__TMUX_GONE__`（tmux 服务不在）/ 空（瞬态失败）。
+     仅 `__TMUX_GONE__` 触发 TmuxExited；空/错误重试一次后静默忽略。
+  4. 退出检测：监听输出中 `[detached (from session`（Ctrl+b d）和 `[exited]`（exit），
+     检测到后终止轮询、清除 in_tmux、解锁本地缓冲。
+  5. 删除旧的 `schedule_tmux_cwd_query` 回车触发逻辑。
 - 涉及文件：
-  `src/app.rs`（TMUX_CWD_QUERY 重写 + detach 检测）、`src/sftp.rs`（ExecQueryCwd handler 重写）
+  `src/app.rs`（轮询任务 + 退出检测 + 删除旧逻辑）、`src/sftp.rs`（ExecQueryCwd handler）
 
 ### 修复 tmux 内 cd 跟随完全失效（exec 查询无 $TMUX 上下文）
 
