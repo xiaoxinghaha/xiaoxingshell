@@ -3225,10 +3225,12 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                                 }
                             }
                         }
-                        // Detect tmux detach (Ctrl+b d): the outer terminal
-                        // receives "[detached (from session ...)]".
+                        // Detect tmux leave: detach prints "[detached (from
+                        // session ...)]"; exit prints "[exited]".
                         if let SessionEvent::Output(ref chunk) = shell_evt {
-                            if chunk.contains("[detached (from session") {
+                            if chunk.contains("[detached (from session")
+                                || chunk.contains("[exited]")
+                            {
                                 if let Ok(mut ts) = tmux_state_pump.lock() {
                                     if let Some(state) =
                                         ts.get_mut(tab_id_pump.as_str())
