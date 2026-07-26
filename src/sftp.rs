@@ -129,6 +129,8 @@ pub enum SftpCommand {
     /// If the command fails and `fallback` is Some, report the fallback instead.
     /// Used for tmux pane_current_path queries and tmux-exit detection.
     ExecQueryCwd { cmd: String, fallback: Option<String> },
+    /// Run `pwd` via exec channel and navigate SFTP to the result (right-click follow).
+    FollowTerminalCwd,
     /// Gracefully shut down the SFTP worker.
     Close,
 }
@@ -277,8 +279,13 @@ impl SftpHandle {
         let _ = self.commands.send(SftpCommand::SetAutoRefreshSecs(secs));
     }
     /// Run a command via exec channel and report stdout as CwdChanged.
+    #[allow(dead_code)]
     pub fn exec_query_cwd(&self, cmd: String, fallback: Option<String>) {
         let _ = self.commands.send(SftpCommand::ExecQueryCwd { cmd, fallback });
+    }
+    /// Run `pwd` via exec channel and navigate SFTP to the result.
+    pub fn follow_terminal_cwd(&self) {
+        let _ = self.commands.send(SftpCommand::FollowTerminalCwd);
     }
 }
 
@@ -701,6 +708,19 @@ async fn run_sftp(
                         let _ = ev.send(SessionEvent::CwdChanged(rpath));
                     }
                     // Still no path → silently ignore; next poll retries.
+                });
+            }
+
+            SftpCommand::FollowTerminalCwd => {
+                let h = handle.clone();
+                let ev = events.clone();
+                tokio::spawn(async move {
+                    if let Ok(output) = run_remote_exec_capture(&h, "pwd").await {
+                        let path = output.trim().to_string();
+                        if !path.is_empty() && path.starts_with('/') {
+                            let _ = ev.send(SessionEvent::CwdChanged(path));
+                        }
+                    }
                 });
             }
 

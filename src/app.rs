@@ -487,8 +487,6 @@ pub fn run() -> Result<()> {
     // Per-tab tmux state: (in_tmux, consecutive_exec_fail_count).
     let tmux_state: Arc<Mutex<HashMap<String, (bool, u8)>>> =
         Arc::new(Mutex::new(HashMap::new()));
-    let tmux_poll_abort: Arc<Mutex<HashMap<String, tokio::task::AbortHandle>>> =
-        Arc::new(Mutex::new(HashMap::new()));
     let pending_ui_refresh: PendingUiRefresh = Arc::new(Mutex::new(Vec::new()));
 
     // Per-tab vt100 parsers + history logs (Arc<Mutex> so they can be cloned
@@ -954,7 +952,6 @@ pub fn run() -> Result<()> {
         local_net_hist.clone(),
         sftp_follow_cd.clone(),
         tmux_state.clone(),
-        tmux_poll_abort.clone(),
     );
 
     {
@@ -1669,7 +1666,6 @@ pub fn run() -> Result<()> {
             disconnect_retry_count: store.borrow().disconnect_retry_count(),
             sftp_auto_refresh_secs: store.borrow().sftp_auto_refresh_secs(),
             tmux_state: tmux_state.clone(),
-            tmux_poll_abort: tmux_poll_abort.clone(),
         },
     );
 
@@ -2289,7 +2285,6 @@ fn wire_session_callbacks(
     local_net_hist: NetHist,
     sftp_follow_cd: Arc<std::sync::atomic::AtomicBool>,
     tmux_state: Arc<Mutex<HashMap<String, (bool, u8)>>>,
-    tmux_poll_abort: Arc<Mutex<HashMap<String, tokio::task::AbortHandle>>>,
 ) {
     let group_options_model = |store: &ConfigStore| -> ModelRc<SharedString> {
         ModelRc::from(Rc::new(VecModel::from(
@@ -3003,7 +2998,6 @@ fn wire_session_callbacks(
                 disconnect_retry_count: store.borrow().disconnect_retry_count(),
                 sftp_auto_refresh_secs: store.borrow().sftp_auto_refresh_secs(),
                 tmux_state: tmux_state.clone(),
-                tmux_poll_abort: tmux_poll_abort.clone(),
             };
             start_session_in_tab(&tab_id, session, &ctx);
         });
@@ -3040,8 +3034,6 @@ struct ConnectCtx {
     sftp_auto_refresh_secs: u32,
     /// Per-tab tmux state: (in_tmux, consecutive_exec_fail_count).
     tmux_state: Arc<Mutex<HashMap<String, (bool, u8)>>>,
-    /// Per-tab abort handle for the tmux cwd polling task.
-    tmux_poll_abort: Arc<Mutex<HashMap<String, tokio::task::AbortHandle>>>,
 }
 
 /// Spawn the shell (+ SFTP) workers and their event-pump threads for an
@@ -3112,7 +3104,6 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
         let sftp_sort_pump = ctx.sftp_sort_states.clone();
         let hidden_transfer_ids_pump = ctx.hidden_transfer_ids.clone();
         let tmux_state_pump = ctx.tmux_state.clone();
-        let tmux_poll_abort_pump = ctx.tmux_poll_abort.clone();
         std::thread::spawn(move || {
             let mut shell_rx = rx;
             let mut cwd_debounce: Option<tokio::task::JoinHandle<()>> = None;
@@ -3246,14 +3237,6 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                                     {
                                         state.0 = false;
                                         state.1 = 0;
-                                    }
-                                }
-                                if let Ok(mut aborts) = tmux_poll_abort_pump.lock()
-                                {
-                                    if let Some(h) =
-                                        aborts.remove(tab_id_pump.as_str())
-                                    {
-                                        h.abort();
                                     }
                                 }
                                 if let Ok(mut map) = bufs_thread.lock() {
@@ -5741,6 +5724,7 @@ fn wire_key_input(
 
     // Forward each keystroke as raw bytes to the SSH PTY. The server's bash /
     // readline handles echo, history (↑↓), Tab completion, Ctrl+C, etc.
+    let sftp_h_for_follow = ctx.sftp_handles.clone();
     {
         let handles = handles.clone();
         let bufs = bufs.clone();
@@ -6193,46 +6177,11 @@ fn wire_key_input(
                             ));
                         });
                     }
-                    // Spawn background cwd polling task (first at 1s, then every 3s).
-                    {
-                        let mut aborts = ctx.tmux_poll_abort.lock().unwrap();
-                        if let Some(old) = aborts.remove(tid.as_str()) {
-                            old.abort();
-                        }
-                        let sftp_h = ctx.sftp_handles.clone();
-                        let tid_poll = tid.clone();
-                        let follow = ctx.sftp_follow_cd.clone();
-                        let handle = ctx.runtime.spawn(async move {
-                            let mut first = true;
-                            loop {
-                                let delay = if first { 1000 } else { 3000 };
-                                first = false;
-                                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                                if !follow.load(std::sync::atomic::Ordering::Relaxed) {
-                                    continue;
-                                }
-                                if let Ok(handles) = sftp_h.lock() {
-                                    if let Some(h) = handles.get(&tid_poll) {
-                                        h.exec_query_cwd(
-                                            TMUX_CWD_QUERY.to_string(),
-                                            None,
-                                        );
-                                    }
-                                }
-                            }
-                        });
-                        aborts.insert(tid.clone(), handle.abort_handle());
-                    }
                 } else if in_tmux_already && is_tmux_exit_command(line.trim()) {
                     // User left tmux; restore outer-shell behaviour.
                     {
                         let mut ts = ctx.tmux_state.lock().unwrap();
                         ts.entry(tid.clone()).or_insert((false, 0)).0 = false;
-                    }
-                    if let Some(h) =
-                        ctx.tmux_poll_abort.lock().unwrap().remove(tid.as_str())
-                    {
-                        h.abort();
                     }
                     if let Some(buf) = bufs.lock().unwrap().get_mut(tid.as_str()) {
                         buf.unlock_local_input_at_prompt();
@@ -6626,6 +6575,19 @@ fn wire_key_input(
             }
             if let Some(h) = handles_clear.borrow().get(&tid) {
                 h.send_raw(vec![0x0c]); // Ctrl+L → shell clears + redraws prompt
+            }
+        });
+    }
+
+    // Context menu → SFTP Follow: exec pwd, navigate SFTP to the result.
+    {
+        let sftp_h = sftp_h_for_follow.clone();
+        window.on_sftp_follow_terminal(move |tab_id: SharedString| {
+            let tid = tab_id.to_string();
+            if let Ok(handles) = sftp_h.lock() {
+                if let Some(h) = handles.get(&tid) {
+                    h.follow_terminal_cwd();
+                }
             }
         });
     }
@@ -7976,21 +7938,6 @@ fn install_tmux_cwd_hook(ctx: &ConnectCtx, tab_id: &str) {
         }
     }
 }
-
-/// Shell command to query the active tmux pane's working directory.
-/// Primary tmux follow path: tmux intercepts OSC 7 / OSC 697 and does NOT
-/// forward them to the outer terminal, so the only reliable channel is an
-/// exec query via the SFTP connection (#158).
-/// The hook writes $PWD to /tmp/.meatshell_pane_cwd on every prompt inside
-/// tmux; read that first. Fall back to list-panes for the active pane.
-/// `display-message -p` is NOT used: it requires $TMUX client context which
-/// the exec channel does not have.
-/// Output contract:
-///   - A path starting with '/' → success.
-///   - "__TMUX_GONE__" → tmux server confirmed not running.
-///   - Empty → transient failure (binary not found, etc.); caller retries.
-const TMUX_CWD_QUERY: &str =
-    "T=\"\"; for p in /usr/bin/tmux /usr/local/bin/tmux /bin/tmux /sbin/tmux /opt/homebrew/bin/tmux; do [ -x \"$p\" ] && T=\"$p\" && break; done; [ -z \"$T\" ] && T=$(command -v tmux 2>/dev/null); [ -z \"$T\" ] && exit 0; if ! \"$T\" has 2>/dev/null; then printf '__TMUX_GONE__\\n'; exit 0; fi; p=$(cat /tmp/.meatshell_pane_cwd 2>/dev/null); [ -n \"$p\" ] && printf '%s\\n' \"$p\" && exit 0; \"$T\" list-panes -a -F '#{?pane_active,#{pane_current_path},}' 2>/dev/null | sed '/^$/d' | head -1";
 
 fn update_pending_cd_input(
     pending: &Arc<Mutex<HashMap<String, String>>>,
