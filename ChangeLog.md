@@ -2,23 +2,31 @@
 
 ## 2026-07-26
 
-### 修复 tmux 内右键 SFTP Follow 跳到 home 目录
+### 修复右键 SFTP Follow 永远跳到 home 目录（exec channel pwd 返回 home）
 
 - 根因：
-  右键 `FollowTerminalCwd` 通过 SFTP 的独立 exec channel 执行 `pwd`。这个
-  exec channel 是新开的 SSH 通道，不是用户 tmux 终端里的 shell，起始工作目录
-  是用户 home，所以 `pwd` 返回 home，SFTP 跳到 home 而不是 tmux 窗格的当前
-  目录，表现为"跟随失败/没跟过去"。
+  右键 `FollowTerminalCwd` 通过 SFTP 的独立 exec channel 执行 `pwd`。SSH exec
+  channel 是新开的通道，不继承用户交互 shell 的工作目录，起始目录永远是用户
+  home —— 所以 `pwd` 恒返回 home，无论用户在终端里 cd 到哪、是否在 tmux 内，
+  右键 follow 都跳到 home，表现为"跟随永远是 ~"。
+  客户端本已通过 OSC 7 知道终端当前目录，但 pump 线程在 follow-cd 关闭时
+  `continue` 吞掉 `CwdChanged` 事件（#59 陷阱），导致 `sftp_path` 也不更新，
+  右键 follow 无可靠路径可用。
 - 修复：
-  `on_sftp_follow_terminal` handler 根据 `tmux_state` 判断是否在 tmux 内：
-  - tmux 内：命令改为 `cat /tmp/.meatshell_pane_cwd 2>/dev/null || pwd`，
-    读 OSC 7 hook 在每个 prompt 写入的活动窗格 PWD（hook 未装上则回退 pwd）；
-  - 非 tmux：命令保持 `pwd`，行为不变。
-  为此 `SftpCommand::FollowTerminalCwd` 变体加 `cmd` 字段，`follow_terminal_cwd`
-  方法接受命令参数，由调用方决定查询命令。
+  1. 新增共享状态 `ConnectCtx::terminal_cwd`（per-tab，OSC 7 报告的终端当前
+     目录）。pump 线程收到 `CwdChanged` 时**无条件**更新它（在 follow-cd 的
+     `continue` 之前），保证它始终是终端真实当前目录，不受 follow-cd 开关影响。
+  2. `on_sftp_follow_terminal` handler 重新设计：
+     - 非 tmux 且 `terminal_cwd` 有效：直接 `list_dir(path)`，用 OSC 7 已知
+       路径跳转，不走 exec channel（避免 pwd 返回 home）；
+     - tmux 内（OSC 7 被 tmux 拦截，`terminal_cwd` 不可靠）：exec 查询
+       `cat /tmp/.meatshell_pane_cwd 2>/dev/null || pwd`（hook 在每个 tmux
+       prompt 写入活动窗格 PWD）；
+     - 非 tmux 且 `terminal_cwd` 无效（刚连接还没出 prompt）：回退 `pwd`。
 - 涉及文件：
-  `src/sftp.rs`（FollowTerminalCwd 变体 + handler + 方法签名）、
-  `src/app.rs`（on_sftp_follow_terminal handler 按 tmux 状态选命令）
+  `src/app.rs`（ConnectCtx 加 terminal_cwd 字段 + pump 线程更新 + handler
+  按 tmux 状态分流 + wire_session_callbacks 透传 terminal_cwd）、
+  `src/sftp.rs`（保留 FollowTerminalCwd { cmd } 变体，tmux 分支使用）
 
 ### 修复右键 SFTP Follow 在 follow-cd 关闭时卡在"加载中"
 
