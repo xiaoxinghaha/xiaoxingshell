@@ -2,6 +2,27 @@
 
 ## 2026-07-26
 
+### 修复右键 SFTP Follow 在 follow-cd 关闭时卡在"加载中"
+
+- 根因：
+  右键菜单 "SFTP Follow" 通过 `SftpCommand::FollowTerminalCwd` 执行 `pwd`，
+  拿到路径后只发 `SessionEvent::CwdChanged(path)`。主线程无条件把 `sftp_loading`
+  置 `true`；但 pump 线程在 follow-cd 开关关闭时会吞掉 `CwdChanged`（#59 陷阱），
+  导致没有任何 `ListDir` 来清 loading，SFTP 面板永远卡在"加载中"。
+- 修复：
+  `FollowTerminalCwd` handler 拿到 `pwd` 结果后，除发 `CwdChanged` 外直接发一条
+  `SftpCommand::ListDir(path)` 给 sftp worker。手动 follow 是用户显式动作，
+  应无条件加载目录，不依赖 follow_cd 开关。
+- 涉及文件：
+  `src/sftp.rs`（FollowTerminalCwd handler）
+
+### 右键菜单 "SFTP Follow" 中文化为 "SFTP跟随"
+
+- 新增 `lang/zh/LC_MESSAGES/xiaoxingshell.po` 与 `lang/en/LC_MESSAGES/xiaoxingshell.po`
+  中 "SFTP Follow" 条目，中文译为 "SFTP跟随"，英文保持 "SFTP Follow"。
+
+## 2026-07-26
+
 ### 重写 tmux cd 跟随：后台轮询代替回车触发
 
 - 根因：

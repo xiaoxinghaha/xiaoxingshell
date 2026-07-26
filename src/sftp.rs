@@ -714,11 +714,16 @@ async fn run_sftp(
             SftpCommand::FollowTerminalCwd => {
                 let h = handle.clone();
                 let ev = events.clone();
+                let tx = self_tx.clone();
                 tokio::spawn(async move {
                     if let Ok(output) = run_remote_exec_capture(&h, "pwd").await {
                         let path = output.trim().to_string();
                         if !path.is_empty() && path.starts_with('/') {
-                            let _ = ev.send(SessionEvent::CwdChanged(path));
+                            let _ = ev.send(SessionEvent::CwdChanged(path.clone()));
+                            // 手动 follow 必须无条件加载目录：pump 线程在
+                            // follow-cd 关闭时会吞掉 CwdChanged（#59 陷阱），
+                            // 那样 sftp_loading 会被置 true 却没有 ListDir 来清。
+                            let _ = tx.send(SftpCommand::ListDir(path));
                         }
                     }
                 });
