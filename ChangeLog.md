@@ -18,18 +18,24 @@
      `continue` 之前），保证它始终是终端真实当前目录，不受 follow-cd 开关影响。
   2. `on_sftp_follow_terminal` handler 改为**不依赖 in_tmux 分流**的统一逻辑：
      - `terminal_cwd`（OSC 7 路径）作为 fallback 传给 sftp worker。
-     - sftp worker 用 **SFTP 协议直接读取** `/tmp/.meatshell_pane_cwd`（不用 exec
-       channel）：tmux 内 hook 写了文件 → 读取成功 → 用文件内容（tmux 窗格真实
-       PWD）；非 tmux 文件不存在 → 读取失败 → 用 fallback（OSC 7 路径）。
+     - sftp worker 用 **SFTP 协议直接读取** `~/.cache/meatshell/pane_cwd`（不用
+       exec channel）：hook 每次 prompt 把 `$PWD` 写到这个文件（无条件，tmux
+       内外都写），SFTP 读取成功 → 用文件内容（真实当前目录）；hook 未装上 →
+       读取失败 → 用 fallback（OSC 7 路径）。
      - 之前用 exec `cat` 读取，但 exec channel 的 `pwd` 恒返回 home，且 `cat`
-       可能因 restricted shell / `ForceCommand` / PATH 失败，导致 exec 结果为空、
-       静默回退到 fallback（进入 tmux 前的路径）。改用 SFTP 协议读文件彻底绕开
-       exec channel，不再依赖 shell 执行环境。
+       可能因 restricted shell / `ForceCommand` / PATH 失败；之前读
+       `/tmp/.meatshell_pane_cwd` 也会因 SFTP chroot 到 home 而读不到 `/tmp`。
+       改用 SFTP 协议读 home 下的文件彻底绕开 exec channel 和 `/tmp` 限制。
+     - hook 脚本（`PROMPT_BODY`）相应改动：去掉 `[ -n "$TMUX_PANE" ] &&` 条件
+       改为无条件写，文件路径从 `/tmp/.meatshell_pane_cwd` 改到
+       `$HOME/.cache/meatshell/pane_cwd`（home 下，SFTP 必定能访问，且无多用户
+       冲突），加 `mkdir -p` 确保目录存在。
 - 涉及文件：
   `src/app.rs`（ConnectCtx 加 terminal_cwd 字段 + pump 线程更新 + handler
   统一逻辑 + wire_session_callbacks 透传 terminal_cwd）、
   `src/sftp.rs`（FollowTerminalCwd { fallback } 变体 + handler 用 sftp.open
-  读取 hook 文件，失败用 fallback）
+  读取 home 下 hook 文件，失败用 fallback）、
+  `src/ssh.rs`（PROMPT_BODY hook 改写 home 下 pane_cwd，无条件）
 
 ### 修复右键 SFTP Follow 在 follow-cd 关闭时卡在"加载中"
 

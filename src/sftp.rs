@@ -130,12 +130,13 @@ pub enum SftpCommand {
     /// Used for tmux pane_current_path queries and tmux-exit detection.
     ExecQueryCwd { cmd: String, fallback: Option<String> },
     /// Navigate SFTP to the terminal's cwd (right-click follow). Reads the
-    /// hook-written /tmp/.meatshell_pane_cwd via SFTP (authoritative inside
-    /// tmux, where OSC 7 is swallowed); when the file is absent (outside
-    /// tmux), falls back to `fallback` — the OSC 7 cwd the caller already
-    /// knows. SFTP is used instead of `exec cat` because the exec channel's
-    /// `pwd` always returns $HOME and its `cat` can be blocked by a restricted
-    /// shell / `ForceCommand` / PATH issues.
+    /// hook-written ~/.cache/meatshell/pane_cwd via SFTP (authoritative — the
+    /// hook writes $PWD there on every prompt, inside and outside tmux); when
+    /// the file is absent (hook not yet installed), falls back to `fallback` —
+    /// the OSC 7 cwd the caller already knows. SFTP is used instead of `exec
+    /// cat` because the exec channel's `pwd` always returns $HOME and its
+    /// `cat` can be blocked by a restricted shell / `ForceCommand` / PATH
+    /// issues, and /tmp may be outside an SFTP chroot.
     FollowTerminalCwd { fallback: Option<String> },
     /// Gracefully shut down the SFTP worker.
     Close,
@@ -289,9 +290,10 @@ impl SftpHandle {
     pub fn exec_query_cwd(&self, cmd: String, fallback: Option<String>) {
         let _ = self.commands.send(SftpCommand::ExecQueryCwd { cmd, fallback });
     }
-    /// Navigate SFTP to the terminal's cwd. Inside tmux the hook writes the
-    /// active pane's $PWD to /tmp/.meatshell_pane_cwd; we read it via SFTP.
-    /// Outside tmux the file is absent, so `fallback` (the OSC 7 cwd) is used.
+    /// Navigate SFTP to the terminal's cwd. The hook writes $PWD to
+    /// ~/.cache/meatshell/pane_cwd on every prompt (inside and outside tmux);
+    /// we read it via SFTP. When the file is absent (hook not yet installed),
+    /// `fallback` (the OSC 7 cwd) is used.
     pub fn follow_terminal_cwd(&self, fallback: Option<String>) {
         let _ = self.commands.send(SftpCommand::FollowTerminalCwd { fallback });
     }
@@ -721,14 +723,18 @@ async fn run_sftp(
 
             SftpCommand::FollowTerminalCwd { fallback } => {
                 use tokio::io::AsyncReadExt;
-                // Read the hook-written tmux pane cwd via SFTP (not exec —
-                // exec's pwd returns $HOME and `cat` can fail on restricted
-                // shells / PATH). Outside tmux the file is absent, so we fall
-                // back to the OSC 7 cwd. Runs inline (no spawn): the file is
-                // tiny and right-click follow is a rare user action, so the
-                // brief blocking of the command loop is acceptable.
+                // Read the hook-written pane cwd via SFTP (not exec — exec's
+                // pwd returns $HOME and `cat` can fail on restricted shells /
+                // PATH). The hook writes $PWD to ~/.cache/meatshell/pane_cwd
+                // on every prompt (inside and outside tmux), so this is
+                // authoritative. Falls back to the OSC 7 cwd only if the file
+                // is missing (e.g. hook not yet installed). Runs inline (no
+                // spawn): the file is tiny and right-click follow is a rare
+                // user action, so the brief blocking is acceptable.
+                let pane_cwd_path =
+                    format!("{}/.cache/meatshell/pane_cwd", home.trim_end_matches('/'));
                 let mut path_opt: Option<String> = None;
-                if let Ok(mut f) = sftp.open("/tmp/.meatshell_pane_cwd").await {
+                if let Ok(mut f) = sftp.open(&pane_cwd_path).await {
                     let mut bytes = Vec::new();
                     if f.read_to_end(&mut bytes).await.is_ok() {
                         if let Ok(s) = String::from_utf8(bytes) {

@@ -6602,11 +6602,11 @@ fn wire_key_input(
     }
 
     // Context menu → SFTP Follow: jump the SFTP panel to the terminal's cwd.
-    // The sftp worker reads /tmp/.meatshell_pane_cwd via SFTP — the hook
-    // writes the active pane's $PWD there on every tmux prompt, so inside
-    // tmux (where OSC 7 is swallowed by tmux) it's authoritative. Outside
-    // tmux the file is absent, so `terminal_cwd` (OSC 7) is the fallback.
-    // No exec channel / `in_tmux` flag involved — both are unreliable here.
+    // The sftp worker reads ~/.cache/meatshell/pane_cwd via SFTP — the hook
+    // writes $PWD there on every prompt (inside and outside tmux), so it's
+    // authoritative. Falls back to `terminal_cwd` (OSC 7) only if the hook
+    // file is missing (e.g. hook not yet installed). No exec channel /
+    // `in_tmux` flag involved — both are unreliable here.
     {
         let sftp_h = sftp_h_for_follow.clone();
         let terminal_cwd = terminal_cwd_for_follow.clone();
