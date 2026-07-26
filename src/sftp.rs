@@ -686,16 +686,11 @@ async fn run_sftp(
                         let _ = ev.send(SessionEvent::CwdChanged(path));
                         return;
                     }
-                    if path == "__TMUX_GONE__" {
-                        let _ = ev.send(SessionEvent::TmuxExited);
-                        return;
-                    }
-                    // Transient failure (binary not found, channel error, etc.).
-                    // Retry once after 700ms before giving up silently.
                     if let Some(fb) = fallback {
                         let _ = ev.send(SessionEvent::CwdChanged(fb));
                         return;
                     }
+                    // Transient failure or __TMUX_GONE__: retry once after 700ms.
                     tokio::time::sleep(std::time::Duration::from_millis(700)).await;
                     let retry = run_remote_exec_capture(&h, &cmd).await;
                     let rpath = match &retry {
@@ -704,10 +699,8 @@ async fn run_sftp(
                     };
                     if !rpath.is_empty() && rpath.starts_with('/') {
                         let _ = ev.send(SessionEvent::CwdChanged(rpath));
-                    } else if rpath == "__TMUX_GONE__" {
-                        let _ = ev.send(SessionEvent::TmuxExited);
                     }
-                    // Still empty → silently ignore; next Enter retries.
+                    // Still no path → silently ignore; next poll retries.
                 });
             }
 
