@@ -2,7 +2,26 @@
 
 ## 2026-07-26
 
-### 修复 tmux 内右键 SFTP Follow 不跟随（hook 未传播到 tmux pane）
+### 修复 tmux 内右键 SFTP Follow 不跟随（改用 tmux 原生路径查询）
+
+- 根因：
+  之前依赖 shell hook 把 `$PWD` 写到 `~/.cache/meatshell/pane_cwd`，再让
+  SFTP 读这个文件。但 `PROMPT_COMMAND` 是 shell 变量，**不会被子进程继承**，
+  tmux 内每个 pane 是独立 shell 进程（由 tmux server 启动），不会继承外层
+  shell 的 `PROMPT_COMMAND`，所以 hook 在 tmux 内根本不运行 ——
+  `cat ~/.cache/meatshell/pane_cwd` 在 tmux 内报错（文件无更新），
+  右键 follow 失败。
+- 修复：
+  **tmux 本身原生追踪每个 pane 的工作目录**（通过 `/proc/<pid>/cwd`），
+  完全不依赖 shell hook。改为在 tmux 内时，通过 exec 通道运行
+  `tmux list-panes -a -F '#{session_attached} #{pane_active} #{pane_current_path}'`
+  并过滤出当前 attached session 的 active pane，直接拿到 tmux 内真实路径。
+  这是最可靠的方式。回退链：`tmux 原生路径` → `pane_cwd 文件(SFTP 读)` → `OSC7 cwd`。
+- 涉及文件：
+  `src/sftp.rs`（FollowTerminalCwd 增加 `in_tmux` 标志 + tmux 查询逻辑）、
+  `src/app.rs`（follow handler 从 `tmux_state` 读取 in_tmux 传入）
+
+### 修复 tmux 内右键 SFTP Follow 不跟随（连接时安装 hook 到 rc 文件）
 
 - 根因：
   `PROMPT_COMMAND` 是 shell 变量，**不会被子进程继承**。tmux 内每个 pane 都是
