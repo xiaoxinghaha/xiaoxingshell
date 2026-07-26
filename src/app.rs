@@ -7912,8 +7912,12 @@ fn install_tmux_cwd_hook(ctx: &ConnectCtx, tab_id: &str) {
 /// Primary tmux follow path: tmux intercepts OSC 7 / OSC 697 and does NOT
 /// forward them to the outer terminal, so the only reliable channel is an
 /// exec query via the SFTP connection (#158).
+/// The hook writes $PWD to /tmp/.meatshell_pane_cwd on every prompt inside
+/// tmux; read that first. Fall back to list-panes for the active pane.
+/// `display-message -p` is NOT used: it requires $TMUX client context which
+/// the exec channel does not have.
 const TMUX_CWD_QUERY: &str =
-    "tmux display-message -p '#{pane_current_path}' 2>/dev/null || tmux list-panes -a -F '#{pane_current_path}' 2>/dev/null | head -1";
+    "{ tmux has 2>/dev/null && { p=$(cat /tmp/.meatshell_pane_cwd 2>/dev/null); [ -n \"$p\" ] && printf '%s\\n' \"$p\" && exit 0; }; tmux list-panes -a -F '#{?pane_active,#{pane_current_path},}' 2>/dev/null | sed '/^$/d' | head -1; }";
 
 /// Schedule a tmux cwd query via the SFTP exec channel after `delay_ms`.
 /// If `fallback` is Some and the query fails, CwdChanged fires with fallback.

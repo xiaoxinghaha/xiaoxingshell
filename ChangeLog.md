@@ -2,6 +2,20 @@
 
 ## 2026-07-26
 
+### 修复 tmux 内 cd 跟随完全失效（exec 查询无 $TMUX 上下文）
+
+- 根因：
+  `TMUX_CWD_QUERY` 使用 `tmux display-message -p '#{pane_current_path}'`，
+  但通过 SFTP exec 通道执行时进程没有 `$TMUX` 环境变量，tmux 找不到客户端上下文
+  导致命令始终失败。连续 2 次失败触发 `TmuxExited` → `in_tmux=false` →
+  重新启用本地缓冲 → tmux 回显异步吞字符。
+- 修复：
+  hook（`__ms7`）在 tmux 内每次 prompt 时将 `$PWD` 写入 `/tmp/.meatshell_pane_cwd`；
+  `TMUX_CWD_QUERY` 改为优先 `cat` 该文件（无需 tmux 客户端上下文），
+  回退到 `tmux list-panes -a` 过滤活动窗格。去掉不可靠的 `display-message -p`。
+- 涉及文件：
+  `src/ssh.rs`（PROMPT_BODY 增加文件写入）、`src/app.rs`（TMUX_CWD_QUERY 重写）
+
 ### 彻底修复 tmux 内 cd 跟随截断路径问题（`cd /root/` → `/roo`）
 
 - 根因：
