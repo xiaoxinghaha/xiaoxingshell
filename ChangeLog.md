@@ -2,6 +2,12 @@
 
 ## 2026-07-28
 
+### 过滤 SSH 扩展数据流中的 hook 回显
+
+- 根因：shell verbose/xtrace 输出可能通过 SSH `ExtendedData` 通道返回，该通道原先绕过了 PTY 回显抑制，快速连接时会显示完整 setup 命令。
+- 修复：对扩展数据流应用同样的 setup 回显过滤；右键 SFTP Follow 未修改，自动 SFTP 跟随保持不变。
+- 涉及文件：`src/ssh.rs`
+
 ### 加固快速连接时 hook 回显的最终过滤
 
 - 现象：SSH 极快连接时，setup 回显可能与首屏输出处于同一数据块并绕过抑制窗口，导致完整 `test -z ...` 命令显示；慢连接则不复现。

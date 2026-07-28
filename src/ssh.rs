@@ -1166,7 +1166,16 @@ async fn run_session(
                         }
                     }
                     Some(ChannelMsg::ExtendedData { data, ext: _ }) => {
-                        let text = String::from_utf8_lossy(&data).into_owned();
+                        let raw = String::from_utf8_lossy(&data).into_owned();
+                        // Shell trace/verbose output may arrive on the SSH
+                        // extended-data stream, which bypasses PTY echo
+                        // suppression. Apply the same setup filter here.
+                        let stripped = strip_setup_echo_anywhere(&raw);
+                        let text = if stripped.len() < raw.len() {
+                            stripped.to_string()
+                        } else {
+                            raw
+                        };
                         let _ = events.send(SessionEvent::Output(text));
                     }
                     Some(ChannelMsg::ExitStatus { exit_status }) => {
