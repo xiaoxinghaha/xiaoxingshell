@@ -6146,11 +6146,9 @@ fn wire_key_input(
                 resolve_cd_follow_target(line, cwd.as_deref(), home.as_deref())
             });
             // --- tmux directory follow ---
-            // Detect tmux entry: set the in_tmux flag, install the cwd hook so
-            // the inner pane's shell emits OSC 7 (the reliable, parse-free
-            // follow path), and source it in the *current* pane so following
-            // starts immediately. Leaving tmux (exit/logout) restores the
-            // outer-shell behaviour (#158).
+            // Detect tmux entry so SFTP Follow can query tmux's native pane cwd.
+            // No shell hook is installed here: tmux tracks pane paths itself,
+            // and sourcing a hook in fish can echo the whole injected command.
             if let Some(ref line) = submitted_line_for_cd {
                 let in_tmux_already = ctx
                     .tmux_state
@@ -6168,37 +6166,6 @@ fn wire_key_input(
                     // breaks the type-ahead echo suppression and eats chars.
                     if let Some(buf) = bufs.lock().unwrap().get_mut(tid.as_str()) {
                         buf.lock_local_input_until_prompt();
-                    }
-                    // Install the hook (writes the script + a guarded `source`
-                    // into the shell rc files) so every pane — current and future
-                    // — emits OSC 7, then source it in the live pane a moment after
-                    // tmux starts so the SFTP panel follows without a restart.
-                    install_tmux_cwd_hook(&ctx, tid.as_str());
-                    if let Some(cmd) = handles
-                        .borrow()
-                        .get(tid.as_str())
-                        .map(|h| h.commands.clone())
-                    {
-                        let home = ctx
-                            .tab_statuses
-                            .lock()
-                            .unwrap()
-                            .get(tid.as_str())
-                            .map(|st| st.sftp_home.clone())
-                            .filter(|h| !h.trim().is_empty())
-                            .unwrap_or_else(|| "/root".to_string());
-                        let file = format!(
-                            "{}/.cache/meatshell/hook.sh",
-                            home.trim_end_matches('/')
-                        );
-                        let source_keys = format!("source '{}'\r", file);
-                        let rt = ctx.runtime.clone();
-                        rt.spawn(async move {
-                            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-                            let _ = cmd.send(crate::ssh::SessionCommand::RawInput(
-                                source_keys.into_bytes(),
-                            ));
-                        });
                     }
                 } else if in_tmux_already && is_tmux_exit_command(line.trim()) {
                     // User left tmux; restore outer-shell behaviour.
@@ -7952,33 +7919,6 @@ fn is_tmux_exit_command(cmd: &str) -> bool {
     t == "exit" || t == "logout"
 }
 
-/// Install the meatshell cwd hook on the remote so tmux inner panes emit OSC 7.
-///
-/// Writes `~/.cache/meatshell/hook.sh` and appends a guarded `source` line to
-/// the user's shell rc files (via the SFTP worker). Once sourced, every prompt
-/// in every pane reports the real cwd via OSC 7 — the reliable, parse-free
-/// "directory changed" signal that drives SFTP following (#158).
-fn install_tmux_cwd_hook(ctx: &ConnectCtx, tab_id: &str) {
-    let home = ctx
-        .tab_statuses
-        .lock()
-        .unwrap()
-        .get(tab_id)
-        .map(|st| st.sftp_home.clone())
-        .filter(|h| !h.trim().is_empty())
-        .unwrap_or_else(|| "/root".to_string());
-    let home = home.trim_end_matches('/').to_string();
-    let rel = crate::ssh::MEATSHELL_HOOK_REL;
-    let file = format!("{home}/{rel}");
-    let dir = file[..file.rfind('/').unwrap_or(file.len())].to_string();
-    let content = crate::ssh::cwd_hook_script();
-    if let Ok(handles) = ctx.sftp_handles.lock() {
-        if let Some(h) = handles.get(tab_id) {
-            h.install_cwd_hook(home, dir, file, content);
-        }
-    }
-}
-
 fn update_pending_cd_input(
     pending: &Arc<Mutex<HashMap<String, String>>>,
     rejected: &Arc<Mutex<HashSet<String>>>,
@@ -9545,7 +9485,7 @@ mod key_tests {
 
     #[test]
     fn tmux_entry_and_exit_are_detected() {
-        // Entering tmux sets the in_tmux flag (hook gets installed).
+        // Entering tmux sets the in_tmux flag (SFTP queries tmux natively).
         assert!(is_tmux_command("tmux"));
         assert!(is_tmux_command("tmux attach"));
         assert!(is_tmux_command("  tmux new -s dev "));

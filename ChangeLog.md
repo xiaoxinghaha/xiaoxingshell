@@ -2,6 +2,12 @@
 
 ## 2026-07-28
 
+### 移除 tmux 的远端 shell hook 注入
+
+- 原因：SFTP 初始化和进入 tmux 时会把 hook 写入 shell rc 并主动 source；fish 加载该脚本时会把整条注入命令打印出来，且 tmux 内跟随仍不稳定。
+- 修复：不再写入或 source `hook.sh`，tmux 跟随只使用 tmux 原生 pane 路径查询；外部 shell 保留原有连接时 hook，因此外部 SFTP 跟随不变。
+- 涉及文件：`src/app.rs`、`src/sftp.rs`、`src/ssh.rs`
+
 ### 修复 fish 等 shell 连接时仍显示 hook 注入命令
 
 - 根因：fish 会因 `test -z "$FISH_VERSION"` 跳过整个 hook，因而不发送连接抑制所等待的 `OSC 99` 完成标记；旧逻辑要等到 16 KiB 缓冲上限才兜底，期间 setup 命令可能被显示。
