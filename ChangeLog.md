@@ -2,6 +2,13 @@
 
 ## 2026-07-28
 
+### 移除连接时 PTY hook 注入和右键 SFTP 跟随
+
+- 原因：连接初始化向 PTY 发送整段 `PROMPT_BODY`，远端会回显 `test -z ...` 长命令；多次回显过滤仍受服务器速度、终端模式和数据通道影响。
+- 修复：不再向 PTY 注入 hook；保留键盘输入层的 `cd` 解析和自动 SFTP 目录跟随，移除右键 `SFTP Follow` 菜单及专用命令链路。
+- 影响：自动 SFTP 跟随保留，连接时不再执行或打印该 hook 命令。
+- 涉及文件：`src/ssh.rs`、`src/app.rs`、`src/sftp.rs`、`ui/app.slint`、`ui/terminal_view.slint`、`lang/*/LC_MESSAGES/xiaoxingshell.po`
+
 ### 过滤 SSH 扩展数据流中的 hook 回显
 
 - 根因：shell verbose/xtrace 输出可能通过 SSH `ExtendedData` 通道返回，该通道原先绕过了 PTY 回显抑制，快速连接时会显示完整 setup 命令。

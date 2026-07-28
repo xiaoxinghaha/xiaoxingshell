@@ -482,10 +482,6 @@ pub fn run() -> Result<()> {
     let sftp_handles: SftpHandles = Arc::new(Mutex::new(HashMap::new()));
     // Per-tab cwd the SFTP panel last followed (see SftpLastCwd).
     let sftp_last_cwd: SftpLastCwd = Arc::new(Mutex::new(HashMap::new()));
-    // Per-tab terminal cwd reported by OSC 7, updated regardless of the
-    // follow-cd setting so the right-click "SFTP Follow" action always has
-    // the real current directory (the exec channel's `pwd` returns $HOME).
-    let terminal_cwd: SftpLastCwd = Arc::new(Mutex::new(HashMap::new()));
     let sftp_entry_cache: SftpEntryCache = Arc::new(Mutex::new(HashMap::new()));
     let sftp_sort_states: SftpSortStates = Arc::new(Mutex::new(HashMap::new()));
     // Per-tab tmux state: (in_tmux, consecutive_exec_fail_count).
@@ -956,7 +952,6 @@ pub fn run() -> Result<()> {
         local_net_hist.clone(),
         sftp_follow_cd.clone(),
         tmux_state.clone(),
-        terminal_cwd.clone(),
     );
 
     {
@@ -1658,7 +1653,6 @@ pub fn run() -> Result<()> {
             handles: handles.clone(),
             sftp_handles: sftp_handles.clone(),
             sftp_last_cwd: sftp_last_cwd.clone(),
-            terminal_cwd: terminal_cwd.clone(),
             sftp_entry_cache: sftp_entry_cache.clone(),
             sftp_sort_states: sftp_sort_states.clone(),
             hidden_transfer_ids: hidden_transfer_ids.clone(),
@@ -2291,7 +2285,6 @@ fn wire_session_callbacks(
     local_net_hist: NetHist,
     sftp_follow_cd: Arc<std::sync::atomic::AtomicBool>,
     tmux_state: Arc<Mutex<HashMap<String, (bool, u8)>>>,
-    terminal_cwd: SftpLastCwd,
 ) {
     let group_options_model = |store: &ConfigStore| -> ModelRc<SharedString> {
         ModelRc::from(Rc::new(VecModel::from(
@@ -2992,7 +2985,6 @@ fn wire_session_callbacks(
                 handles: handles.clone(),
                 sftp_handles: sftp_handles.clone(),
                 sftp_last_cwd: sftp_last_cwd.clone(),
-                terminal_cwd: terminal_cwd.clone(),
                 sftp_entry_cache: cache_for_connect.clone(),
                 sftp_sort_states: sort_for_connect.clone(),
                 hidden_transfer_ids: hidden_transfer_ids.clone(),
@@ -3023,10 +3015,6 @@ struct ConnectCtx {
     handles: Rc<RefCell<HashMap<String, SessionHandle>>>,
     sftp_handles: SftpHandles,
     sftp_last_cwd: SftpLastCwd,
-    /// Per-tab terminal cwd from OSC 7, always updated (independent of
-    /// follow-cd). Read by the right-click "SFTP Follow" action so it can
-    /// jump without an exec-channel round-trip (whose `pwd` returns $HOME).
-    terminal_cwd: SftpLastCwd,
     sftp_entry_cache: SftpEntryCache,
     sftp_sort_states: SftpSortStates,
     hidden_transfer_ids: Arc<Mutex<HashSet<String>>>,
@@ -3106,7 +3094,6 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
         let bufs_thread = ctx.bufs.clone();
         let sftp_handles_pump = ctx.sftp_handles.clone();
         let sftp_last_cwd_pump = ctx.sftp_last_cwd.clone();
-        let terminal_cwd_pump = ctx.terminal_cwd.clone();
         let rt_pump = ctx.runtime.clone();
         let tab_id_pump = tab_id.to_string();
         let statuses_pump = ctx.tab_statuses.clone();
@@ -3168,14 +3155,6 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                         }
                         if let SessionEvent::CwdChanged(ref cwd) = shell_evt {
                             last_cwd_reported = Some(cwd.clone());
-                            // Record the terminal's cwd for the right-click
-                            // "SFTP Follow" action. Updated unconditionally so
-                            // it stays correct even when follow-cd is off
-                            // (then the event is swallowed below and never
-                            // reaches the UI thread / sftp_path).
-                            if let Ok(mut m) = terminal_cwd_pump.lock() {
-                                m.insert(tab_id_pump.clone(), cwd.clone());
-                            }
                             // Reset tmux exec failure counter on any successful
                             // CwdChanged (proves the query path is working).
                             if let Ok(mut ts) = tmux_state_pump.lock() {
@@ -5745,9 +5724,6 @@ fn wire_key_input(
 
     // Forward each keystroke as raw bytes to the SSH PTY. The server's bash /
     // readline handles echo, history (↑↓), Tab completion, Ctrl+C, etc.
-    let sftp_h_for_follow = ctx.sftp_handles.clone();
-    let terminal_cwd_for_follow = ctx.terminal_cwd.clone();
-    let tmux_state_for_follow = ctx.tmux_state.clone();
     {
         let handles = handles.clone();
         let bufs = bufs.clone();
@@ -6146,9 +6122,7 @@ fn wire_key_input(
                 resolve_cd_follow_target(line, cwd.as_deref(), home.as_deref())
             });
             // --- tmux directory follow ---
-            // Detect tmux entry so SFTP Follow can query tmux's native pane cwd.
-            // No shell hook is installed here: tmux tracks pane paths itself,
-            // and sourcing a hook in fish can echo the whole injected command.
+            // Detect tmux entry so input buffering follows tmux's echo behavior.
             if let Some(ref line) = submitted_line_for_cd {
                 let in_tmux_already = ctx
                     .tmux_state
@@ -6565,36 +6539,6 @@ fn wire_key_input(
             }
             if let Some(h) = handles_clear.borrow().get(&tid) {
                 h.send_raw(vec![0x0c]); // Ctrl+L → shell clears + redraws prompt
-            }
-        });
-    }
-
-    // Context menu → SFTP Follow: jump the SFTP panel to the terminal's cwd.
-    // Inside tmux, the sftp worker queries tmux directly for the active pane's
-    // cwd (tmux tracks it natively — reliable, no shell-hook dependency).
-    // Outside tmux, it reads the hook-written ~/.cache/meatshell/pane_cwd via
-    // SFTP. `terminal_cwd` (OSC 7) is the final fallback.
-    {
-        let sftp_h = sftp_h_for_follow.clone();
-        let terminal_cwd = terminal_cwd_for_follow.clone();
-        let tmux_state = tmux_state_for_follow.clone();
-        window.on_sftp_follow_terminal(move |tab_id: SharedString| {
-            let tid = tab_id.to_string();
-            let fallback = terminal_cwd
-                .lock()
-                .ok()
-                .and_then(|m| m.get(tid.as_str()).cloned())
-                .filter(|p| !p.is_empty() && p.starts_with('/'));
-            let in_tmux = tmux_state
-                .lock()
-                .ok()
-                .and_then(|m| m.get(tid.as_str()).copied())
-                .map(|(in_tmux, _)| in_tmux)
-                .unwrap_or(false);
-            if let Ok(handles) = sftp_h.lock() {
-                if let Some(h) = handles.get(&tid) {
-                    h.follow_terminal_cwd(fallback, in_tmux);
-                }
             }
         });
     }

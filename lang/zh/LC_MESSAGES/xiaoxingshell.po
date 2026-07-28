@@ -285,9 +285,6 @@ msgstr "清空缓存"
 msgid "Find"
 msgstr "查找"
 
-msgid "SFTP Follow"
-msgstr "SFTP跟随"
-
 msgid "Processes"
 msgstr "进程"
 

@@ -285,9 +285,6 @@ msgstr "Clear buffer"
 msgid "Find"
 msgstr "Find"
 
-msgid "SFTP Follow"
-msgstr "SFTP Follow"
-
 msgid "Processes"
 msgstr "Processes"
 

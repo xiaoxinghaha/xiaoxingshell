@@ -164,7 +164,6 @@ export component TerminalView inherits Rectangle {
     callback paste-from-clipboard();
     callback copy-terminal-text();
     callback clear-terminal();              // wipe this session's screen buffer
-    callback sftp-follow-terminal();        // exec pwd remotely, SFTP follows
     callback find-query-changed(string);    // recompute search highlights
     callback terminal-scroll(int);          // scroll history by N lines (+ = up)
     callback select-start(int, int);        // begin drag-selection at (row, col)
@@ -557,7 +556,7 @@ export component TerminalView inherits Rectangle {
                             x: root.ctx-x;
                             y: root.ctx-y;
                             width: 132px;
-                            height: 160px;
+                            height: 128px;
                             Rectangle {
                                 background: Theme.bg-panel;
                                 border-radius: Theme.radius-sm;
@@ -583,10 +582,6 @@ export component TerminalView inherits Rectangle {
                                     MenuItem {
                                         icon: "\u{E8B6}"; label: @tr("Find");
                                         clicked => { root.find-active = true; }
-                                    }
-                                    MenuItem {
-                                        icon: "\u{E8DA}"; label: @tr("SFTP Follow");
-                                        clicked => { root.sftp-follow-terminal(); ime-input.focus(); }
                                     }
                                 }
                             }

@@ -96,10 +96,6 @@ fn contains_zmodem_init(data: &[u8]) -> bool {
         .any(|w| w[0] == 0x18 && (w[1] == b'B' || w[1] == b'C'))
 }
 
-/// Shell hook body injected once after the first prompt so the SFTP panel can
-/// follow `cd` via OSC 7.
-pub const PROMPT_BODY: &str = "test -z \"$FISH_VERSION\" && eval '__msc(){ __c=\"$(fc -ln -1 2>/dev/null)\"; [ -n \"$__c\" ] && [ \"$__c\" != \"$__cl\" ] && { __cl=\"$__c\"; printf \"\\033]697;%s\\007\" \"$__c\"; }; }; __ms7(){ __msc; printf \"\\033]7;file://%s%s\\007\" \"$HOSTNAME\" \"$PWD\"; mkdir -p \"$HOME/.cache/meatshell\" 2>/dev/null; printf \"%s\" \"$PWD\" > \"$HOME/.cache/meatshell/pane_cwd\" 2>/dev/null; }; __h=\"$(history 1 2>/dev/null)\"; __h=\"${__h#\"${__h%%[! ]*}\"}\"; __h=\"${__h%%[!0-9]*}\"; [ -n \"$BASH_VERSION\" ] && [ -n \"$__h\" ] && history -d \"$__h\" 2>/dev/null; unset __h; __cl=\"$(fc -ln -1 2>/dev/null)\"; if [ -n \"$ZSH_VERSION\" ]; then autoload -Uz add-zsh-hook 2>/dev/null; add-zsh-hook precmd __ms7; else PROMPT_COMMAND=\"__ms7${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"; fi; __ms7; printf \"\\033]99;__msh_hk\\007\"'";
-
 /// Extract the remote path from an OSC 7 sequence embedded in `text`.
 ///
 /// Format: `ESC ] 7 ; file://hostname/path BEL`
@@ -126,8 +122,7 @@ pub fn client_config(keepalive_interval_secs: u32, disconnect_retry_count: u32) 
 }
 
 /// Like [`extract_osc7_path`] but also returns the byte index just past the OSC
-/// sequence's terminator, so the caller can cut everything up to and including
-/// it — used to discard the echoed setup line (which may wrap) at connect (#98).
+/// sequence's terminator for callers that need to consume the full sequence.
 fn extract_osc7_end(text: &str) -> Option<(String, usize)> {
     let bytes = text.as_bytes();
     let mut i = 0;
@@ -170,89 +165,6 @@ fn extract_osc7_end(text: &str) -> Option<(String, usize)> {
         i = end + term_len.max(1);
     }
     None
-}
-
-/// Unique marker our injected setup command prints at its very end
-/// (`ESC ] 99 ; __msh_hk BEL`). It is used to know when the setup line has
-/// finished executing so its server-side echo can be stripped (#98). We anchor
-/// on THIS marker rather than on the OSC 7 (`ESC ] 7 ; file://…`) because
-/// modern shells/dotfiles already emit OSC 7 on every prompt for terminal
-/// integration — anchoring on the first OSC 7 would end suppression too early
-/// (on the shell's own OSC 7, which precedes our injected command), leaving
-/// the echoed setup line visible.
-const HOOK_DONE_MARKER: &[u8] = b"\x1b]99;__msh_hk\x07";
-
-/// Return the byte index just past [`HOOK_DONE_MARKER`] in `text`, if present.
-/// Used by the connect-time echo suppression to find where our setup command
-/// ended so everything before it (the echoed command + its OSC output) can be
-/// discarded (#98).
-fn find_hook_done_marker(text: &str) -> Option<usize> {
-    let bytes = text.as_bytes();
-    if bytes.len() < HOOK_DONE_MARKER.len() {
-        return None;
-    }
-    bytes
-        .windows(HOOK_DONE_MARKER.len())
-        .position(|w| w == HOOK_DONE_MARKER)
-        .map(|i| i + HOOK_DONE_MARKER.len())
-}
-
-/// When the completion marker is never emitted (e.g. shells where the hook is
-/// intentionally skipped, like fish via `test -z "$FISH_VERSION"`, or any shell
-/// that hits the 16 KiB suppression cap before the marker arrives), the PTY echo
-/// of our injected setup command would otherwise be dumped to the terminal.
-/// Strip that echoed command by anchoring on its distinctive literal tail,
-/// keeping the real prompt and any subsequent output (#98).
-///
-/// The echoed bytes contain the LITERAL backslash-escapes (`\033`/`\007`) rather
-/// than real ESC/BEL, because `PROMPT_BODY` stores them as literal text — so we
-/// match the literal tail `__msh_hk\007'` (with a real backslash), not the real
-/// OSC 99 marker.
-fn strip_echoed_setup(buf: &str) -> &str {
-    const TAIL: &[u8] = b"__msh_hk\\007\"'";
-    let bytes = buf.as_bytes();
-    let start = bytes
-        .windows(b"test -z \"$FISH_VERSION\" && eval '".len())
-        .position(|w| w == b"test -z \"$FISH_VERSION\" && eval '");
-    let search_start = start.unwrap_or(0);
-    for start in search_start..bytes.len() {
-        if bytes[start] != TAIL[0] {
-            continue;
-        }
-        let mut pos = start;
-        let mut matched = true;
-        for &expected in TAIL {
-            while pos < bytes.len() && matches!(bytes[pos], b'\r' | b'\n') {
-                pos += 1;
-            }
-            if pos >= bytes.len() || bytes[pos] != expected {
-                matched = false;
-                break;
-            }
-            pos += 1;
-        }
-        if matched {
-            return &buf[pos..];
-        }
-    }
-    buf
-}
-
-fn setup_echo_started(buf: &str) -> bool {
-    buf.contains("test -z \"$FISH_VERSION\" && eval '")
-}
-
-fn strip_setup_echo_anywhere(buf: &str) -> &str {
-    const PREFIX: &str = "test -z \"$FISH_VERSION\" && eval '";
-    const TAIL: &str = "__msh_hk\\007\"'";
-    let Some(start) = buf.find(PREFIX) else {
-        return buf;
-    };
-    let from_start = &buf[start..];
-    let Some(marker_end) = from_start.find(TAIL).map(|p| p + TAIL.len()) else {
-        return buf;
-    };
-    &buf[start + marker_end..]
 }
 
 /// Find a meatshell command-capture sequence (`ESC ] 697 ; <command> BEL|ST`)
@@ -823,20 +735,6 @@ async fn run_session(
         session.host
     )));
 
-    // Whether we have already injected the PROMPT_COMMAND setup.
-    // We wait for the first non-empty data chunk (the initial shell prompt)
-    // before sending so the command doesn't interleave with banner text.
-    let mut prompt_injected = false;
-    // True from injecting PROMPT_SETUP until the echoed setup line has been
-    // received and stripped; output is buffered (not shown) during that window.
-    let mut suppress_echo = false;
-    // Keystrokes sent while the setup line is being echoed can appear before
-    // the setup's OSC 7 marker and be swallowed with that echo. Queue them
-    // until the hook is installed, then replay them in order.
-    let mut pending_input_while_suppress: Vec<u8> = Vec::new();
-    // Buffers output while `suppress_echo` so the (long) echoed setup line can be
-    // stripped even when it splits across reads (#98).
-    let mut echo_buf = String::new();
     // Holds an `ESC ]` … sequence that was split at the end of a data read and
     // has no terminator yet. Prepended to the next chunk so OSC 7 / OSC 697
     // sequences are never dropped at chunk boundaries (#158).
@@ -844,42 +742,6 @@ async fn run_session(
     // After a ZMODEM transfer finishes we briefly ignore ZMODEM detection so the
     // sender's lingering close frames can't spawn a spurious second receive (#76).
     let mut zmodem_done_at: Option<std::time::Instant> = None;
-
-    // Cwd-notification (OSC 7) setup, injected once after the first prompt so
-    // the SFTP panel can follow `cd` (#91). It must work across shells:
-    //   • bash/sh  → PROMPT_COMMAND runs `__ms7` before every prompt.
-    //   • zsh      → bash's PROMPT_COMMAND is IGNORED by zsh, so we register a
-    //                `precmd` hook via `add-zsh-hook` instead (non-destructive —
-    //                it preserves oh-my-zsh / p10k hooks, unlike `precmd(){…}`).
-    //   • fish     → guarded out (fish 3.1+ emits OSC 7 itself).
-    // `__ms7` is called once at the end so the initial cwd arrives immediately.
-    //
-    // The whole shell-specific body lives inside `eval '…'`: fish can't parse
-    // bash/zsh function & `if` syntax, but it CAN parse `eval '<opaque string>'`,
-    // and the `test -z "$FISH_VERSION" &&` guard short-circuits before the eval
-    // ever runs under fish (#71). The body uses only double quotes inside so the
-    // outer single-quoted string needs no escaping; printf turns \033/\007 into
-    // ESC/BEL at prompt time. No array syntax → safe to *parse* in dash/ash too.
-    //
-    // The leading space keeps the line out of shell history when HISTCONTROL=
-    // ignorespace is enabled. Some root/server profiles don't enable it, so
-    // bash also deletes the last history entry after the line has been accepted.
-    // Its echo is stripped locally (the needle below), so the bookkeeping
-    // command never shows up.
-    //
-    // Besides OSC 7 (cwd), the hook also captures the command the user just ran
-    // and reports it via a private `OSC 697 ; <cmd> BEL` so it can join the
-    // command-box history (#113) — terminal-typed commands aren't otherwise
-    // recorded. `__msc` reads the last history entry with `fc -ln -1`; this only
-    // ever sees real executed commands, never password prompts (those use
-    // `read -s` and aren't shell commands). `__cl` remembers the last reported
-    // command so a redrawn prompt (e.g. Enter on an empty line) doesn't re-emit
-    // it, and is primed once up front so the pre-session history isn't replayed.
-    //
-    // The echoed setup line is discarded by anchoring on the OSC 7 it produces
-    // (see the suppress block below), so it doesn't matter that the long line
-    // wraps — we never substring-match it.
-    let prompt_setup = format!(" {}\r", PROMPT_BODY);
 
     // --- Remote resource monitor (separate exec channel) ----------------
     // A tiny remote loop streams /proc/stat + /proc/meminfo every 2s; we parse
@@ -972,10 +834,6 @@ async fn run_session(
                         // Only log the byte count — never the bytes themselves,
                         // which are raw keystrokes and may contain passwords (#15).
                         tracing::debug!("ssh channel.data len={} bytes", bytes.len());
-                        if suppress_echo {
-                            pending_input_while_suppress.extend_from_slice(&bytes);
-                            continue;
-                        }
                         if let Err(err) = channel.data(&bytes[..]).await {
                             let _ = events.send(SessionEvent::Closed(format!("{}: {err}", t("写入失败", "write failed"))));
                             break;
@@ -1050,82 +908,22 @@ async fn run_session(
 
                         let chunk = String::from_utf8_lossy(&data).into_owned();
 
-                        // Inject PROMPT_COMMAND after the first real shell output.
-                        if !prompt_injected && !chunk.trim().is_empty() {
-                            prompt_injected = true;
-                            suppress_echo = true;
-                            let _ = channel.data(prompt_setup.as_bytes()).await;
-                            // Fall through: this chunk is buffered below so the
-                            // echoed setup line is stripped as a single piece.
-                        }
-
-                        // While suppressing, buffer output until the setup marker
-                        // or the echoed command's literal tail arrives. Discard
-                        // the setup echo and keep the fresh prompt/output (#98).
-                        // A size cap remains the safety valve for shells that do
-                        // not echo the command or report back.
-                        let mut flush_pending_input = false;
-                        let mut text = if suppress_echo {
-                            echo_buf.push_str(&chunk);
-                            const ECHO_BUF_CAP: usize = 1 << 14; // 16 KiB
-                            if let Some(marker_end) = find_hook_done_marker(&echo_buf) {
-                                suppress_echo = false;
-                                flush_pending_input = true;
-                                // Extract the cwd from the OSC 7 our hook emitted
-                                // in the (now-discarded) region before the marker.
-                                if let Some(cwd) = extract_osc7_path(&echo_buf[..marker_end]) {
-                                    tracing::debug!("OSC7 cwd={:?}", cwd);
-                                    let _ = events.send(SessionEvent::CwdChanged(cwd));
-                                }
-                                let rest = echo_buf[marker_end..].to_string();
-                                echo_buf.clear();
-                                rest
-                            } else {
-                                // Shells such as fish short-circuit the setup
-                                // command and never emit our OSC 99 marker. As
-                                // soon as the echoed command's literal tail is
-                                // complete, drop it instead of waiting for the
-                                // 16 KiB safety cap (#98).
-                                let stripped = strip_echoed_setup(&echo_buf);
-                                if stripped.len() < echo_buf.len() {
-                                    suppress_echo = false;
-                                    flush_pending_input = true;
-                                    echo_buf = stripped.to_string();
-                                    std::mem::take(&mut echo_buf)
-                                } else if echo_buf.len() >= ECHO_BUF_CAP && !setup_echo_started(&echo_buf) {
-                                    suppress_echo = false;
-                                    flush_pending_input = true;
-                                    // The marker never arrived (shell that skips the
-                                    // hook, or a chatty shell). Drop the echoed setup
-                                    // command so it isn't dumped to the terminal.
-                                    echo_buf = stripped.to_string();
-                                    std::mem::take(&mut echo_buf)
-                                } else {
-                                    continue; // keep buffering; show nothing yet
-                                }
-                            }
+                        // An OSC 7 / OSC 697 sequence can be split across the
+                        // boundary between two SSH data reads. Carry any
+                        // incomplete tail and prepend it to the next chunk.
+                        let combined = if osc_carry.is_empty() {
+                            chunk
                         } else {
-                            // Outside the setup window, every data read is shown.
-                            // But an OSC 7 / OSC 697 sequence can be split across
-                            // the boundary between this `chunk` and the previous
-                            // read, in which case the tail of the previous read was
-                            // already lost. Carry any `ESC ]` … run that has no
-                            // terminator yet, prepend it here, and hold the new
-                            // incomplete tail for the next chunk (#158).
-                            let combined = if osc_carry.is_empty() {
-                                chunk
-                            } else {
-                                let mut s = std::mem::take(&mut osc_carry);
-                                s.push_str(&chunk);
-                                s
-                            };
-                            match find_incomplete_osc_tail(&combined) {
-                                Some(start) => {
-                                    osc_carry = combined[start..].to_string();
-                                    combined[..start].to_string()
-                                }
-                                None => combined,
+                            let mut s = std::mem::take(&mut osc_carry);
+                            s.push_str(&chunk);
+                            s
+                        };
+                        let mut text = match find_incomplete_osc_tail(&combined) {
+                            Some(start) => {
+                                osc_carry = combined[start..].to_string();
+                                combined[..start].to_string()
                             }
+                            None => combined,
                         };
 
                         // Capture commands run in the terminal via our OSC 697
@@ -1140,14 +938,6 @@ async fn run_session(
                             }
                         }
 
-                        // Final guard for a fast-connect race: if the PTY echo
-                        // escaped the suppression window, never render our own
-                        // injected setup command.
-                        let stripped_setup = strip_setup_echo_anywhere(&text);
-                        if stripped_setup.len() < text.len() {
-                            text = stripped_setup.to_string();
-                        }
-
                         // Scan after command capture so prompt hooks that emit
                         // both OSC 697 and OSC 7 let the UI decide cd-follow
                         // using the command that caused this prompt.
@@ -1157,25 +947,9 @@ async fn run_session(
                         }
 
                         let _ = events.send(SessionEvent::Output(text));
-                        if flush_pending_input && !pending_input_while_suppress.is_empty() {
-                            let queued = std::mem::take(&mut pending_input_while_suppress);
-                            if let Err(err) = channel.data(&queued[..]).await {
-                                let _ = events.send(SessionEvent::Closed(format!("{}: {err}", t("写入失败", "write failed"))));
-                                break;
-                            }
-                        }
                     }
                     Some(ChannelMsg::ExtendedData { data, ext: _ }) => {
-                        let raw = String::from_utf8_lossy(&data).into_owned();
-                        // Shell trace/verbose output may arrive on the SSH
-                        // extended-data stream, which bypasses PTY echo
-                        // suppression. Apply the same setup filter here.
-                        let stripped = strip_setup_echo_anywhere(&raw);
-                        let text = if stripped.len() < raw.len() {
-                            stripped.to_string()
-                        } else {
-                            raw
-                        };
+                        let text = String::from_utf8_lossy(&data).into_owned();
                         let _ = events.send(SessionEvent::Output(text));
                     }
                     Some(ChannelMsg::ExitStatus { exit_status }) => {
@@ -1901,98 +1675,6 @@ mod osc_command_tests {
         assert!(super::extract_osc7_path(&completed).is_some());
     }
 
-    #[test]
-    fn hook_done_marker_anchors_suppression_past_server_osc7() {
-        // Simulate a server that already emits OSC 7 on its prompt (modern
-        // dotfiles / oh-my-zsh). The echoed setup command follows, then our
-        // unique done-marker. Suppression must end on the marker, NOT on the
-        // server's own OSC 7, so the echoed command is fully discarded.
-        let echoed = "root@host:~#  test -z \"$FISH_VERSION\" && eval '...'";
-        let server_osc7 = "\u{1b}]7;file://host/root\u{07}";
-        let our_osc7 = "\u{1b}]7;file://host/root\u{07}";
-        let marker = "\u{1b}]99;__msh_hk\u{07}";
-        let prompt = "root@host:~# ";
-        let buf = format!("{server_osc7}{echoed}{our_osc7}{marker}{prompt}");
-
-        // The marker is found and sits AFTER the echoed command, so everything
-        // up to it (including the server's OSC 7 and the echoed command) is the
-        // part we discard.
-        let marker_end = super::find_hook_done_marker(&buf).expect("marker present");
-        let discarded = &buf[..marker_end];
-        assert!(discarded.contains(&echoed), "echoed command must be stripped");
-        assert!(discarded.contains(server_osc7), "server OSC7 must be stripped");
-        let rest = &buf[marker_end..];
-        assert_eq!(rest, prompt, "only the fresh prompt survives");
-
-        // cwd is still recoverable from the discarded region (our OSC 7).
-        assert_eq!(super::extract_osc7_path(discarded), Some("/root".to_string()));
-    }
-
-    #[test]
-    fn hook_done_marker_absent_until_setup_runs() {
-        // Before our setup emits the marker, it must not be found (so buffering
-        // continues and nothing is shown prematurely).
-        assert!(super::find_hook_done_marker("root@host:~# some unrelated output").is_none());
-        assert!(super::find_hook_done_marker("").is_none());
-    }
-
-    #[test]
-    fn strip_echoed_setup_drops_command_when_marker_absent() {
-        // A shell that skips the hook (e.g. fish) echoes the setup command back
-        // with literal `\033`/`\007` text and never emits the real OSC 99 marker.
-        // The fallback must drop the echoed command but keep the real prompt and
-        // any subsequent output.
-        let echoed = "root@host:~#  test -z \"$FISH_VERSION\" && eval '__msc(){ ... printf \"\\033]99;__msh_hk\\007\"'";
-        let prompt = "root@host:~# ";
-        let later = "some real output after the marker never came";
-        let buf = format!("{echoed}\r\n{prompt}{later}");
-
-        let rest = super::strip_echoed_setup(&buf);
-        assert!(!rest.contains("__msh_hk"), "echoed setup must be stripped");
-        assert!(rest.contains(prompt), "real prompt must survive");
-        assert!(rest.contains(later), "subsequent output must survive");
-    }
-
-    #[test]
-    fn strip_echoed_setup_waits_for_literal_tail() {
-        let partial = "prompt$ test -z \"$FISH_VERSION\" && eval '... __msh_hk\\007\"";
-        assert_eq!(super::strip_echoed_setup(partial), partial);
-
-        let complete = format!("{partial}'\r\nprompt$ ");
-        assert_eq!(super::strip_echoed_setup(&complete), "\r\nprompt$ ");
-
-        let wrapped = "echo __msh_hk\\\r\n007\"'\r\nprompt$ ";
-        assert_eq!(super::strip_echoed_setup(wrapped), "\r\nprompt$ ");
-    }
-
-    #[test]
-    fn strip_echoed_setup_keeps_buffer_when_no_echo() {
-        // If the literal tail is absent nothing is stripped (no-op fallback).
-        let buf = "root@host:~# normal output with no setup echo";
-        assert_eq!(super::strip_echoed_setup(buf), buf);
-    }
-
-    #[test]
-    fn setup_echo_is_not_released_at_cap_before_tail() {
-        let prefix = "banner\n".repeat(3000);
-        let started = format!("{prefix}test -z \"$FISH_VERSION\" && eval '");
-        assert!(started.len() >= (1 << 14));
-        assert!(super::setup_echo_started(&started));
-        let complete = format!("{started}... __msh_hk\\007\"'\r\nprompt$ ");
-        assert_eq!(
-            super::strip_echoed_setup(&complete),
-            "\r\nprompt$ "
-        );
-    }
-
-    #[test]
-    fn strip_setup_echo_anywhere_handles_fast_connect_output() {
-        let text = "[root@host ~]#  test -z \"$FISH_VERSION\" && eval '... __msh_hk\\007\"'\r\n[root@host ~]# ";
-        assert_eq!(
-            super::strip_setup_echo_anywhere(text),
-            "\r\n[root@host ~]# "
-        );
-    }
 }
 
 #[cfg(test)]

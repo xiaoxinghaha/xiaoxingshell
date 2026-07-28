@@ -634,7 +634,6 @@ export component AppWindow inherits Window {
     // Clear a session's terminal buffer (its visible screen + scrollback).
     callback clear-terminal(string /* tab-id */);
     // Exec pwd remotely and navigate SFTP to the result.
-    callback sftp-follow-terminal(string /* tab-id */);
     // Recompute search highlights for a session's visible screen.
     callback find-query-changed(string /* tab-id */, string /* query */);
     // Scroll a session's scrollback history by N lines (+ = up/older).
@@ -1036,7 +1035,6 @@ export component AppWindow inherits Window {
                             paste-from-clipboard() => { root.paste-from-clipboard(term.id); }
                             copy-terminal-text() => { root.copy-terminal-text(term.id); }
                             clear-terminal() => { root.clear-terminal(term.id); }
-                            sftp-follow-terminal() => { root.sftp-follow-terminal(term.id); }
                             find-query-changed(q) => { root.find-query-changed(term.id, q); }
                             terminal-scroll(d) => { root.terminal-scroll(term.id, d); }
                             select-start(r, c) => { root.term-select-start(term.id, r, c); }
