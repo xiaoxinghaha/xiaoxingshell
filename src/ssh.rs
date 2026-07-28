@@ -211,7 +211,11 @@ fn find_hook_done_marker(text: &str) -> Option<usize> {
 fn strip_echoed_setup(buf: &str) -> &str {
     const TAIL: &[u8] = b"__msh_hk\\007\"'";
     let bytes = buf.as_bytes();
-    for start in 0..bytes.len() {
+    let start = bytes
+        .windows(b"test -z \"$FISH_VERSION\" && eval '".len())
+        .position(|w| w == b"test -z \"$FISH_VERSION\" && eval '");
+    let search_start = start.unwrap_or(0);
+    for start in search_start..bytes.len() {
         if bytes[start] != TAIL[0] {
             continue;
         }
@@ -232,6 +236,23 @@ fn strip_echoed_setup(buf: &str) -> &str {
         }
     }
     buf
+}
+
+fn setup_echo_started(buf: &str) -> bool {
+    buf.contains("test -z \"$FISH_VERSION\" && eval '")
+}
+
+fn strip_setup_echo_anywhere(buf: &str) -> &str {
+    const PREFIX: &str = "test -z \"$FISH_VERSION\" && eval '";
+    const TAIL: &str = "__msh_hk\\007\"'";
+    let Some(start) = buf.find(PREFIX) else {
+        return buf;
+    };
+    let from_start = &buf[start..];
+    let Some(marker_end) = from_start.find(TAIL).map(|p| p + TAIL.len()) else {
+        return buf;
+    };
+    &buf[start + marker_end..]
 }
 
 /// Find a meatshell command-capture sequence (`ESC ] 697 ; <command> BEL|ST`)
@@ -1071,7 +1092,7 @@ async fn run_session(
                                     flush_pending_input = true;
                                     echo_buf = stripped.to_string();
                                     std::mem::take(&mut echo_buf)
-                                } else if echo_buf.len() >= ECHO_BUF_CAP {
+                                } else if echo_buf.len() >= ECHO_BUF_CAP && !setup_echo_started(&echo_buf) {
                                     suppress_echo = false;
                                     flush_pending_input = true;
                                     // The marker never arrived (shell that skips the
@@ -1117,6 +1138,14 @@ async fn run_session(
                             if !cmd.is_empty() && !cmd.contains("__ms7") {
                                 let _ = events.send(SessionEvent::CommandRan(cmd.to_string()));
                             }
+                        }
+
+                        // Final guard for a fast-connect race: if the PTY echo
+                        // escaped the suppression window, never render our own
+                        // injected setup command.
+                        let stripped_setup = strip_setup_echo_anywhere(&text);
+                        if stripped_setup.len() < text.len() {
+                            text = stripped_setup.to_string();
                         }
 
                         // Scan after command capture so prompt hooks that emit
@@ -1932,6 +1961,28 @@ mod osc_command_tests {
         // If the literal tail is absent nothing is stripped (no-op fallback).
         let buf = "root@host:~# normal output with no setup echo";
         assert_eq!(super::strip_echoed_setup(buf), buf);
+    }
+
+    #[test]
+    fn setup_echo_is_not_released_at_cap_before_tail() {
+        let prefix = "banner\n".repeat(3000);
+        let started = format!("{prefix}test -z \"$FISH_VERSION\" && eval '");
+        assert!(started.len() >= (1 << 14));
+        assert!(super::setup_echo_started(&started));
+        let complete = format!("{started}... __msh_hk\\007\"'\r\nprompt$ ");
+        assert_eq!(
+            super::strip_echoed_setup(&complete),
+            "\r\nprompt$ "
+        );
+    }
+
+    #[test]
+    fn strip_setup_echo_anywhere_handles_fast_connect_output() {
+        let text = "[root@host ~]#  test -z \"$FISH_VERSION\" && eval '... __msh_hk\\007\"'\r\n[root@host ~]# ";
+        assert_eq!(
+            super::strip_setup_echo_anywhere(text),
+            "\r\n[root@host ~]# "
+        );
     }
 }
 
