@@ -226,10 +226,28 @@ fn find_hook_done_marker(text: &str) -> Option<usize> {
 /// OSC 99 marker.
 fn strip_echoed_setup(buf: &str) -> &str {
     const TAIL: &[u8] = b"__msh_hk\\007\"'";
-    match buf.as_bytes().windows(TAIL.len()).position(|w| w == TAIL) {
-        Some(pos) => &buf[pos + TAIL.len()..],
-        None => buf,
+    let bytes = buf.as_bytes();
+    for start in 0..bytes.len() {
+        if bytes[start] != TAIL[0] {
+            continue;
+        }
+        let mut pos = start;
+        let mut matched = true;
+        for &expected in TAIL {
+            while pos < bytes.len() && matches!(bytes[pos], b'\r' | b'\n') {
+                pos += 1;
+            }
+            if pos >= bytes.len() || bytes[pos] != expected {
+                matched = false;
+                break;
+            }
+            pos += 1;
+        }
+        if matched {
+            return &buf[pos..];
+        }
     }
+    buf
 }
 
 /// Find a meatshell command-capture sequence (`ESC ] 697 ; <command> BEL|ST`)
@@ -1036,15 +1054,11 @@ async fn run_session(
                             // echoed setup line is stripped as a single piece.
                         }
 
-                        // While suppressing, buffer output until the injected
-                        // __ms7 prints its OSC 7 (it runs right after the setup
-                        // line is echoed and executed), then discard everything up
-                        // to and including that OSC 7 — the echoed setup line (which
-                        // may WRAP across the terminal width, so substring-matching
-                        // it is unreliable) plus the pre-injection prompt. Whatever
-                        // follows the OSC 7 is the fresh prompt, which we keep (#98).
-                        // A size cap is the safety valve for a shell that never
-                        // reports back (e.g. dash without PROMPT_COMMAND).
+                        // While suppressing, buffer output until the setup marker
+                        // or the echoed command's literal tail arrives. Discard
+                        // the setup echo and keep the fresh prompt/output (#98).
+                        // A size cap remains the safety valve for shells that do
+                        // not echo the command or report back.
                         let mut flush_pending_input = false;
                         let mut text = if suppress_echo {
                             echo_buf.push_str(&chunk);
@@ -1061,17 +1075,29 @@ async fn run_session(
                                 let rest = echo_buf[marker_end..].to_string();
                                 echo_buf.clear();
                                 rest
-                            } else if echo_buf.len() >= ECHO_BUF_CAP {
-                                suppress_echo = false;
-                                flush_pending_input = true;
-                                // The marker never arrived (shell that skips the
-                                // hook, or a chatty shell). Drop the echoed setup
-                                // command so it isn't dumped to the terminal.
-                                let stripped = strip_echoed_setup(&echo_buf);
-                                echo_buf = stripped.to_string();
-                                std::mem::take(&mut echo_buf)
                             } else {
-                                continue; // keep buffering; show nothing yet
+                                // Shells such as fish short-circuit the setup
+                                // command and never emit our OSC 99 marker. As
+                                // soon as the echoed command's literal tail is
+                                // complete, drop it instead of waiting for the
+                                // 16 KiB safety cap (#98).
+                                let stripped = strip_echoed_setup(&echo_buf);
+                                if stripped.len() < echo_buf.len() {
+                                    suppress_echo = false;
+                                    flush_pending_input = true;
+                                    echo_buf = stripped.to_string();
+                                    std::mem::take(&mut echo_buf)
+                                } else if echo_buf.len() >= ECHO_BUF_CAP {
+                                    suppress_echo = false;
+                                    flush_pending_input = true;
+                                    // The marker never arrived (shell that skips the
+                                    // hook, or a chatty shell). Drop the echoed setup
+                                    // command so it isn't dumped to the terminal.
+                                    echo_buf = stripped.to_string();
+                                    std::mem::take(&mut echo_buf)
+                                } else {
+                                    continue; // keep buffering; show nothing yet
+                                }
                             }
                         } else {
                             // Outside the setup window, every data read is shown.
@@ -1914,6 +1940,18 @@ mod osc_command_tests {
         assert!(!rest.contains("__msh_hk"), "echoed setup must be stripped");
         assert!(rest.contains(prompt), "real prompt must survive");
         assert!(rest.contains(later), "subsequent output must survive");
+    }
+
+    #[test]
+    fn strip_echoed_setup_waits_for_literal_tail() {
+        let partial = "prompt$ test -z \"$FISH_VERSION\" && eval '... __msh_hk\\007\"";
+        assert_eq!(super::strip_echoed_setup(partial), partial);
+
+        let complete = format!("{partial}'\r\nprompt$ ");
+        assert_eq!(super::strip_echoed_setup(&complete), "\r\nprompt$ ");
+
+        let wrapped = "echo __msh_hk\\\r\n007\"'\r\nprompt$ ";
+        assert_eq!(super::strip_echoed_setup(wrapped), "\r\nprompt$ ");
     }
 
     #[test]
