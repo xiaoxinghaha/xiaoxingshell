@@ -6038,7 +6038,7 @@ fn wire_key_input(
                                 locally_queued_send = Some(flush.into_bytes());
                                 repaint_after_local = true;
                             }
-                        } else if key_for_pty == "\n" && !ctrl && !alt {
+                        } else if matches!(key_for_pty, "\n" | "\r") && !ctrl && !alt {
                             if !buf.local_line.is_empty() {
                                 let committed = buf.take_local_line();
                                 submitted_line_for_cd = Some(committed.clone());
@@ -6088,6 +6088,14 @@ fn wire_key_input(
                         repaint_after_local = true;
                     }
                 }
+            }
+            // Local-mode characters are mirrored into the passthrough tracker
+            // for handoff scenarios. Once the complete line is committed,
+            // discard that mirror so a later mode switch cannot reuse a stale
+            // or partial `cd` command.
+            if local_mode_was_active && submitted_line_for_cd.is_some() {
+                pending_cd_input.lock().unwrap().remove(tid.as_str());
+                rejected_cd_input.lock().unwrap().remove(tid.as_str());
             }
             if !local_mode_was_active {
                 submitted_line_for_cd = update_pending_cd_input(
@@ -9876,6 +9884,17 @@ mod selection_tests {
 
         assert!(buf.local_line.is_empty());
         assert_eq!(buf.suppress_echo, "pwd\r");
+    }
+
+    #[test]
+    fn optimistic_enter_preserves_absolute_cd_path() {
+        let mut buf = make_buf(5, 40, &[], &["root@host:~# "], 0);
+        buf.local_prompt_ready = true;
+        for ch in "cd /ttt/".chars() {
+            buf.insert_local_char(ch);
+        }
+
+        assert_eq!(buf.take_local_line(), "cd /ttt/");
     }
 
     #[test]
