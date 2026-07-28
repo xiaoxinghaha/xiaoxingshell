@@ -213,6 +213,25 @@ fn find_hook_done_marker(text: &str) -> Option<usize> {
         .map(|i| i + HOOK_DONE_MARKER.len())
 }
 
+/// When the completion marker is never emitted (e.g. shells where the hook is
+/// intentionally skipped, like fish via `test -z "$FISH_VERSION"`, or any shell
+/// that hits the 16 KiB suppression cap before the marker arrives), the PTY echo
+/// of our injected setup command would otherwise be dumped to the terminal.
+/// Strip that echoed command by anchoring on its distinctive literal tail,
+/// keeping the real prompt and any subsequent output (#98).
+///
+/// The echoed bytes contain the LITERAL backslash-escapes (`\033`/`\007`) rather
+/// than real ESC/BEL, because `PROMPT_BODY` stores them as literal text — so we
+/// match the literal tail `__msh_hk\007'` (with a real backslash), not the real
+/// OSC 99 marker.
+fn strip_echoed_setup(buf: &str) -> &str {
+    const TAIL: &[u8] = b"__msh_hk\\007\"'";
+    match buf.as_bytes().windows(TAIL.len()).position(|w| w == TAIL) {
+        Some(pos) => &buf[pos + TAIL.len()..],
+        None => buf,
+    }
+}
+
 /// Find a meatshell command-capture sequence (`ESC ] 697 ; <command> BEL|ST`)
 /// emitted by the shell hook (#113). Returns the command text and the byte
 /// range of the whole escape sequence, so the caller can strip it before the
@@ -1045,6 +1064,11 @@ async fn run_session(
                             } else if echo_buf.len() >= ECHO_BUF_CAP {
                                 suppress_echo = false;
                                 flush_pending_input = true;
+                                // The marker never arrived (shell that skips the
+                                // hook, or a chatty shell). Drop the echoed setup
+                                // command so it isn't dumped to the terminal.
+                                let stripped = strip_echoed_setup(&echo_buf);
+                                echo_buf = stripped.to_string();
                                 std::mem::take(&mut echo_buf)
                             } else {
                                 continue; // keep buffering; show nothing yet
@@ -1873,6 +1897,30 @@ mod osc_command_tests {
         // continues and nothing is shown prematurely).
         assert!(super::find_hook_done_marker("root@host:~# some unrelated output").is_none());
         assert!(super::find_hook_done_marker("").is_none());
+    }
+
+    #[test]
+    fn strip_echoed_setup_drops_command_when_marker_absent() {
+        // A shell that skips the hook (e.g. fish) echoes the setup command back
+        // with literal `\033`/`\007` text and never emits the real OSC 99 marker.
+        // The fallback must drop the echoed command but keep the real prompt and
+        // any subsequent output.
+        let echoed = "root@host:~#  test -z \"$FISH_VERSION\" && eval '__msc(){ ... printf \"\\033]99;__msh_hk\\007\"'";
+        let prompt = "root@host:~# ";
+        let later = "some real output after the marker never came";
+        let buf = format!("{echoed}\r\n{prompt}{later}");
+
+        let rest = super::strip_echoed_setup(&buf);
+        assert!(!rest.contains("__msh_hk"), "echoed setup must be stripped");
+        assert!(rest.contains(prompt), "real prompt must survive");
+        assert!(rest.contains(later), "subsequent output must survive");
+    }
+
+    #[test]
+    fn strip_echoed_setup_keeps_buffer_when_no_echo() {
+        // If the literal tail is absent nothing is stripped (no-op fallback).
+        let buf = "root@host:~# normal output with no setup echo";
+        assert_eq!(super::strip_echoed_setup(buf), buf);
     }
 }
 
