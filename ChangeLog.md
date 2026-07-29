@@ -13,6 +13,25 @@
 - 涉及文件：
   - `ui/sftp_panel.slint`
 
+### 修复 tmux 内程序狂刷日志导致内存持续上涨直至崩溃（OOM）
+
+- 现象：
+  打开 tmux 后，在里面运行的程序持续输出日志时，客户端进程占用内存不断增大，最终被系统 OOM kill 退出（程序崩溃）。
+- 根因：
+  SSH 终端输出走的是 `tokio::sync::mpsc::unbounded_channel`（`src/ssh.rs` 中的 `events` 通道）。生产者是 russh 异步读取循环，每收到一段数据就 `send` 一条 `SessionEvent::Output`；由于是无界通道，生产者 `send` **永不阻塞**。消费者是一个独立 std 线程，每条事件都要 `apply_session_event_to_window` 做一次完整的 vt100 重解析并重建 Slint Model。tmux 会灌入大量转义序列，日志刷屏时事件到达速度远超消费者处理能力，无界队列无限堆积 → 内存持续上涨 → OOM。
+  已排除的疑似泄漏点（均已是有界存储，不是根因）：滚动缓冲 `buf.history`（按 `trim_history_to_limit` 截断）、`echo_buf`（16 KiB 上限）、`mon_buf`（1 MiB 上限）、`osc_carry`（仅保留一条未完成的尾部片段）。
+- 修复（最小改动 + 背压）：
+  把"高频终端输出"与"低频控制事件"分流到两条通道：
+  1. 新增一个有界通道 `out_tx/out_rx`，容量 `SSH_OUTPUT_CHANNEL_CAP = 1024`；`src/ssh.rs` 里主输出、`ExtendedData`(stderr)、`ResourceStats` 三类高频事件改为 `out_tx.send(...).await`，背压会让 `await` 阻塞生产者。
+  2. 控制事件（cwd、command、status、host-key、凭据、zmodem 错误、closed）仍走原来的无界 `events` 通道，逻辑不变。
+  3. `src/app.rs` 的消费者线程转而 `tokio::select!` 同时消费无界控制通道与有界输出通道（输出通道优先，`biased`）。背压沿"SSH 读取循环 → TCP"向上游传递，远端程序写满窗口后自然被节流，内存占用被限制在通道容量 + 消费者在途处理量之内，不再无限增长。
+- 影响：
+  - 不触碰 SFTP（约 80 个 send 点）、凭据/host-key 共享函数、`ClientHandler`、`zmodem.rs`；只改 SSH 输出与消费者两条路径。
+  - 大输出量场景下，终端可能比"无界时"稍滞后，但换来了内存有界、不再崩溃。
+- 涉及文件：
+  - `src/ssh.rs`（`spawn_session`/`run_session` 分流高频事件到新有界通道 + 常量 `SSH_OUTPUT_CHANNEL_CAP`）
+  - `src/app.rs`（消费者线程 `tokio::select!` 同时消费控制通道与有界输出通道）
+
 ## 2026-07-28
 
 ### 修复外部 shell 自动跟随路径被截断

@@ -484,9 +484,8 @@ pub fn run() -> Result<()> {
     let sftp_last_cwd: SftpLastCwd = Arc::new(Mutex::new(HashMap::new()));
     let sftp_entry_cache: SftpEntryCache = Arc::new(Mutex::new(HashMap::new()));
     let sftp_sort_states: SftpSortStates = Arc::new(Mutex::new(HashMap::new()));
-    // Per-tab tmux state: (in_tmux, consecutive_exec_fail_count).
-    let tmux_state: Arc<Mutex<HashMap<String, (bool, u8)>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    // Per-tab tmux state. While true, automatic SFTP following is disabled.
+    let tmux_state: Arc<Mutex<HashMap<String, bool>>> = Arc::new(Mutex::new(HashMap::new()));
     let pending_ui_refresh: PendingUiRefresh = Arc::new(Mutex::new(Vec::new()));
 
     // Per-tab vt100 parsers + history logs (Arc<Mutex> so they can be cloned
@@ -2284,7 +2283,7 @@ fn wire_session_callbacks(
     local_snap: LocalSnap,
     local_net_hist: NetHist,
     sftp_follow_cd: Arc<std::sync::atomic::AtomicBool>,
-    tmux_state: Arc<Mutex<HashMap<String, (bool, u8)>>>,
+    tmux_state: Arc<Mutex<HashMap<String, bool>>>,
 ) {
     let group_options_model = |store: &ConfigStore| -> ModelRc<SharedString> {
         ModelRc::from(Rc::new(VecModel::from(
@@ -3032,8 +3031,8 @@ struct ConnectCtx {
     disconnect_retry_count: u32,
     /// Periodic SFTP directory refresh interval in seconds.
     sftp_auto_refresh_secs: u32,
-    /// Per-tab tmux state: (in_tmux, consecutive_exec_fail_count).
-    tmux_state: Arc<Mutex<HashMap<String, (bool, u8)>>>,
+    /// Per-tab tmux state. While true, automatic SFTP following is disabled.
+    tmux_state: Arc<Mutex<HashMap<String, bool>>>,
 }
 
 /// Spawn the shell (+ SFTP) workers and their event-pump threads for an
@@ -3042,28 +3041,40 @@ struct ConnectCtx {
 fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
     let has_sftp = session.kind == SessionKind::Ssh;
     let (initial_cols, initial_rows) = *ctx.last_term_size.lock().unwrap();
-    let (handle, rx) = match session.kind {
-        SessionKind::Ssh => spawn_session(
-            ctx.runtime.handle(),
-            tab_id.to_string(),
-            session.clone(),
-            initial_cols,
-            initial_rows,
-            ctx.keepalive_interval_secs,
-            ctx.disconnect_retry_count,
-        ),
-        SessionKind::Serial => crate::serial::spawn_serial_session(
-            ctx.runtime.handle(),
-            tab_id.to_string(),
-            session.clone(),
-        ),
-        SessionKind::Telnet => crate::telnet::spawn_telnet_session(
-            ctx.runtime.handle(),
-            tab_id.to_string(),
-            session.clone(),
-            initial_cols,
-            initial_rows,
-        ),
+    let (handle, rx, out_rx) = match session.kind {
+        SessionKind::Ssh => {
+            let (h, evt_rx, out_rx) = spawn_session(
+                ctx.runtime.handle(),
+                tab_id.to_string(),
+                session.clone(),
+                initial_cols,
+                initial_rows,
+                ctx.keepalive_interval_secs,
+                ctx.disconnect_retry_count,
+            );
+            // `out_rx` is the bounded high-volume output channel (backpressure for
+            // output floods, see ssh.rs SSH_OUTPUT_CHANNEL_CAP). Serial/telnet use
+            // a single unbounded channel and don't get one.
+            (h, evt_rx, Some(out_rx))
+        }
+        SessionKind::Serial => {
+            let (h, r) = crate::serial::spawn_serial_session(
+                ctx.runtime.handle(),
+                tab_id.to_string(),
+                session.clone(),
+            );
+            (h, r, None)
+        }
+        SessionKind::Telnet => {
+            let (h, r) = crate::telnet::spawn_telnet_session(
+                ctx.runtime.handle(),
+                tab_id.to_string(),
+                session.clone(),
+                initial_cols,
+                initial_rows,
+            );
+            (h, r, None)
+        }
     };
     ctx.handles.borrow_mut().insert(tab_id.to_string(), handle);
 
@@ -3105,18 +3116,58 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
         let hidden_transfer_ids_pump = ctx.hidden_transfer_ids.clone();
         let tmux_state_pump = ctx.tmux_state.clone();
         std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("shell event pump runtime");
+            rt.block_on(async move {
             let mut shell_rx = rx;
+            // Bounded high-volume output channel (SSH only); `None` for serial/telnet
+            // which route everything through the single `shell_rx`. (ssh.rs #70)
+            let mut out_rx = out_rx;
+            let mut out_closed = out_rx.is_none();
             let mut cwd_debounce: Option<tokio::task::JoinHandle<()>> = None;
             let mut last_cwd_reported: Option<String> = None;
             loop {
-                match shell_rx.blocking_recv() {
-                    None => break,
-                    Some(shell_evt) => {
+                // Pull the next event from the bounded output channel (with
+                // backpressure) and/or the unbounded control channel. When `out_rx`
+                // is `None` (serial/telnet) or already closed, we just drain
+                // `shell_rx`.
+                let shell_evt: SessionEvent = if let Some(out) = out_rx.as_mut() {
+                    if out_closed {
+                        match shell_rx.recv().await {
+                            Some(e) => e,
+                            None => break,
+                        }
+                    } else {
+                        tokio::select! {
+                            biased;
+                            out_evt = out.recv() => match out_evt {
+                                Some(e) => e,
+                                None => { out_closed = true; continue; }
+                            },
+                            ctrl_evt = shell_rx.recv() => match ctrl_evt {
+                                Some(e) => e,
+                                None => break,
+                            },
+                        }
+                    }
+                } else {
+                    match shell_rx.recv().await {
+                        Some(e) => e,
+                        None => break,
+                    }
+                };
                         if let SessionEvent::CommandRan(ref cmd) = shell_evt {
                             let is_cd = is_cd_command(cmd);
                             // 用 resolve_cd_follow_target 解析 cd 命令得到目标路径，
                             // 不依赖 OSC 7 cwd（可能在 tmux 下被截断）（#158）
-                            if is_cd {
+                            let in_tmux = tmux_state_pump
+                                .lock()
+                                .ok()
+                                .and_then(|ts| ts.get(tab_id_pump.as_str()).copied())
+                                .unwrap_or(false);
+                            if is_cd && !in_tmux {
                                 if let Some(cwd) = last_cwd_reported.clone() {
                                     let home = statuses_pump
                                         .lock()
@@ -3155,19 +3206,12 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                         }
                         if let SessionEvent::CwdChanged(ref cwd) = shell_evt {
                             last_cwd_reported = Some(cwd.clone());
-                            // Reset tmux exec failure counter on any successful
-                            // CwdChanged (proves the query path is working).
-                            if let Ok(mut ts) = tmux_state_pump.lock() {
-                                if let Some(state) = ts.get_mut(tab_id_pump.as_str()) {
-                                    state.1 = 0;
-                                }
-                            }
                             // Only re-enable local buffering when NOT in tmux.
                             // In tmux the echo behaviour breaks type-ahead.
                             let in_tmux = tmux_state_pump
                                 .lock()
                                 .ok()
-                                .and_then(|ts| ts.get(tab_id_pump.as_str()).map(|s| s.0))
+                                .and_then(|ts| ts.get(tab_id_pump.as_str()).copied())
                                 .unwrap_or(false);
                             if !in_tmux {
                                 if let Ok(mut map) = bufs_thread.lock() {
@@ -3179,12 +3223,13 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                             // Swallow the event entirely when follow-cd is off:
                             // forwarding it would set sftp_loading without any
                             // ListDir to clear it (the #59 stuck-"loading" trap).
-                            if !follow_cd_pump.load(std::sync::atomic::Ordering::Relaxed) {
+                            if in_tmux
+                                || !follow_cd_pump.load(std::sync::atomic::Ordering::Relaxed)
+                            {
                                 continue;
                             }
                             // 目录真正变化时才跟随；prompt 重复报同一目录则跳过。
-                            // tmux 内 CwdChanged 来自 exec 查询（tmux 拦截 OSC 7），
-                            // 路径可靠；tmux 外来自 OSC 7 绝对路径，同样可靠。
+                            // 外部 shell 来自 OSC 7 绝对路径。
                             let dir_changed = {
                                 let m = sftp_last_cwd_pump.lock().ok();
                                 m.as_ref()
@@ -3212,19 +3257,6 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                                 }
                             }));
                         }
-                        if let SessionEvent::TmuxExited = shell_evt {
-                            // tmux exec query failed. Only clear in_tmux after
-                            // 2 consecutive failures to tolerate transient errors.
-                            if let Ok(mut ts) = tmux_state_pump.lock() {
-                                if let Some(state) = ts.get_mut(tab_id_pump.as_str()) {
-                                    state.1 = state.1.saturating_add(1);
-                                    if state.1 >= 2 {
-                                        state.0 = false;
-                                        state.1 = 0;
-                                    }
-                                }
-                            }
-                        }
                         // Detect tmux leave: detach prints "[detached (from
                         // session ...)]"; exit prints "[exited]".
                         if let SessionEvent::Output(ref chunk) = shell_evt {
@@ -3232,11 +3264,8 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                                 || chunk.contains("[exited]")
                             {
                                 if let Ok(mut ts) = tmux_state_pump.lock() {
-                                    if let Some(state) =
-                                        ts.get_mut(tab_id_pump.as_str())
-                                    {
-                                        state.0 = false;
-                                        state.1 = 0;
+                                    if let Some(state) = ts.get_mut(tab_id_pump.as_str()) {
+                                        *state = false;
                                     }
                                 }
                                 if let Ok(mut map) = bufs_thread.lock() {
@@ -3279,9 +3308,8 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                                 tracing::error!("shell event UI update panicked; event skipped");
                             }
                         });
-                    }
                 }
-            }
+            });
         });
     }
 
@@ -4196,8 +4224,6 @@ fn apply_session_event_to_window(
                 }
             });
         }
-        // Handled entirely in the pump thread (clears in_tmux flag).
-        SessionEvent::TmuxExited => {}
     }
 }
 
@@ -6137,12 +6163,12 @@ fn wire_key_input(
                     .lock()
                     .unwrap()
                     .get(tid.as_str())
-                    .map(|s| s.0)
+                    .copied()
                     .unwrap_or(false);
                 if is_tmux_command(line.trim()) {
                     {
                         let mut ts = ctx.tmux_state.lock().unwrap();
-                        ts.entry(tid.clone()).or_insert((false, 0)).0 = true;
+                        ts.insert(tid.clone(), true);
                     }
                     // Disable local buffering inside tmux — its echo behaviour
                     // breaks the type-ahead echo suppression and eats chars.
@@ -6153,7 +6179,7 @@ fn wire_key_input(
                     // User left tmux; restore outer-shell behaviour.
                     {
                         let mut ts = ctx.tmux_state.lock().unwrap();
-                        ts.entry(tid.clone()).or_insert((false, 0)).0 = false;
+                        ts.insert(tid.clone(), false);
                     }
                     if let Some(buf) = bufs.lock().unwrap().get_mut(tid.as_str()) {
                         buf.unlock_local_input_at_prompt();
@@ -6165,7 +6191,7 @@ fn wire_key_input(
                 .lock()
                 .unwrap()
                 .get(tid.as_str())
-                .map(|s| s.0)
+                .copied()
                 .unwrap_or(false);
             if snapped_to_live || repaint_after_local {
                 pending_ui_refresh.lock().unwrap().push(tid.clone());

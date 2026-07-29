@@ -14,8 +14,15 @@ use russh::keys::key::PrivateKeyWithHashAlg;
 use russh::keys::load_secret_key;
 use russh::{Channel, ChannelId, ChannelMsg, Disconnect};
 use ssh_key::{HashAlg, PublicKey};
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
+
+/// Capacity of the bounded terminal-output channel (#70). When the UI can't keep
+/// up with a flood of output, this caps the buffered `Output`/`ResourceStats`
+/// events, bounding memory. 1024 events × (a few KiB each) keeps peak usage in the
+/// low-MiB range and is large enough to absorb normal bursts (e.g. `cat` of a
+/// big file) without throttling.
+const SSH_OUTPUT_CHANNEL_CAP: usize = 1024;
 
 use crate::config::{AuthMethod, Session};
 use crate::i18n::t;
@@ -433,9 +440,6 @@ pub enum SessionEvent {
     // --- SFTP events -------------------------------------------------------
     /// The shell's current working directory changed (parsed from OSC 7).
     CwdChanged(String),
-    /// The tmux exec query failed — tmux is no longer running.
-    #[allow(dead_code)]
-    TmuxExited,
     /// SFTP directory listing arrived.
     SftpEntries {
         path: String,
@@ -513,8 +517,14 @@ impl SessionHandle {
 /// after the tab becomes active; passing the best-known size here avoids the
 /// remote shell starting at a stale 80×24 and sending an extra SIGWINCH.
 ///
-/// Returns a [`SessionHandle`] for the UI + an [`UnboundedReceiver`] the UI
-/// should drain on the Slint event loop.
+/// Returns a [`SessionHandle`] for the UI + two receivers the UI should drain on
+/// the Slint event loop:
+///   • `evt_rx`  — control events (cwd, command, status, host-key, …), unbounded
+///                 because they are low-frequency and must never be dropped.
+///   • `out_rx`  — high-volume terminal output (`Output` / `ResourceStats`),
+///                 **bounded** so a flood of output (e.g. a log-spamming program
+///                 inside tmux) applies backpressure up the SSH read loop instead
+///                 of growing an unbounded queue until the process OOMs (#70).
 pub fn spawn_session(
     runtime: &tokio::runtime::Handle,
     tab_id: String,
@@ -523,9 +533,15 @@ pub fn spawn_session(
     initial_rows: u32,
     keepalive_interval_secs: u32,
     disconnect_retry_count: u32,
-) -> (SessionHandle, UnboundedReceiver<SessionEvent>) {
+) -> (SessionHandle, UnboundedReceiver<SessionEvent>, Receiver<SessionEvent>) {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<SessionCommand>();
     let (evt_tx, evt_rx) = mpsc::unbounded_channel::<SessionEvent>();
+
+    // Bound the high-volume terminal output. When the UI consumer can't keep up
+    // with a flood, `out_tx.send().await` blocks here, so we stop reading from
+    // the SSH channel and TCP/SSH flow control makes the remote program pause —
+    // memory stays bounded at (cap × avg-chunk) instead of growing forever.
+    let (out_tx, out_rx) = mpsc::channel::<SessionEvent>(SSH_OUTPUT_CHANNEL_CAP);
 
     let evt_tx_for_task = evt_tx.clone();
     let join = runtime.spawn(async move {
@@ -533,6 +549,7 @@ pub fn spawn_session(
             session,
             cmd_rx,
             evt_tx_for_task.clone(),
+            out_tx,
             initial_cols,
             initial_rows,
             keepalive_interval_secs,
@@ -552,6 +569,7 @@ pub fn spawn_session(
             join,
         },
         evt_rx,
+        out_rx,
     )
 }
 
@@ -559,6 +577,7 @@ async fn run_session(
     session: Session,
     mut commands: UnboundedReceiver<SessionCommand>,
     events: UnboundedSender<SessionEvent>,
+    out_tx: Sender<SessionEvent>,
     initial_cols: u32,
     initial_rows: u32,
     keepalive_interval_secs: u32,
@@ -739,9 +758,60 @@ async fn run_session(
     // has no terminator yet. Prepended to the next chunk so OSC 7 / OSC 697
     // sequences are never dropped at chunk boundaries (#158).
     let mut osc_carry = String::new();
+    // Whether we have already injected the PROMPT_COMMAND setup.
+    // We wait for the first non-empty data chunk (the initial shell prompt)
+    // before sending so the command doesn't interleave with banner text.
+    let mut prompt_injected = false;
+    // True from injecting PROMPT_SETUP until the echoed setup line has been
+    // received and stripped; output is buffered (not shown) during that window.
+    let mut suppress_echo = false;
+    // Keystrokes sent while the setup line is being echoed can appear before
+    // the setup's OSC 7 marker and be swallowed with that echo. Queue them
+    // until the hook is installed, then replay them in order.
+    let mut pending_input_while_suppress: Vec<u8> = Vec::new();
+    // Buffers output while `suppress_echo` so the (long) echoed setup line can be
+    // stripped even when it splits across reads (#98).
+    let mut echo_buf = String::new();
     // After a ZMODEM transfer finishes we briefly ignore ZMODEM detection so the
     // sender's lingering close frames can't spawn a spurious second receive (#76).
     let mut zmodem_done_at: Option<std::time::Instant> = None;
+
+    // Cwd-notification (OSC 7) setup, injected once after the first prompt so
+    // the SFTP panel can follow `cd` (#91). It must work across shells:
+    //   • bash/sh  → PROMPT_COMMAND runs `__ms7` before every prompt.
+    //   • zsh      → bash's PROMPT_COMMAND is IGNORED by zsh, so we register a
+    //                `precmd` hook via `add-zsh-hook` instead (non-destructive —
+    //                it preserves oh-my-zsh / p10k hooks, unlike `precmd(){…}`).
+    //   • fish     → guarded out (fish 3.1+ emits OSC 7 itself).
+    // `__ms7` is called once at the end so the initial cwd arrives immediately.
+    //
+    // The whole shell-specific body lives inside `eval '…'`: fish can't parse
+    // bash/zsh function & `if` syntax, but it CAN parse `eval '<opaque string>'`,
+    // and the `test -z "$FISH_VERSION" &&` guard short-circuits before the eval
+    // ever runs under fish (#71). The body uses only double quotes inside so the
+    // outer single-quoted string needs no escaping; printf turns \033/\007 into
+    // ESC/BEL at prompt time. No array syntax → safe to *parse* in dash/ash too.
+    //
+    // The leading space keeps the line out of shell history when HISTCONTROL=
+    // ignorespace is enabled. Some root/server profiles don't enable it, so
+    // bash also deletes the last history entry after the line has been accepted.
+    // Its echo is stripped locally (the needle below), so the bookkeeping
+    // command never shows up.
+    //
+    // Besides OSC 7 (cwd), the hook also captures the command the user just ran
+    // and reports it via a private `OSC 697 ; <cmd> BEL` so it can join the
+    // command-box history (#113) — terminal-typed commands aren't otherwise
+    // recorded. `__msc` reads the last history entry with `fc -ln -1`; this only
+    // ever sees real executed commands, never password prompts (those use
+    // `read -s` and aren't shell commands). `__cl` remembers the last reported
+    // command so a redrawn prompt (e.g. Enter on an empty line) doesn't re-emit
+    // it, and is primed once up front so the pre-session history isn't replayed.
+    //
+    // The echoed setup line is discarded by anchoring on the OSC 7 it produces
+    // (see the suppress block below), so it doesn't matter that the long line
+    // wraps — we never substring-match it.
+    const PROMPT_BODY: &str = "test -z \"$FISH_VERSION\" && eval '__msc(){ __c=\"$(fc -ln -1 2>/dev/null)\"; [ -n \"$__c\" ] && [ \"$__c\" != \"$__cl\" ] && { __cl=\"$__c\"; printf \"\\033]697;%s\\007\" \"$__c\"; }; }; __ms7(){ __msc; printf \"\\033]7;file://%s%s\\007\" \"$HOSTNAME\" \"$PWD\"; }; __h=\"$(history 1 2>/dev/null)\"; __h=\"${__h#\"${__h%%[! ]*}\"}\"; __h=\"${__h%%[!0-9]*}\"; [ -n \"$BASH_VERSION\" ] && [ -n \"$__h\" ] && history -d \"$__h\" 2>/dev/null; unset __h; __cl=\"$(fc -ln -1 2>/dev/null)\"; if [ -n \"$ZSH_VERSION\" ]; then autoload -Uz add-zsh-hook 2>/dev/null; add-zsh-hook precmd __ms7; else PROMPT_COMMAND=\"__ms7${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"; fi; __ms7'";
+    let prompt_setup = format!(" {}\r", PROMPT_BODY);
 
     // --- Remote resource monitor (separate exec channel) ----------------
     // A tiny remote loop streams /proc/stat + /proc/meminfo every 2s; we parse
@@ -834,6 +904,10 @@ async fn run_session(
                         // Only log the byte count — never the bytes themselves,
                         // which are raw keystrokes and may contain passwords (#15).
                         tracing::debug!("ssh channel.data len={} bytes", bytes.len());
+                        if suppress_echo {
+                            pending_input_while_suppress.extend_from_slice(&bytes);
+                            continue;
+                        }
                         if let Err(err) = channel.data(&bytes[..]).await {
                             let _ = events.send(SessionEvent::Closed(format!("{}: {err}", t("写入失败", "write failed"))));
                             break;
@@ -908,6 +982,47 @@ async fn run_session(
 
                         let chunk = String::from_utf8_lossy(&data).into_owned();
 
+                        // Inject PROMPT_COMMAND after the first real shell output.
+                        if !prompt_injected && !chunk.trim().is_empty() {
+                            prompt_injected = true;
+                            suppress_echo = true;
+                            let _ = channel.data(prompt_setup.as_bytes()).await;
+                            // Fall through: this chunk is buffered below so the
+                            // echoed setup line is stripped as a single piece.
+                        }
+
+                        // While suppressing, buffer output until the injected
+                        // __ms7 prints its OSC 7 (it runs right after the setup
+                        // line is echoed and executed), then discard everything up
+                        // to and including that OSC 7 — the echoed setup line (which
+                        // may WRAP across the terminal width, so substring-matching
+                        // it is unreliable) plus the pre-injection prompt. Whatever
+                        // follows the OSC 7 is the fresh prompt, which we keep (#98).
+                        // A size cap is the safety valve for a shell that never
+                        // reports back (e.g. dash without PROMPT_COMMAND).
+                        let mut flush_pending_input = false;
+                        let chunk = if suppress_echo {
+                            echo_buf.push_str(&chunk);
+                            const ECHO_BUF_CAP: usize = 1 << 14; // 16 KiB
+                            if let Some((cwd, seq_end)) = extract_osc7_end(&echo_buf) {
+                                suppress_echo = false;
+                                flush_pending_input = true;
+                                tracing::debug!("OSC7 cwd={:?}", cwd);
+                                let _ = events.send(SessionEvent::CwdChanged(cwd));
+                                let rest = echo_buf[seq_end..].to_string();
+                                echo_buf.clear();
+                                rest
+                            } else if echo_buf.len() >= ECHO_BUF_CAP {
+                                suppress_echo = false;
+                                flush_pending_input = true;
+                                std::mem::take(&mut echo_buf)
+                            } else {
+                                continue; // keep buffering; show nothing yet
+                            }
+                        } else {
+                            chunk
+                        };
+
                         // An OSC 7 / OSC 697 sequence can be split across the
                         // boundary between two SSH data reads. Carry any
                         // incomplete tail and prepend it to the next chunk.
@@ -946,11 +1061,20 @@ async fn run_session(
                             let _ = events.send(SessionEvent::CwdChanged(cwd));
                         }
 
-                        let _ = events.send(SessionEvent::Output(text));
+                        // High-volume terminal output → bounded channel with backpressure.
+                        let _ = out_tx.send(SessionEvent::Output(text)).await;
+                        if flush_pending_input && !pending_input_while_suppress.is_empty() {
+                            let queued = std::mem::take(&mut pending_input_while_suppress);
+                            if let Err(err) = channel.data(&queued[..]).await {
+                                let _ = events.send(SessionEvent::Closed(format!("{}: {err}", t("写入失败", "write failed"))));
+                                break;
+                            }
+                        }
                     }
                     Some(ChannelMsg::ExtendedData { data, ext: _ }) => {
                         let text = String::from_utf8_lossy(&data).into_owned();
-                        let _ = events.send(SessionEvent::Output(text));
+                        // High-volume stderr output → bounded channel with backpressure.
+                        let _ = out_tx.send(SessionEvent::Output(text)).await;
                     }
                     Some(ChannelMsg::ExitStatus { exit_status }) => {
                         let _ = events.send(SessionEvent::Status(
@@ -988,7 +1112,10 @@ async fn run_session(
                                 &mut prev_net,
                                 &mut prev_net_at,
                             ) {
-                                let _ = events.send(stats);
+                                // ResourceStats is low-frequency, but route it through
+                                // the bounded output channel for a single backpressure
+                                // point.
+                                let _ = out_tx.send(stats).await;
                             }
                         }
                         // Bound the leftover (incomplete) tail: a server that
