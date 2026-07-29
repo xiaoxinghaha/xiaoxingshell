@@ -903,17 +903,23 @@ export component SftpPanel inherits Rectangle {
                                 row-ta := TouchArea {
                                     mouse-cursor: default;
                                     clicked => { }
-                                    pointer-event(ev) => {
-                                        if (ev.kind == PointerEventKind.down
-                                                && ev.button == PointerEventButton.left) {
-                                            if (!ev.modifiers.shift
-                                                    && root.selected-row == i
-                                                    && root.selection-start-row == i
-                                                    && root.selection-end-row == i) {
-                                                root.pending-rename-row = i;
-                                            } else {
-                                                root.pending-rename-row = -1;
-                                            }
+                                pointer-event(ev) => {
+                                    if (ev.kind == PointerEventKind.down
+                                            && ev.button == PointerEventButton.left) {
+                                        // Only arm rename when the click lands on the
+                                        // name column (first column, x in [8px, 8px +
+                                        // col-name-width]); clicking other columns merely
+                                        // selects the row, like Windows Explorer (#70).
+                                        if (!ev.modifiers.shift
+                                                && root.selected-row == i
+                                                && root.selection-start-row == i
+                                                && root.selection-end-row == i
+                                                && self.mouse-x >= 8px
+                                                && self.mouse-x <= 8px + root.col-name-width) {
+                                            root.pending-rename-row = i;
+                                        } else {
+                                            root.pending-rename-row = -1;
+                                        }
                                             if (ev.modifiers.shift && root.selection-anchor-row >= 0) {
                                                 root.selected-row = i;
                                                 root.selection-start-row = root.selection-anchor-row;
