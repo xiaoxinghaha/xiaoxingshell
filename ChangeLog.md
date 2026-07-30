@@ -1,5 +1,24 @@
 # ChangeLog
 
+## 2026-07-30
+
+### 修复终端连上后输入中文时输入法跑到别处并卡死终端
+
+- 现象：
+  SSH 终端刚连上、首次输入中文时，输入法候选/合成窗口不在光标处，而是跑到终端底部等"别的地方"；随后终端卡死，键盘无任何响应，即使切换回英文也无效，只能重启软件恢复。
+- 根因（输入法位置）：
+  捕获键盘与 IME 的隐藏 `ime-input` 是一个 `opacity:0; height:1px` 的 TextInput，原先被钉在 `y: key-capture.height - 16px`（终端底部）。Windows IME 的候选/合成窗口跟随"焦点 TextInput 的插入符位置"，于是出现在终端底部而非可视光标处。
+- 根因（卡死）：
+  `on_terminal_focused` 每次隐藏输入框获得焦点都调用 `prefer_terminal_english_input_mode()` → `ImmSetOpenStatus(himc, 0)` 强关 IME。若此刻正在中文合成（preedit 非空），外部强关 IME 不会按正常流程给 Slint 发 preedit 取消通知，`preedit-text` 卡在非空 → TextInput 认为仍在合成 → `key-pressed` 不再触发、`edited` 因 `preedit-text==""` 守卫永不提交 → 彻底卡死，切英文也救不回（IME 上下文已半死），只有重启重建 TextInput 才恢复。"刚连上首次输入中文"恰好命中。
+- 修复（最小改动）：
+  1. `ui/terminal_view.slint` 的 `ime-input` 把 `x/y` 改为跟随终端光标：`x: 10px + cursor-col*cell-w`、`y: 8px + cursor-row*cell-h + flickable.viewport-y`（计入 grid 偏移与滚动），宽度收为 `cell-w`。IME 合成窗口现在贴着光标出现，不再跑到底部。
+  2. `ime-input` 的 `changed has-focus` 增加 preedit 守卫：仅当 `preedit-text == ""`（无进行中的合成）时才触发 `terminal-focused()`（进而强关 IME），避免中途打断中文合成导致 preedit 卡死；同时在该分支清掉 `self.text` 残留，防止被守卫跳过的提交累积堵住输入。
+- 影响：
+  - 不改 `src/ssh.rs`、SFTP、凭据逻辑；`prefer_terminal_english_input_mode` 本身保留，只是不再在合成进行中触发。
+  - 已卡死的会话仍需重启一次恢复；本修复防止再次发生。
+- 涉及文件：
+  - `ui/terminal_view.slint`
+
 ## 2026-07-29
 
 ### 优化 SFTP 重命名触发区域：仅名称列触发，整行不再触发

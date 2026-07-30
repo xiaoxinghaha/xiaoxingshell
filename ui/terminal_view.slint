@@ -620,18 +620,35 @@ export component TerminalView inherits Rectangle {
             // safety net for IME commits that Windows delivers via WM_IME_CHAR
             // rather than WM_CHAR (and therefore don't fire key-pressed).
             ime-input := TextInput {
-                x: 0;
-                y: key-capture.height - 16px;
-                width: key-capture.width;
+                // Position the hidden field at the terminal cursor (grid offset
+                // 10px/8px + cursor cell + flickable scroll offset) so the Win32
+                // IME composition / candidate window — which follows the focused
+                // TextInput's caret — pops up at the cursor instead of at the
+                // bottom of the terminal where the field used to be pinned
+                // (key-capture.height - 16px).  Typing always snaps to the live
+                // bottom, so the caret stays inside the visible viewport.
+                x: 10px + root.cursor-col * root.cell-w;
+                y: 8px + root.cursor-row * root.cell-h + flickable.viewport-y;
+                width: root.cell-w;
                 height: 1px;
                 opacity: 0;
                 single-line: true;
 
-                // Reset blink phase on focus gain so cursor appears immediately.
+                // Reset blink phase on focus gain so the cursor appears
+                // immediately.  Only trigger the "prefer English IME" policy
+                // when NO composition is in flight: force-closing the IME
+                // (ImmSetOpenStatus 0) while a Chinese preedit is active desyncs
+                // Slint's preedit-text (the cancel notification is never
+                // delivered), leaving the TextInput frozen — no key-pressed, no
+                // edited, recoverable only by restart.  Also clear any leftover
+                // committed text from a previously skipped commit.
                 changed has-focus => {
                     if (self.has-focus) {
                         key-capture.cursor-blink = true;
-                        root.terminal-focused();
+                        if (self.preedit-text == "") {
+                            root.terminal-focused();
+                            if (self.text != "") { self.text = ""; }
+                        }
                     }
                 }
 
