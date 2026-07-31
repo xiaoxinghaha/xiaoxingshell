@@ -1712,9 +1712,13 @@ pub fn run() -> Result<()> {
     let refresh_bufs = bufs.clone();
     let refresh_weak = window.as_weak();
     let refresh_timer = slint::Timer::default();
+    // 20 fps render tick: flushing + full-screen rebuild + Slint redraw of a
+    // 32 KiB batch fits comfortably inside 50 ms even on slower machines, so
+    // fast-scrolling output (`yes`, logs) stays smooth instead of saturating
+    // the UI thread at 33 ms.
     refresh_timer.start(
         slint::TimerMode::Repeated,
-        std::time::Duration::from_millis(33),
+        std::time::Duration::from_millis(50),
         move || {
             let ids = {
                 let mut q = refresh_queue.lock().unwrap();
@@ -2973,12 +2977,20 @@ fn wire_session_callbacks(
             // Create vt100 parser for this tab (default 24×80; resized on first
             // terminal-resize callback). Scrollback retention is capped by the
             // user's Interface setting.
+            //
+            // NOTE: the parser's internal scrollback is deliberately disabled
+            // (scrollback_len = 0): vt100 keeps a FULL grid row (~44 B per
+            // cell, i.e. 160 cols × 44 B ≈ 7 KiB/row) per scrollback line, so
+            // a 100k-line setting would hold ~700 MB in the parser alone, on
+            // TOP of our own compact `history` copy. All scrolling/rendering
+            // reads our own history (build_row + scroll view), so the parser's
+            // internal copy is redundant.
             let is_dark_now = weak.upgrade().map(|w| w.get_dark_mode()).unwrap_or(true);
             let scrollback_lines = store.borrow().terminal_scrollback_lines() as usize;
             bufs.lock().unwrap().insert(
                 tab_id.clone(),
                 TermBuffer {
-                    parser: vt100::Parser::new(24, 80, scrollback_lines),
+                    parser: vt100::Parser::new(24, 80, 0),
                     find_query: String::new(),
                     is_dark: is_dark_now,
                     sel_anchor: None,
@@ -5909,11 +5921,13 @@ fn wire_key_input(
                         h.close();
                     }
                     // Fresh screen: new parser, cleared history/selection.
+                    // Parser scrollback stays 0 — scrollback lives only in our
+                    // own `history` (see the init site for why).
                     {
                         let mut map = ctx.bufs.lock().unwrap();
                         if let Some(b) = map.get_mut(tab_id.as_str()) {
                             let (rows, cols) = b.parser.screen().size();
-                            b.parser = vt100::Parser::new(rows, cols, b.max_history_lines);
+                            b.parser = vt100::Parser::new(rows, cols, 0);
                             b.history.clear();
                             b.prev.clear();
                             b.displayed_text.clear();
@@ -8853,9 +8867,9 @@ impl TermBuffer {
     }
 
     /// Flush the pending output into the vt100 parser. Called by
-    /// `rebuild_tab_display` (the 33 ms render tick), so all output that
+    /// `rebuild_tab_display` (the 50 ms render tick), so all output that
     /// arrived since the last tick is parsed in ONE coalesced batch instead of
-    /// once per network chunk. At most the newest 64 KiB is ingested per tick:
+    /// once per network chunk. At most the newest 32 KiB is ingested per tick:
     /// if the UI fell behind, older bytes are dropped (skip frames) so a
     /// render tick never exceeds its budget.
     fn flush_pending_output(&mut self) {
@@ -8863,7 +8877,7 @@ impl TermBuffer {
             return;
         }
         let mut text = std::mem::take(&mut self.pending_text);
-        const MAX_INGEST_PER_TICK: usize = 64 * 1024;
+        const MAX_INGEST_PER_TICK: usize = 32 * 1024;
         if text.len() > MAX_INGEST_PER_TICK {
             let mut drop = text.len() - MAX_INGEST_PER_TICK;
             while drop < text.len() && !text.is_char_boundary(drop) {
@@ -8880,7 +8894,10 @@ impl TermBuffer {
         let bytes = self.rewrite_hvp(raw);
         let bytes = &bytes[..];
         let rows = self.parser.screen().size().0 as usize;
-        let batch_lines = (rows / 2).max(1);
+        // One batch per screen height (was rows/2): each batch rebuilds the
+        // whole screen for scroll detection, so the larger batch halves that
+        // per-flush cost for fast-scrolling output like `yes`.
+        let batch_lines = rows.max(1);
         let mut start = 0usize;
         let mut nl = 0usize;
         for i in 0..bytes.len() {
