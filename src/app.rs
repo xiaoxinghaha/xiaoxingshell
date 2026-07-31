@@ -7844,10 +7844,24 @@ fn build_row(screen: &vt100::Screen, r: u16, cols: u16) -> Line {
 /// Detect how many lines scrolled off the top between two screen snapshots by
 /// finding the vertical shift `k` that best aligns `prev` onto `curr` (longest
 /// top-anchored run of equal plain-text lines).  `k` lines left the top.
+///
+/// Two pruning rules keep the worst case (a screen full of identical lines, or
+/// any flood where every row is the same text) at O(rows) comparisons instead
+/// of O(rows²): a shift `k` whose remaining `prev` rows can't beat the current
+/// best match is skipped, and a best match that already spans the whole `curr`
+/// screen can't be improved.
 fn detect_scroll(prev: &[Line], curr: &[Line]) -> usize {
+    if prev.is_empty() || curr.is_empty() {
+        return 0;
+    }
     let mut best_k = 0usize;
     let mut best_len = 0usize;
     for k in 0..prev.len() {
+        // `p` is capped by `prev.len() - k`, so a shift that can't beat the
+        // current best is skipped; later shifts only have fewer rows left.
+        if prev.len() - k <= best_len {
+            break;
+        }
         let mut p = 0usize;
         while k + p < prev.len() && p < curr.len() && prev[k + p].text == curr[p].text {
             p += 1;
@@ -7855,6 +7869,10 @@ fn detect_scroll(prev: &[Line], curr: &[Line]) -> usize {
         if p > best_len {
             best_len = p;
             best_k = k;
+            // Matched the entire current screen — nothing can beat this.
+            if best_len >= curr.len() {
+                break;
+            }
         }
     }
     best_k
@@ -10163,6 +10181,62 @@ mod selection_tests {
         assert!(!is_tmux_command("tmuxinator"));
         assert!(!is_tmux_command(""));
         assert!(!is_tmux_command("cd /tmp"));
+    }
+
+    #[test]
+    fn detect_scroll_finds_shift() {
+        let line = |t: &str| Line {
+            text: t.to_string(),
+            spans: Vec::new(),
+            wrapped: false,
+        };
+        // Scroll two lines: prev rows 2.. align onto curr rows 0.. .
+        let prev = vec![line("a"), line("b"), line("c"), line("d"), line("e")];
+        let curr = vec![line("c"), line("d"), line("e"), line("f"), line("g")];
+        assert_eq!(detect_scroll(&prev, &curr), 2);
+    }
+
+    #[test]
+    fn detect_scroll_no_match_returns_zero() {
+        let line = |t: &str| Line {
+            text: t.to_string(),
+            spans: Vec::new(),
+            wrapped: false,
+        };
+        let prev = vec![line("a"), line("b"), line("c")];
+        let curr = vec![line("x"), line("y"), line("z")];
+        assert_eq!(detect_scroll(&prev, &curr), 0);
+    }
+
+    #[test]
+    fn detect_scroll_identical_screen_returns_zero() {
+        // The pathological flood case: every row is the same text. The pruning
+        // keeps this at O(rows) comparisons; the answer must stay 0 (no scroll).
+        let line = |t: &str| Line {
+            text: t.to_string(),
+            spans: Vec::new(),
+            wrapped: false,
+        };
+        let prev: Vec<Line> = (0..100).map(|_| line("same")).collect();
+        let curr: Vec<Line> = (0..100).map(|_| line("same")).collect();
+        assert_eq!(detect_scroll(&prev, &curr), 0);
+    }
+
+    #[test]
+    fn detect_scroll_identical_screen_with_tail_change() {
+        // All rows identical except the last row changed. Both "no scroll" and
+        // "scrolled one row" produce the same alignment length here, and the
+        // algorithm (like the original) resolves the tie to 0 — the visible
+        // result is identical either way, so 0 is the safe answer.
+        let line = |t: &str| Line {
+            text: t.to_string(),
+            spans: Vec::new(),
+            wrapped: false,
+        };
+        let prev: Vec<Line> = (0..100).map(|_| line("same")).collect();
+        let mut curr: Vec<Line> = (0..100).map(|_| line("same")).collect();
+        curr[99] = line("new");
+        assert_eq!(detect_scroll(&prev, &curr), 0);
     }
 
 }
