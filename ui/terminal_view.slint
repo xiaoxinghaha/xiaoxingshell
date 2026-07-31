@@ -135,7 +135,6 @@ export component TerminalView inherits Rectangle {
     callback delete-history(int /* index */);  // remove a history entry (#96)
 
     callback send-key(string, bool, bool, bool);
-    callback terminal-focused();
     callback terminal-resize(float, float);
     callback sftp-navigate(string);
     callback sftp-download(string);
@@ -635,20 +634,10 @@ export component TerminalView inherits Rectangle {
                 single-line: true;
 
                 // Reset blink phase on focus gain so the cursor appears
-                // immediately.  Only trigger the "prefer English IME" policy
-                // when NO composition is in flight: force-closing the IME
-                // (ImmSetOpenStatus 0) while a Chinese preedit is active desyncs
-                // Slint's preedit-text (the cancel notification is never
-                // delivered), leaving the TextInput frozen — no key-pressed, no
-                // edited, recoverable only by restart.  Also clear any leftover
-                // committed text from a previously skipped commit.
+                // immediately.
                 changed has-focus => {
                     if (self.has-focus) {
                         key-capture.cursor-blink = true;
-                        if (self.preedit-text == "") {
-                            root.terminal-focused();
-                            if (self.text != "") { self.text = ""; }
-                        }
                     }
                 }
 

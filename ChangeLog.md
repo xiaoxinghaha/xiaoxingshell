@@ -1,5 +1,20 @@
 # ChangeLog
 
+## 2026-07-31
+
+### 移除终端获焦自动切换英文输入法逻辑（彻底解决卡死）
+
+- 背景：
+  上一版（2026-07-30）给"获焦强关 IME"加了 preedit 守卫，但实际仍会出现终端直接卡死、只有重启才能恢复的情况。根因是 `prefer_terminal_english_input_mode()` 调 `ImmSetOpenStatus(0)` 强关 IME 这一行为本身在部分输入法/时序下会打乱 Slint TextInput 的合成状态。守卫无法完全规避，遂整体移除该自动切换逻辑。
+- 改动（删除整条 `terminal-focused` 链，它只为强关 IME 服务）：
+  1. `src/app.rs`：删除 `prefer_terminal_english_input_mode()` 函数（Windows 的 imm32 实现 + 非 Windows 空实现）及 `window.on_terminal_focused(...)` 处理器注册。
+  2. `ui/terminal_view.slint`：删除 `callback terminal-focused();` 声明；`ime-input` 的 `changed has-focus` 去掉 `root.terminal-focused()` 调用与上版加的 preedit 守卫/text 清理块，只保留光标闪烁重置。
+  3. `ui/app.slint`：删除 `callback terminal-focused(string /* tab-id */);` 声明与 `terminal-focused() => { root.terminal-focused(term.id); }` 转发绑定。
+- 结果：
+  终端获得焦点时不再主动动输入法，用户手动切什么输入法都保持原样；不会因强关 IME 打断中文合成而卡死。`is_vk_back_down`/`c0_letter_key_down` 等其它 user32 调用是独立函数，不受影响。
+- 涉及文件：
+  - `src/app.rs`、`ui/terminal_view.slint`、`ui/app.slint`
+
 ## 2026-07-30
 
 ### 修复终端连上后输入中文时输入法跑到别处并卡死终端

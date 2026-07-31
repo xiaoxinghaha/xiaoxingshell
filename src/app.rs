@@ -1981,38 +1981,6 @@ fn center_window(win: &AppWindow) {
 #[cfg(not(windows))]
 fn center_window(_win: &AppWindow) {}
 
-#[cfg(windows)]
-fn prefer_terminal_english_input_mode() {
-    type Hwnd = isize;
-    type Himc = isize;
-    #[link(name = "user32")]
-    extern "system" {
-        fn GetForegroundWindow() -> Hwnd;
-    }
-    #[link(name = "imm32")]
-    extern "system" {
-        fn ImmGetContext(hwnd: Hwnd) -> Himc;
-        fn ImmSetOpenStatus(himc: Himc, open: i32) -> i32;
-        fn ImmReleaseContext(hwnd: Hwnd, himc: Himc) -> i32;
-    }
-
-    let hwnd = unsafe { GetForegroundWindow() };
-    if hwnd == 0 {
-        return;
-    }
-    let himc = unsafe { ImmGetContext(hwnd) };
-    if himc == 0 {
-        return;
-    }
-    unsafe {
-        ImmSetOpenStatus(himc, 0);
-        ImmReleaseContext(hwnd, himc);
-    }
-}
-
-#[cfg(not(windows))]
-fn prefer_terminal_english_input_mode() {}
-
 /// The active terminal tab's current SFTP directory ("" if unknown).
 fn active_sftp_path(win: &AppWindow, tab_id: &str) -> String {
     let model = win.get_terminals();
@@ -6379,12 +6347,6 @@ fn wire_key_input(
             pending_ui_refresh.lock().unwrap().push(tab_id.to_string());
         });
     }
-
-    // Terminal focus policy: on Windows, close the current IME open state when
-    // the terminal regains focus. Users can still switch to Chinese manually.
-    window.on_terminal_focused(move |_tab_id: SharedString| {
-        prefer_terminal_english_input_mode();
-    });
 
     // Ctrl+Shift+C: copy current terminal screen to clipboard.
     {

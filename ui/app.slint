@@ -575,8 +575,6 @@ export component AppWindow inherits Window {
 
     // Raw keystroke forwarding: Rust converts key+modifiers to PTY bytes.
     callback send-key(string /* tab-id */, string /* key */, bool /* ctrl */, bool /* alt */, bool /* shift */);
-    // Terminal input focus policy, e.g. switch Windows IME to English.
-    callback terminal-focused(string /* tab-id */);
     // Notifies Rust of a PTY resize (pixel dimensions; Rust converts to cols/rows).
     callback terminal-resize(string /* tab-id */, float /* width-px */, float /* height-px */);
 
@@ -958,7 +956,6 @@ export component AppWindow inherits Window {
                                 root.quick-cmd-manage-open = true;
                             }
                             send-key(key, ctrl, alt, shift) => { root.send-key(term.id, key, ctrl, alt, shift) }
-                            terminal-focused() => { root.terminal-focused(term.id); }
                             terminal-resize(w, h) => { root.terminal-resize(term.id, w, h) }
                             terminal-bg-image: root.term-bg-image;
                             terminal-bg-image-enabled: root.term-bg-image-path != "";
