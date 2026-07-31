@@ -897,8 +897,15 @@ async fn run_session(
     }
 
     // --- Main pump ------------------------------------------------------
+    // `biased` + the commands branch first: while a remote program floods
+    // output, a Ctrl+C / keystroke must be delivered to the PTY immediately
+    // instead of waiting behind the fair-scheduled output handling (a
+    // Ctrl+C during `yes` used to take seconds to stop the flood). The
+    // commands branch is pending the vast majority of the time, so output
+    // throughput is unaffected.
     loop {
         tokio::select! {
+            biased;
             cmd = commands.recv() => {
                 match cmd {
                     Some(SessionCommand::RawInput(bytes)) => {
