@@ -3096,16 +3096,96 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
             let mut out_closed = out_rx.is_none();
             let mut cwd_debounce: Option<tokio::task::JoinHandle<()>> = None;
             let mut last_cwd_reported: Option<String> = None;
+
+            // --- Output batching ---
+            // High-volume `Output` events are aggregated here and posted to the
+            // UI thread at most once per 16 ms / 64 KiB instead of one
+            // invoke_from_event_loop + full-screen re-render per SSH chunk.  A
+            // flood (`yes`, log spam, `cat` of a big file) can no longer pile up
+            // an unbounded UI event queue that freezes the window and grows
+            // memory.  Control events (cwd, command, status, host-key, …) bypass
+            // the batch, but are always handled AFTER flushing any pending batch
+            // so the UI sees everything in arrival order.
+            const OUTPUT_BATCH_BYTES: usize = 64 * 1024;
+            const OUTPUT_BATCH_MS: std::time::Duration = std::time::Duration::from_millis(16);
+            let mut batch_buf = String::new();
+            let mut batch_since: Option<std::time::Instant> = None;
+
+            // Post one event (or a flushed output batch) to the Slint event loop.
+            let post_to_ui = |evt: SessionEvent| {
+                let weak_evt = weak_inner.clone();
+                let tid = tab_id_pump.clone();
+                let bufs_evt = bufs_thread.clone();
+                let st_evt = statuses_pump.clone();
+                let lc_evt = local_pump.clone();
+                let nh_evt = net_pump.clone();
+                let sftp_cache_evt = sftp_cache_pump.clone();
+                let sftp_sort_evt = sftp_sort_pump.clone();
+                let hidden_transfer_ids_evt = hidden_transfer_ids_pump.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        if let Some(win) = weak_evt.upgrade() {
+                            apply_session_event_to_window(
+                                &win,
+                                &tid,
+                                evt,
+                                &bufs_evt,
+                                &st_evt,
+                                &lc_evt,
+                                &nh_evt,
+                                &sftp_cache_evt,
+                                &sftp_sort_evt,
+                                &hidden_transfer_ids_evt,
+                            );
+                        }
+                    }));
+                    if result.is_err() {
+                        tracing::error!("shell event UI update panicked; event skipped");
+                    }
+                });
+            };
             loop {
                 // Pull the next event from the bounded output channel (with
                 // backpressure) and/or the unbounded control channel. When `out_rx`
                 // is `None` (serial/telnet) or already closed, we just drain
-                // `shell_rx`.
+                // `shell_rx`.  While an output batch is pending, a 16 ms timeout
+                // fires too, so the batch is flushed even if no new data arrives.
                 let shell_evt: SessionEvent = if let Some(out) = out_rx.as_mut() {
                     if out_closed {
                         match shell_rx.recv().await {
                             Some(e) => e,
                             None => break,
+                        }
+                    } else if let Some(since) = batch_since {
+                        let now = std::time::Instant::now();
+                        if now >= since + OUTPUT_BATCH_MS {
+                            // Batch deadline elapsed → flush it, keep waiting.
+                            let batch = std::mem::take(&mut batch_buf);
+                            batch_since = None;
+                            if !batch.is_empty() {
+                                post_to_ui(SessionEvent::Output(batch));
+                            }
+                            continue;
+                        }
+                        tokio::select! {
+                            biased;
+                            _ = tokio::time::sleep(since + OUTPUT_BATCH_MS - now) => {
+                                // Batch deadline elapsed → flush it, keep waiting.
+                                let batch = std::mem::take(&mut batch_buf);
+                                batch_since = None;
+                                if !batch.is_empty() {
+                                    post_to_ui(SessionEvent::Output(batch));
+                                }
+                                continue;
+                            }
+                            out_evt = out.recv() => match out_evt {
+                                Some(e) => e,
+                                None => { out_closed = true; continue; }
+                            },
+                            ctrl_evt = shell_rx.recv() => match ctrl_evt {
+                                Some(e) => e,
+                                None => break,
+                            },
                         }
                     } else {
                         tokio::select! {
@@ -3119,6 +3199,33 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                                 None => break,
                             },
                         }
+                    }
+                } else if let Some(since) = batch_since {
+                    // Serial/telnet route everything through `shell_rx`; while a
+                    // batch is pending we still need the flush deadline.
+                    let now = std::time::Instant::now();
+                    if now >= since + OUTPUT_BATCH_MS {
+                        let batch = std::mem::take(&mut batch_buf);
+                        batch_since = None;
+                        if !batch.is_empty() {
+                            post_to_ui(SessionEvent::Output(batch));
+                        }
+                        continue;
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = tokio::time::sleep(since + OUTPUT_BATCH_MS - now) => {
+                            let batch = std::mem::take(&mut batch_buf);
+                            batch_since = None;
+                            if !batch.is_empty() {
+                                post_to_ui(SessionEvent::Output(batch));
+                            }
+                            continue;
+                        }
+                        e = shell_rx.recv() => match e {
+                            Some(e) => e,
+                            None => break,
+                        },
                     }
                 } else {
                     match shell_rx.recv().await {
@@ -3245,37 +3352,29 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                                 }
                             }
                         }
-                        let weak_evt = weak_inner.clone();
-                        let tid = tab_id_pump.clone();
-                        let bufs_evt = bufs_thread.clone();
-                        let st_evt = statuses_pump.clone();
-                        let lc_evt = local_pump.clone();
-                        let nh_evt = net_pump.clone();
-                        let sftp_cache_evt = sftp_cache_pump.clone();
-                        let sftp_sort_evt = sftp_sort_pump.clone();
-                        let hidden_transfer_ids_evt = hidden_transfer_ids_pump.clone();
-                        let _ = slint::invoke_from_event_loop(move || {
-                            let result =
-                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    if let Some(win) = weak_evt.upgrade() {
-                                        apply_session_event_to_window(
-                                            &win,
-                                            &tid,
-                                            shell_evt,
-                                            &bufs_evt,
-                                            &st_evt,
-                                            &lc_evt,
-                                            &nh_evt,
-                                            &sftp_cache_evt,
-                                            &sftp_sort_evt,
-                                            &hidden_transfer_ids_evt,
-                                        );
-                                    }
-                                }));
-                            if result.is_err() {
-                                tracing::error!("shell event UI update panicked; event skipped");
+                        // High-volume Output → aggregate into the pending batch
+                        // (the tmux-leave detection above still runs per raw
+                        // chunk so the tmux state stays responsive).  Every
+                        // other event type first flushes any pending batch so
+                        // the UI sees events in arrival order.
+                        if let SessionEvent::Output(ref chunk) = shell_evt {
+                            if batch_since.is_none() {
+                                batch_since = Some(std::time::Instant::now());
                             }
-                        });
+                            batch_buf.push_str(chunk);
+                            if batch_buf.len() >= OUTPUT_BATCH_BYTES {
+                                let batch = std::mem::take(&mut batch_buf);
+                                batch_since = None;
+                                post_to_ui(SessionEvent::Output(batch));
+                            }
+                            continue;
+                        }
+                        if !batch_buf.is_empty() {
+                            let batch = std::mem::take(&mut batch_buf);
+                            batch_since = None;
+                            post_to_ui(SessionEvent::Output(batch));
+                        }
+                        post_to_ui(shell_evt);
                 }
             });
         });
