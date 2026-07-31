@@ -463,6 +463,36 @@ fn set_window_icon(window: &AppWindow) {
         .with_winit_window(|ww| ww.set_window_icon(Some(icon)));
 }
 
+/// Message recorded by the global panic hook; a Slint timer in `run()` polls
+/// this and shows the internal-error dialog on the UI thread. Only the first
+/// panic is kept (the rest are still logged to error.log via tracing).
+static CRASH_MSG: Mutex<Option<String>> = Mutex::new(None);
+
+/// Install a global panic hook that records every panic to error.log (via
+/// tracing, which the file layer persists at WARN+) and pops an on-screen
+/// dialog with the message — so a panic in any thread is never a silent crash.
+///
+/// This only works together with unwinding (release profile no longer uses
+/// `panic = "abort"`): the `catch_unwind` guards around the per-event UI
+/// updates then contain the panic, while this hook still fires for panics
+/// that escape (e.g. a broken SSH worker task).
+///
+/// The hook itself never touches the window (AppWindow isn't Send): it records
+/// the message here, and the 500 ms poll timer in `run()` shows the dialog.
+pub fn init_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let thread = std::thread::current();
+        let thread_name = thread.name().unwrap_or("<unnamed>");
+        let msg = format!("panic in thread '{thread_name}': {info}");
+        tracing::error!("{msg}");
+        if let Ok(mut guard) = CRASH_MSG.lock() {
+            if guard.is_none() {
+                *guard = Some(msg);
+            }
+        }
+    }));
+}
+
 pub fn run() -> Result<()> {
     // --- Runtime + store -------------------------------------------------
     let runtime = Arc::new(Runtime::new().context("failed to start tokio runtime")?);
@@ -1693,6 +1723,29 @@ pub fn run() -> Result<()> {
             }
         },
     );
+
+    // Panic-dialog poller: the global panic hook (app::init_panic_hook) runs on
+    // whatever thread panicked and only records the message; this timer shows
+    // the internal-error dialog on the UI thread. Kept alive via Box::leak.
+    {
+        let panic_weak = window.as_weak();
+        let panic_timer = slint::Timer::default();
+        panic_timer.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_millis(500),
+            move || {
+                if let Some(win) = panic_weak.upgrade() {
+                    if let Some(msg) = CRASH_MSG.lock().unwrap().take() {
+                        // Cap the dialog payload; the full message is in error.log.
+                        let short: String = msg.chars().take(600).collect();
+                        win.set_crash_info(short.into());
+                        win.set_crash_open(true);
+                    }
+                }
+            },
+        );
+        Box::leak(Box::new(panic_timer));
+    }
 
     // --- System sampler (1 Hz) ------------------------------------------
     let sampler = Rc::new(Mutex::new(SystemSampler::new()));
@@ -9369,6 +9422,28 @@ mod tab_tests {
 
         move_tab_after_welcome(&model, "c", 0);
         assert_eq!(ids(&model), vec!["welcome", "c", "a", "b"]);
+    }
+}
+
+#[cfg(test)]
+mod panic_hook_tests {
+    use super::*;
+
+    #[test]
+    fn panic_hook_records_message() {
+        // A panic (even one caught by catch_unwind) must be recorded so the UI
+        // poller can show the internal-error dialog and error.log gets a line.
+        *CRASH_MSG.lock().unwrap() = None;
+        init_panic_hook();
+        let _ = std::panic::catch_unwind(|| panic!("synthetic panic for hook test"));
+        let msg = CRASH_MSG.lock().unwrap().clone();
+        assert!(
+            msg.as_deref()
+                .map(|m| m.contains("panic in thread") && m.contains("synthetic panic"))
+                .unwrap_or(false),
+            "panic hook should record the panic message, got: {msg:?}"
+        );
+        *CRASH_MSG.lock().unwrap() = None;
     }
 }
 

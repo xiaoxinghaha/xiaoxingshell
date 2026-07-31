@@ -77,7 +77,10 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
-panic = "abort"
+# Unwinding (not abort) so a panic in one task/thread is contained by the
+# surrounding catch_unwind and the app keeps running; the global panic hook
+# (main.rs → app::init_panic_hook) records every panic to error.log and shows
+# a dialog instead of silently killing the process.
 
 [profile.dev]
 opt-level = 0

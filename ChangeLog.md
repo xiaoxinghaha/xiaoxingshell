@@ -2,6 +2,23 @@
 
 ## 2026-07-31
 
+### 崩溃不再静默：release 改 panic=unwind，全局 panic hook 写日志并弹窗
+
+- 背景：
+  release 构建使用 `panic = "abort"`，任何线程一旦 panic 整个进程直接退出；且无控制台（`windows_subsystem=windows`），panic 信息不可见、error.log 里也没有——用户看到的现象就是"卡住后直接崩溃退出"且无从诊断。`catch_unwind`（事件 UI 更新处）在 abort 模式下也形同虚设。
+- 修复：
+  1. `Cargo.toml`：release 移除 `panic = "abort"`（改回 unwind），单线程/单任务 panic 由 `catch_unwind` 兜住，进程继续运行。
+  2. `src/app.rs` 新增 `init_panic_hook()`：任何线程 panic 时把消息写入 error.log（经 tracing，WARN+ 进文件层），并记录到 `CRASH_MSG`。
+  3. `src/app.rs` `run()` 增加 500ms 轮询 timer：检测到 panic 记录后在 UI 线程弹出"内部错误"对话框（消息截断显示，完整内容在 error.log）。
+  4. `ui/app.slint` 新增 `crash-open`/`crash-info` 属性与内部错误对话框（复用 confirm-close 的样式模式）。
+  5. `src/main.rs`：`init_tracing()` 后立即安装 panic hook。
+- 效果：
+  单个任务 panic 不再杀死整个应用（事件更新、SSH/SFTP worker 等）；逃逸的 panic 至少留下 error.log 记录并弹窗提示，不再静默退出。
+- 涉及文件：
+  - `Cargo.toml`、`src/main.rs`、`src/app.rs`、`ui/app.slint`
+
+## 2026-07-31
+
 ### 终端 resize 触发的 scrollback 重排防抖：拖拽窗口不再卡顿
 
 - 背景：

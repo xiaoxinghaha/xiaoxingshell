@@ -388,6 +388,10 @@ export component AppWindow inherits Window {
     // double-click on the title-bar icon / X shouldn't drop active sessions.
     in-out property <bool> confirm-close-open: false;
     callback confirm-close-yes();                  // quit the app for real
+    // Internal-error (panic) dialog, opened by the global panic hook; the full
+    // message is also written to error.log next to sessions.json.
+    in-out property <bool> crash-open: false;
+    in-out property <string> crash-info;           // panic message (truncated)
     // Host-key confirmation (#109-5). Rust opens this when a server presents an
     // unknown / changed host key; the user's answer flows back via the callbacks
     // and Rust closes the dialog.
@@ -2424,6 +2428,64 @@ export component AppWindow inherits Window {
                         text: root.lang-en ? "Close" : "关闭";
                         primary: true;
                         clicked => { root.confirm-close-yes(); }
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Internal-error (panic) dialog --------------------------------------
+    // Shown by the global panic hook (app::init_panic_hook) so a panic in any
+    // thread is never a silent crash. The full message lives in error.log.
+    if root.crash-open : Rectangle {
+        width: parent.width;
+        height: parent.height;
+        background: #00000088;
+        TouchArea { clicked => { root.crash-open = false; } }
+
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 440px;
+            height: 232px;
+            background: Theme.bg-panel;
+            border-radius: Theme.radius-md;
+            border-width: 1px;
+            border-color: Theme.border-strong;
+            drop-shadow-blur: 24px;
+            drop-shadow-color: #000000a0;
+            TouchArea {}
+
+            VerticalLayout {
+                padding: 18px;
+                spacing: 12px;
+                Text {
+                    text: root.lang-en ? "Internal Error" : "内部错误";
+                    color: Theme.text-primary; font-size: Theme.fs-lg; font-weight: 700;
+                }
+                Text {
+                    text: root.lang-en
+                        ? "The app hit an internal error. Details were written to error.log next to sessions.json."
+                        : "程序遇到内部错误,详细信息已写入 error.log(与 sessions.json 同目录)。";
+                    color: Theme.text-secondary; font-size: Theme.fs-sm; wrap: word-wrap;
+                }
+                Rectangle {
+                    height: 68px;
+                    clip: true;
+                    Text {
+                        text: root.crash-info;
+                        color: Theme.text-secondary; font-size: Theme.fs-xs; wrap: word-wrap;
+                        width: parent.width;
+                        height: parent.height;
+                    }
+                }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalLayout {
+                    alignment: end;
+                    Button {
+                        text: root.lang-en ? "OK" : "知道了";
+                        primary: true;
+                        clicked => { root.crash-open = false; }
                     }
                 }
             }

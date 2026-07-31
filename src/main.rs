@@ -38,6 +38,9 @@ impl Drop for SingleInstanceGuard {
 
 fn main() -> anyhow::Result<()> {
     init_tracing();
+    // Install BEFORE the window exists: the hook logs to error.log on its own,
+    // and only shows the dialog once app::run() registers the window weak.
+    app::init_panic_hook();
     let _single_instance = acquire_single_instance_guard()?;
 
     // ── IME policy ───────────────────────────────────────────────────────────
