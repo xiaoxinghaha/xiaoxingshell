@@ -3021,27 +3021,28 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                 ctx.disconnect_retry_count,
             );
             // `out_rx` is the bounded high-volume output channel (backpressure for
-            // output floods, see ssh.rs SSH_OUTPUT_CHANNEL_CAP). Serial/telnet use
-            // a single unbounded channel and don't get one.
+            // output floods, see ssh.rs SSH_OUTPUT_CHANNEL_CAP). Serial/telnet
+            // use the same bounded channel now, so all three session kinds feed
+            // the pump identically.
             (h, evt_rx, Some(out_rx))
         }
         SessionKind::Serial => {
-            let (h, r) = crate::serial::spawn_serial_session(
+            let (h, r, out_rx) = crate::serial::spawn_serial_session(
                 ctx.runtime.handle(),
                 tab_id.to_string(),
                 session.clone(),
             );
-            (h, r, None)
+            (h, r, Some(out_rx))
         }
         SessionKind::Telnet => {
-            let (h, r) = crate::telnet::spawn_telnet_session(
+            let (h, r, out_rx) = crate::telnet::spawn_telnet_session(
                 ctx.runtime.handle(),
                 tab_id.to_string(),
                 session.clone(),
                 initial_cols,
                 initial_rows,
             );
-            (h, r, None)
+            (h, r, Some(out_rx))
         }
     };
     ctx.handles.borrow_mut().insert(tab_id.to_string(), handle);

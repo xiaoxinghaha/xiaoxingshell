@@ -2,6 +2,21 @@
 
 ## 2026-07-31
 
+### serial/telnet 输出接入有界通道：设备/服务器刷屏不再卡死
+
+- 现象：
+  串口设备（交换机/路由器 console 日志）或 telnet 服务器持续刷输出时，终端可能卡死、内存上涨。
+- 根因：
+  serial/telnet 的 `Output` 事件走 unbounded channel（`src/serial.rs`、`src/telnet.rs`），完全没有背压；设备以自身速率投递事件，UI 消费不过来时队列无界增长。
+- 修复：
+  1. `src/serial.rs`：`spawn_serial_session` 增加与 SSH 相同的有界输出通道（复用 `SSH_OUTPUT_CHANNEL_CAP`）；读取线程改用 `blocking_send`，UI 落后时读线程直接停顿（背压到串口缓冲），不再堆积内存。
+  2. `src/telnet.rs`：`spawn_telnet_session` 同样增加有界输出通道，`send().await` 对 TCP 读循环施加背压。
+  3. `src/app.rs`：两种会话与 SSH 一样返回 `Some(out_rx)`，pump 统一处理；配合上一项的输出合批，事件队列有界。
+- 涉及文件：
+  - `src/serial.rs`、`src/telnet.rs`、`src/ssh.rs`、`src/app.rs`
+
+## 2026-07-31
+
 ### 修复输出洪峰时终端卡死：事件泵按 16ms/64KiB 合批投递 UI
 
 - 现象：

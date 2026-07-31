@@ -42,16 +42,27 @@ pub fn spawn_telnet_session(
     session: Session,
     initial_cols: u32,
     initial_rows: u32,
-) -> (SessionHandle, UnboundedReceiver<SessionEvent>) {
+) -> (
+    SessionHandle,
+    UnboundedReceiver<SessionEvent>,
+    tokio::sync::mpsc::Receiver<SessionEvent>,
+) {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<SessionCommand>();
     let (evt_tx, evt_rx) = mpsc::unbounded_channel::<SessionEvent>();
+    // Bound the high-volume output (same as SSH): a chatty server can't pile up
+    // an unbounded UI event queue; `send().await` applies backpressure up the
+    // TCP read loop instead.
+    let (out_tx, out_rx) =
+        mpsc::channel::<SessionEvent>(crate::ssh::SSH_OUTPUT_CHANNEL_CAP);
 
     let evt_for_task = evt_tx.clone();
+    let out_for_task = out_tx.clone();
     let join = runtime.spawn(async move {
         if let Err(err) = run_telnet(
             session,
             cmd_rx,
             evt_for_task.clone(),
+            out_for_task,
             initial_cols,
             initial_rows,
         )
@@ -68,6 +79,7 @@ pub fn spawn_telnet_session(
             join,
         },
         evt_rx,
+        out_rx,
     )
 }
 
@@ -104,6 +116,7 @@ async fn run_telnet(
     session: Session,
     mut commands: UnboundedReceiver<SessionCommand>,
     events: UnboundedSender<SessionEvent>,
+    out_tx: tokio::sync::mpsc::Sender<SessionEvent>,
     initial_cols: u32,
     initial_rows: u32,
 ) -> Result<()> {
@@ -196,7 +209,8 @@ async fn run_telnet(
                         }
                         if !data.is_empty() {
                             let text = String::from_utf8_lossy(&data).into_owned();
-                            let _ = events.send(SessionEvent::Output(text));
+                            // Bounded channel with backpressure (see ssh.rs).
+                            let _ = out_tx.send(SessionEvent::Output(text)).await;
                         }
                     }
                     Err(e) => {

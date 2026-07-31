@@ -21,8 +21,9 @@ use tokio::task::JoinHandle;
 /// up with a flood of output, this caps the buffered `Output`/`ResourceStats`
 /// events, bounding memory. 1024 events × (a few KiB each) keeps peak usage in the
 /// low-MiB range and is large enough to absorb normal bursts (e.g. `cat` of a
-/// big file) without throttling.
-const SSH_OUTPUT_CHANNEL_CAP: usize = 1024;
+/// big file) without throttling. Shared with serial/telnet which route their
+/// output through the same bounded channel.
+pub const SSH_OUTPUT_CHANNEL_CAP: usize = 1024;
 
 use crate::config::{AuthMethod, Session};
 use crate::i18n::t;

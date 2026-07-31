@@ -25,17 +25,29 @@ use crate::ssh::{SessionCommand, SessionEvent, SessionHandle};
 
 /// Spawn a serial-port session. See module docs for why the signature mirrors
 /// `spawn_session` (minus the PTY size, which a serial line has no notion of).
+/// Returns the session handle plus the unbounded control channel and a bounded
+/// high-volume output channel (same layout as [`crate::ssh::spawn_session`]).
 pub fn spawn_serial_session(
     runtime: &tokio::runtime::Handle,
     tab_id: String,
     session: Session,
-) -> (SessionHandle, UnboundedReceiver<SessionEvent>) {
+) -> (
+    SessionHandle,
+    UnboundedReceiver<SessionEvent>,
+    tokio::sync::mpsc::Receiver<SessionEvent>,
+) {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<SessionCommand>();
     let (evt_tx, evt_rx) = mpsc::unbounded_channel::<SessionEvent>();
+    // Bound the high-volume output so a chatty device (console logging, etc.)
+    // can't pile up an unbounded UI event queue (memory DoS). The reader thread
+    // uses blocking_send, which stalls the reader instead of growing memory.
+    let (out_tx, out_rx) =
+        mpsc::channel::<SessionEvent>(crate::ssh::SSH_OUTPUT_CHANNEL_CAP);
 
     let evt_for_task = evt_tx.clone();
+    let out_for_task = out_tx.clone();
     let join = runtime.spawn(async move {
-        if let Err(err) = run_serial(session, cmd_rx, evt_for_task.clone()).await {
+        if let Err(err) = run_serial(session, cmd_rx, evt_for_task.clone(), out_for_task).await {
             let _ = evt_for_task.send(SessionEvent::Closed(format!("{err:#}")));
         }
     });
@@ -47,6 +59,7 @@ pub fn spawn_serial_session(
             join,
         },
         evt_rx,
+        out_rx,
     )
 }
 
@@ -86,6 +99,7 @@ async fn run_serial(
     session: Session,
     mut commands: UnboundedReceiver<SessionCommand>,
     events: UnboundedSender<SessionEvent>,
+    out_tx: tokio::sync::mpsc::Sender<SessionEvent>,
 ) -> Result<()> {
     let port_name = session.serial_port.trim().to_string();
     if port_name.is_empty() {
@@ -147,6 +161,7 @@ async fn run_serial(
     let running = Arc::new(AtomicBool::new(true));
     let reader_running = running.clone();
     let reader_events = events.clone();
+    let reader_out = out_tx;
     let reader_handle = std::thread::spawn(move || {
         let mut port = port;
         let mut buf = [0u8; 4096];
@@ -155,7 +170,10 @@ async fn run_serial(
                 Ok(0) => {}
                 Ok(n) => {
                     let text = String::from_utf8_lossy(&buf[..n]).into_owned();
-                    if reader_events.send(SessionEvent::Output(text)).is_err() {
+                    // blocking_send applies backpressure: when the UI is behind,
+                    // the reader stalls here instead of growing an unbounded
+                    // queue (memory DoS from a chatty device).
+                    if reader_out.blocking_send(SessionEvent::Output(text)).is_err() {
                         break;
                     }
                 }
