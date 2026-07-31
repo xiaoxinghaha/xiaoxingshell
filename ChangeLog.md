@@ -2,6 +2,17 @@
 
 ## 2026-07-31
 
+### 终端 resize 触发的 scrollback 重排防抖：拖拽窗口不再卡顿
+
+- 背景：
+  拖动 SFTP 面板 / 缩放窗口时 Slint 连续触发多次 `terminal-resize`，每次列数变化都立即执行 `reflow_history`（O(scrollback × spans) 的全量重排），历史多时 UI 线程被拖拽连续阻塞。
+- 修复（`src/app.rs`）：
+  `parser.set_size` 仍即时执行（保证显示正确），但 `reflow_history` 改为 150ms 单次定时器防抖：拖拽期间只记录每个 tab 的最新列宽，停止 150ms 后一次性按最新宽度重排；重排完成后触发一次重渲染。
+- 涉及文件：
+  - `src/app.rs`
+
+## 2026-07-31
+
 ### detect_scroll 增加剪枝快速路径：刷屏时减少 UI 线程开销
 
 - 背景：

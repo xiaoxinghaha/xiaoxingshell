@@ -6348,6 +6348,17 @@ fn wire_key_input(
         let bufs_resize = bufs.clone(); // keep bufs alive for the copy handler below
         let pending_ui_refresh = pending_ui_refresh.clone();
         let weak = window.as_weak();
+        // Debounce scrollback reflow on column changes: dragging the SFTP
+        // panel / resizing the window fires many `terminal_resize`s in a row,
+        // and each `reflow_history` is O(scrollback × spans).  A 150 ms
+        // single-shot timer applies only the last recorded width per tab.
+        // The timer is leaked like the sidebar sampler's so it outlives this
+        // function (Slint timers stop when dropped).
+        let pending_reflow: Rc<RefCell<HashMap<String, u16>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+        let reflow_timer: Rc<RefCell<slint::Timer>> =
+            Rc::new(RefCell::new(slint::Timer::default()));
+        Box::leak(Box::new(reflow_timer.clone()));
         // The Slint side now measures the real Consolas cell size (via a hidden
         // probe Text) and passes whole column/row counts directly, so there is
         // no pixel→cell guesswork here.  This keeps full-screen programs like
@@ -6440,8 +6451,32 @@ fn wire_key_input(
                 buf.prev.clear();
                 // Reflow scrollback when the column count changed so wrapped
                 // lines re-adapt to the new width (like a web page reflow).
+                // Debounced: only the latest width is applied, 150 ms after the
+                // last resize event, so rapid drag-resizing reflows once
+                // instead of once per event.
                 if cols as u16 != old_cols {
-                    buf.reflow_history(cols as u16);
+                    pending_reflow.borrow_mut().insert(tab_id.to_string(), cols as u16);
+                    if !reflow_timer.borrow().running() {
+                        let pending = pending_reflow.clone();
+                        let bufs_debounce = bufs_resize.clone();
+                        let refresh_q = pending_ui_refresh.clone();
+                        reflow_timer
+                            .borrow_mut()
+                            .start(slint::TimerMode::SingleShot, Duration::from_millis(150), move || {
+                                let widths = std::mem::take(&mut *pending.borrow_mut());
+                                if let Ok(mut map) = bufs_debounce.lock() {
+                                    for (tid, cols) in widths {
+                                        if let Some(buf) = map.get_mut(&tid) {
+                                            buf.reflow_history(cols);
+                                            // The reflow changes the scrollback
+                                            // layout after the resize frame was
+                                            // already rendered — redraw it.
+                                            refresh_q.lock().unwrap().push(tid);
+                                        }
+                                    }
+                                }
+                            });
+                    }
                 }
             }
             pending_ui_refresh.lock().unwrap().push(tab_id.to_string());
