@@ -20,7 +20,7 @@ use russh::client::Msg;
 use russh::{Channel, ChannelMsg};
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -83,6 +83,9 @@ pub async fn receive(
     let mut rx = Rx::new(channel, first);
     let mut received = 0u32;
     let mut cur: Option<CurFile> = None;
+    // Throttle progress events (see the ZDATA arm below): one event per
+    // subpacket would flood the UI for a large `sz`.
+    let mut last_progress_at = Instant::now();
     // A header already read ahead (e.g. the next ZFILE peeked after a ZEOF).
     let mut pending: Option<(u8, [u8; 4])> = None;
 
@@ -128,15 +131,22 @@ pub async fn receive(
                 if let Some(c) = cur.as_mut() {
                     c.file.write_all(&chunk).await.context("write file")?;
                     c.written += chunk.len() as u64;
-                    emit(
-                        events,
-                        &c.id,
-                        &c.name,
-                        c.written,
-                        c.size.max(c.written),
-                        0,
-                        "",
-                    );
+                    // Progress events at most every 150 ms (same cadence as
+                    // SFTP transfers in sftp.rs), not once per ~1 KiB
+                    // subpacket — a multi-GB `sz` would otherwise enqueue
+                    // millions of events and freeze the UI / grow memory.
+                    if last_progress_at.elapsed() >= Duration::from_millis(150) {
+                        last_progress_at = Instant::now();
+                        emit(
+                            events,
+                            &c.id,
+                            &c.name,
+                            c.written,
+                            c.size.max(c.written),
+                            0,
+                            "",
+                        );
+                    }
                 }
                 match end {
                     ZCRCG => continue,
