@@ -347,6 +347,13 @@ export component AppWindow inherits Window {
     callback set-term-font-size(int);              // apply + persist font size (px)
     in-out property <int> terminal-scrollback-lines: 9999;
     callback set-terminal-scrollback-lines(int);   // apply + persist terminal scrollback cap
+    // Terminal render cadence (ms) + max output ingested per render tick (KiB)
+    // during high-volume output. Tune-able so users can trade smoothness
+    // against how much intermediate output is kept on slow machines.
+    in-out property <int> terminal-render-tick-ms: 50;
+    callback set-terminal-render-tick-ms(int);     // apply + persist render cadence
+    in-out property <int> terminal-max-ingest-kib: 32;
+    callback set-terminal-max-ingest-kib(int);     // apply + persist per-tick ingest cap
     in-out property <int> session-flash-ms: 1000;
     callback set-session-flash-ms(int);             // apply + persist session-row flash duration
     in-out property <string> nav-rail-color-text: "";
@@ -2898,6 +2905,68 @@ export component AppWindow inherits Window {
                                         text: root.lang-en
                                             ? "Controls how many terminal scrollback lines stay in memory per session."
                                             : "控制每个会话在内存中保留多少行终端滚动缓存。";
+                                        color: Theme.text-muted;
+                                        font-size: Theme.fs-sm;
+                                        wrap: word-wrap;
+                                    }
+
+                                    VerticalLayout {
+                                        spacing: 6px;
+                                        Text { text: root.lang-en ? "Render tick (ms)" : "渲染节拍 (ms)";
+                                               color: Theme.text-secondary; font-size: Theme.fs-sm; }
+                                        HorizontalLayout {
+                                            spacing: 10px;
+                                            SpinBox {
+                                                width: 120px;
+                                                value: root.terminal-render-tick-ms;
+                                                minimum: 16;
+                                                maximum: 500;
+                                                edited => { root.set-terminal-render-tick-ms(self.value); }
+                                            }
+                                            Text {
+                                                text: root.terminal-render-tick-ms + "";
+                                                color: Theme.text-muted;
+                                                font-size: Theme.fs-sm;
+                                                vertical-alignment: center;
+                                            }
+                                            Rectangle { horizontal-stretch: 1; }
+                                        }
+                                    }
+                                    Text {
+                                        text: root.lang-en
+                                            ? "Interval between full-screen redraws during fast-scrolling output. Higher = smoother on slow machines, fewer frames."
+                                            : "快速滚动输出时的全屏重绘间隔。数值越大，低配机器越流畅（帧数更少）。";
+                                        color: Theme.text-muted;
+                                        font-size: Theme.fs-sm;
+                                        wrap: word-wrap;
+                                    }
+
+                                    VerticalLayout {
+                                        spacing: 6px;
+                                        Text { text: root.lang-en ? "Max output per tick (KiB)" : "每帧最大输出 (KiB)";
+                                               color: Theme.text-secondary; font-size: Theme.fs-sm; }
+                                        HorizontalLayout {
+                                            spacing: 10px;
+                                            SpinBox {
+                                                width: 120px;
+                                                value: root.terminal-max-ingest-kib;
+                                                minimum: 8;
+                                                maximum: 256;
+                                                edited => { root.set-terminal-max-ingest-kib(self.value); }
+                                            }
+                                            Text {
+                                                text: root.terminal-max-ingest-kib + "";
+                                                color: Theme.text-muted;
+                                                font-size: Theme.fs-sm;
+                                                vertical-alignment: center;
+                                            }
+                                            Rectangle { horizontal-stretch: 1; }
+                                        }
+                                    }
+                                    Text {
+                                        text: root.lang-en
+                                            ? "How much output is parsed per render tick. Lower = smoother on slow machines (drops more intermediate frames)."
+                                            : "每个渲染节拍解析多少输出。数值越小，低配机器越流畅（丢弃更多中间帧）。";
                                         color: Theme.text-muted;
                                         font-size: Theme.fs-sm;
                                         wrap: word-wrap;

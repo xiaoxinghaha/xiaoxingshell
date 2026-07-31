@@ -367,6 +367,15 @@ pub struct ConfigFile {
     /// Maximum terminal scrollback lines kept in memory. 0 = built-in default.
     #[serde(default)]
     pub terminal_scrollback_lines: u32,
+    /// Terminal render cadence in ms (interval between full-screen redraws
+    /// during high-volume output). 0 = built-in default (50).
+    #[serde(default)]
+    pub terminal_render_tick_ms: u32,
+    /// Maximum bytes of pending output ingested per render tick, in KiB.
+    /// 0 = built-in default (32). Lower = smoother on slow machines (drops
+    /// more intermediate frames); higher = more output kept (more memory).
+    #[serde(default)]
+    pub terminal_max_ingest_kib: u32,
     /// Duration for the short session-row flash after create/edit/connect. 0 =
     /// built-in default.
     #[serde(default)]
@@ -850,6 +859,34 @@ impl ConfigStore {
 
     pub fn set_terminal_scrollback_lines(&mut self, lines: u32) {
         self.cache.terminal_scrollback_lines = lines.clamp(100, 200_000);
+    }
+
+    /// Terminal render cadence in milliseconds (default 50). The UI redraws at
+    /// most this often during high-volume output; a higher value keeps slow
+    /// machines smooth by dropping more intermediate frames.
+    pub fn terminal_render_tick_ms(&self) -> u32 {
+        if self.cache.terminal_render_tick_ms == 0 {
+            50
+        } else {
+            self.cache.terminal_render_tick_ms.clamp(16, 500)
+        }
+    }
+
+    pub fn set_terminal_render_tick_ms(&mut self, ms: u32) {
+        self.cache.terminal_render_tick_ms = ms.clamp(16, 500);
+    }
+
+    /// Maximum pending output ingested per render tick in KiB (default 32).
+    pub fn terminal_max_ingest_kib(&self) -> u32 {
+        if self.cache.terminal_max_ingest_kib == 0 {
+            32
+        } else {
+            self.cache.terminal_max_ingest_kib.clamp(8, 256)
+        }
+    }
+
+    pub fn set_terminal_max_ingest_kib(&mut self, kib: u32) {
+        self.cache.terminal_max_ingest_kib = kib.clamp(8, 256);
     }
 
     /// Session row flash duration in milliseconds (default 1000).
@@ -1373,6 +1410,32 @@ mod tests {
 
         store.set_session_flash_ms(8_000);
         assert_eq!(store.session_flash_ms(), 5_000);
+    }
+
+    #[test]
+    fn terminal_render_tick_ms_defaults_and_clamps() {
+        let mut store = temp_store();
+
+        assert_eq!(store.terminal_render_tick_ms(), 50);
+
+        store.set_terminal_render_tick_ms(1);
+        assert_eq!(store.terminal_render_tick_ms(), 16);
+
+        store.set_terminal_render_tick_ms(2_000);
+        assert_eq!(store.terminal_render_tick_ms(), 500);
+    }
+
+    #[test]
+    fn terminal_max_ingest_kib_defaults_and_clamps() {
+        let mut store = temp_store();
+
+        assert_eq!(store.terminal_max_ingest_kib(), 32);
+
+        store.set_terminal_max_ingest_kib(1);
+        assert_eq!(store.terminal_max_ingest_kib(), 8);
+
+        store.set_terminal_max_ingest_kib(1_000);
+        assert_eq!(store.terminal_max_ingest_kib(), 256);
     }
 
     #[test]

@@ -40,6 +40,10 @@ struct TermBuffer {
     history: Vec<Line>,
     /// Per-session cap for `history`, configurable from Interface settings.
     max_history_lines: usize,
+    /// Max pending-output bytes ingested per render tick (configurable from
+    /// Interface settings). Bounds the per-frame vt100 parse cost so a slow
+    /// machine stays smooth by dropping intermediate frames.
+    max_ingest_per_tick: usize,
     /// Previous frame's grid lines, for scroll-off detection.
     prev: Vec<Line>,
     /// Scrollback view offset in lines (0 = live bottom).
@@ -86,7 +90,7 @@ struct TermBuffer {
     csi_state: CsiState,
     /// Raw output that arrived since the last render pass. The event pump
     /// aggregates chunks here (bounded — oldest bytes are dropped past the
-    /// cap) and the 33 ms render timer flushes it into the vt100 parser once
+    /// cap) and the render-tick timer flushes it into the vt100 parser once
     /// per tick, so a flood (`yes`, log spam) renders in coalesced batches
     /// instead of one full-screen rebuild per network chunk. Dropping old
     /// bytes is the standard "skip intermediate frames" behaviour of terminal
@@ -618,6 +622,8 @@ pub fn run() -> Result<()> {
         }
         window.set_term_font_size(s.font_size() as f32);
         window.set_terminal_scrollback_lines(s.terminal_scrollback_lines() as i32);
+        window.set_terminal_render_tick_ms(s.terminal_render_tick_ms() as i32);
+        window.set_terminal_max_ingest_kib(s.terminal_max_ingest_kib() as i32);
         window.set_session_flash_ms(s.session_flash_ms() as i32);
     }
     // Editable inputs (e.g. the SFTP path bar) need a CJK-capable font: the
@@ -849,6 +855,49 @@ pub fn run() -> Result<()> {
             }
             if let Some(w) = weak.upgrade() {
                 w.set_terminal_scrollback_lines(saved as i32);
+            }
+        });
+    }
+    // Interface setting: terminal render cadence (ms). Read live by the render
+    // tick timer from the window property, so only persist + round-trip here.
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        window.on_set_terminal_render_tick_ms(move |ms: i32| {
+            let saved = {
+                let mut s = store.borrow_mut();
+                s.set_terminal_render_tick_ms(ms.max(16) as u32);
+                let saved = s.terminal_render_tick_ms();
+                let _ = s.save();
+                saved
+            };
+            if let Some(w) = weak.upgrade() {
+                w.set_terminal_render_tick_ms(saved as i32);
+            }
+        });
+    }
+    // Interface setting: max output ingested per render tick (KiB). Applied
+    // live to every open terminal buffer.
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        let bufs = bufs.clone();
+        window.on_set_terminal_max_ingest_kib(move |kib: i32| {
+            let saved = {
+                let mut s = store.borrow_mut();
+                s.set_terminal_max_ingest_kib(kib.max(8) as u32);
+                let saved = s.terminal_max_ingest_kib();
+                let _ = s.save();
+                saved
+            };
+            {
+                let mut map = bufs.lock().unwrap();
+                for buf in map.values_mut() {
+                    buf.set_max_ingest_per_tick(saved as usize * 1024);
+                }
+            }
+            if let Some(w) = weak.upgrade() {
+                w.set_terminal_max_ingest_kib(saved as i32);
             }
         });
     }
@@ -1711,14 +1760,18 @@ pub fn run() -> Result<()> {
     let refresh_queue = pending_ui_refresh.clone();
     let refresh_bufs = bufs.clone();
     let refresh_weak = window.as_weak();
+    // Render tick: the timer fires every 16 ms as a cheap poll, but the actual
+    // flush + full-screen rebuild + Slint redraw runs at most once per
+    // `terminal-render-tick-ms` (Interface settings, default 50 ms), measured
+    // by timestamp — so changing the setting applies immediately without
+    // restarting the timer. Pending refresh requests are kept in the queue
+    // until the next allowed tick, so nothing is lost.
+    let last_render_at: Rc<RefCell<Option<std::time::Instant>>> =
+        Rc::new(RefCell::new(None));
     let refresh_timer = slint::Timer::default();
-    // 20 fps render tick: flushing + full-screen rebuild + Slint redraw of a
-    // 32 KiB batch fits comfortably inside 50 ms even on slower machines, so
-    // fast-scrolling output (`yes`, logs) stays smooth instead of saturating
-    // the UI thread at 33 ms.
     refresh_timer.start(
         slint::TimerMode::Repeated,
-        std::time::Duration::from_millis(50),
+        std::time::Duration::from_millis(16),
         move || {
             let ids = {
                 let mut q = refresh_queue.lock().unwrap();
@@ -1727,6 +1780,24 @@ pub fn run() -> Result<()> {
                 }
                 q.drain(..).collect::<Vec<_>>()
             };
+            // Not enough time since the last render? Keep the requests queued.
+            let tick_ms = refresh_weak
+                .upgrade()
+                .map(|w| w.get_terminal_render_tick_ms().max(16) as u64)
+                .unwrap_or(50);
+            let now = std::time::Instant::now();
+            {
+                let mut last = last_render_at.borrow_mut();
+                if last
+                    .map(|t| now.duration_since(t) < std::time::Duration::from_millis(tick_ms))
+                    .unwrap_or(false)
+                {
+                    // Put the drained ids back so the next tick still renders them.
+                    refresh_queue.lock().unwrap().extend(ids);
+                    return;
+                }
+                *last = Some(now);
+            }
             if let Some(w) = refresh_weak.upgrade() {
                 let mut seen = std::collections::HashSet::new();
                 for tid in ids {
@@ -2987,6 +3058,7 @@ fn wire_session_callbacks(
             // internal copy is redundant.
             let is_dark_now = weak.upgrade().map(|w| w.get_dark_mode()).unwrap_or(true);
             let scrollback_lines = store.borrow().terminal_scrollback_lines() as usize;
+            let max_ingest_bytes = store.borrow().terminal_max_ingest_kib() as usize * 1024;
             bufs.lock().unwrap().insert(
                 tab_id.clone(),
                 TermBuffer {
@@ -2997,6 +3069,7 @@ fn wire_session_callbacks(
                     sel_focus: None,
                     history: Vec::new(),
                     max_history_lines: scrollback_lines,
+                    max_ingest_per_tick: max_ingest_bytes,
                     prev: Vec::new(),
                     view_offset: 0,
                     displayed_text: Vec::new(),
@@ -3990,7 +4063,7 @@ fn apply_session_event_to_window(
         SessionEvent::Output(chunk) => {
             // Aggregate into the per-tab pending buffer and mark the tab for a
             // render-tick rebuild — the actual vt100 parse + full-screen render
-            // happens at most once per 33 ms in rebuild_tab_display (which
+            // happens at most once per render tick in rebuild_tab_display (which
             // flushes pending_text), so a flood of output can't pile up an
             // unbounded queue of per-event renders on the UI thread.
             {
@@ -8423,6 +8496,11 @@ impl TermBuffer {
         self.trim_history_to_limit();
     }
 
+    /// Update the per-tick ingest cap from the Interface settings (live).
+    fn set_max_ingest_per_tick(&mut self, bytes: usize) {
+        self.max_ingest_per_tick = bytes.max(8 * 1024);
+    }
+
     fn unlock_local_input_at_prompt(&mut self) {
         self.local_prompt_ready = self.local_buffer_preferred;
         self.local_passthrough_until_prompt = false;
@@ -8855,7 +8933,7 @@ impl TermBuffer {
     fn push_pending_output(&mut self, text: &str) {
         self.pending_text.push_str(text);
         // 1 MiB ceiling ≈ 50 ms of a 20 MB/s `yes` flood; generous for any
-        // legitimate burst, and the 33 ms render timer drains it anyway.
+        // legitimate burst, and the render-tick timer drains it anyway.
         const PENDING_OUTPUT_CAP: usize = 1 << 20;
         if self.pending_text.len() > PENDING_OUTPUT_CAP {
             let mut drop = self.pending_text.len() - PENDING_OUTPUT_CAP;
@@ -8867,19 +8945,19 @@ impl TermBuffer {
     }
 
     /// Flush the pending output into the vt100 parser. Called by
-    /// `rebuild_tab_display` (the 50 ms render tick), so all output that
-    /// arrived since the last tick is parsed in ONE coalesced batch instead of
-    /// once per network chunk. At most the newest 32 KiB is ingested per tick:
-    /// if the UI fell behind, older bytes are dropped (skip frames) so a
+    /// `rebuild_tab_display` (the render tick), so all output that arrived
+    /// since the last tick is parsed in ONE coalesced batch instead of once
+    /// per network chunk. At most `max_ingest_per_tick` bytes are ingested per
+    /// tick: if the UI fell behind, older bytes are dropped (skip frames) so a
     /// render tick never exceeds its budget.
     fn flush_pending_output(&mut self) {
         if self.pending_text.is_empty() {
             return;
         }
         let mut text = std::mem::take(&mut self.pending_text);
-        const MAX_INGEST_PER_TICK: usize = 32 * 1024;
-        if text.len() > MAX_INGEST_PER_TICK {
-            let mut drop = text.len() - MAX_INGEST_PER_TICK;
+        let cap = self.max_ingest_per_tick;
+        if text.len() > cap {
+            let mut drop = text.len() - cap;
             while drop < text.len() && !text.is_char_boundary(drop) {
                 drop += 1;
             }
@@ -9950,6 +10028,7 @@ mod selection_tests {
             sel_focus: None,
             history: history.iter().map(|s| hist_line(s)).collect(),
             max_history_lines: 9_999,
+            max_ingest_per_tick: 32 * 1024,
             prev: Vec::new(),
             view_offset,
             displayed_text: Vec::new(),
@@ -10029,6 +10108,7 @@ mod selection_tests {
             sel_focus: Some((0, 5)),
             history: Vec::new(),
             max_history_lines: 9_999,
+            max_ingest_per_tick: 32 * 1024,
             prev: Vec::new(),
             view_offset: 0,
             displayed_text: Vec::new(),
