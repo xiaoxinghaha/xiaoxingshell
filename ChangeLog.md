@@ -2,6 +2,23 @@
 
 ## 2026-07-31
 
+### 修复 yes 刷屏仍导致内存飙升至数百 MB：UI 侧累积 + 定时渲染 + 丢旧帧
+
+- 现象：
+  上一版（pump 端 64KiB/16ms 合批）后，终端跑 `yes` 内存仍从 ~100MB 迅速涨到 ~800MB 并卡死。
+- 根因：
+  合批只把投递次数缩小了约 16 倍，但**每次投递的闭包在 UI 线程的消费成本**（vt100 解析 + 全屏重建 + 3 个 Model + Slint 全量重渲染）约 10-30ms/64KiB，而 `yes` 的产出远高于此——`invoke_from_event_loop` 的队列依然无界堆积，每个闭包持有 64KiB 字符串，队列积压 → 内存飙升 → UI 线程满负荷 → 卡死。
+- 修复（两级"跳过中间帧"）：
+  1. **UI 侧累积**（`src/app.rs` `TermBuffer::push_pending_output`）：Output 事件只把文本追加进 `pending_text`（1 MiB 硬上限，超出丢最旧字节，按字符边界截断），不再逐事件解析渲染。
+  2. **33ms 定时渲染**（`rebuild_tab_display` 开头 `flush_pending_output`）：所有累积输出在渲染节拍里一次性解析+渲染；若落后太多，单次只摄取最新 64KiB（`MAX_INGEST_PER_TICK`），更旧内容直接丢弃——这是终端模拟器标准的丢帧行为。
+  3. `apply_session_event_to_window` 增加 `refresh_queue` 参数（shell/sftp 两个 pump 与两处递归调用同步更新），Output 分支只标记 tab 待重绘。
+- 效果：
+  无论 `yes`/日志刷屏多快：UI 事件队列稳态 1-2 个闭包、`pending_text` ≤1MiB、每 33ms 只渲染一次且摄取量有上限——内存有界（几百 KB 级增长），UI 不再冻结，窗口可随时响应。
+- 涉及文件：
+  - `src/app.rs`（含 2 个新单元测试）
+
+## 2026-07-31
+
 ### 崩溃不再静默：release 改 panic=unwind，全局 panic hook 写日志并弹窗
 
 - 背景：

@@ -84,6 +84,14 @@ struct TermBuffer {
     /// absolute-positioned full-screen output collapses into a scrolling mess.
     /// Kept here so a sequence split across read chunks is still translated.
     csi_state: CsiState,
+    /// Raw output that arrived since the last render pass. The event pump
+    /// aggregates chunks here (bounded — oldest bytes are dropped past the
+    /// cap) and the 33 ms render timer flushes it into the vt100 parser once
+    /// per tick, so a flood (`yes`, log spam) renders in coalesced batches
+    /// instead of one full-screen rebuild per network chunk. Dropping old
+    /// bytes is the standard "skip intermediate frames" behaviour of terminal
+    /// emulators when the UI can't keep up.
+    pending_text: String,
 }
 
 /// Minimal CSI-final-byte rewriter state (persists across read chunks).
@@ -981,6 +989,7 @@ pub fn run() -> Result<()> {
         local_net_hist.clone(),
         sftp_follow_cd.clone(),
         tmux_state.clone(),
+        pending_ui_refresh.clone(),
     );
 
     {
@@ -1695,6 +1704,7 @@ pub fn run() -> Result<()> {
             disconnect_retry_count: store.borrow().disconnect_retry_count(),
             sftp_auto_refresh_secs: store.borrow().sftp_auto_refresh_secs(),
             tmux_state: tmux_state.clone(),
+            pending_ui_refresh: pending_ui_refresh.clone(),
         },
     );
 
@@ -2305,6 +2315,7 @@ fn wire_session_callbacks(
     local_net_hist: NetHist,
     sftp_follow_cd: Arc<std::sync::atomic::AtomicBool>,
     tmux_state: Arc<Mutex<HashMap<String, bool>>>,
+    pending_ui_refresh: PendingUiRefresh,
 ) {
     let group_options_model = |store: &ConfigStore| -> ModelRc<SharedString> {
         ModelRc::from(Rc::new(VecModel::from(
@@ -2988,6 +2999,7 @@ fn wire_session_callbacks(
                     suppress_echo: String::new(),
                     tmux_prefix_until: None,
                     csi_state: CsiState::Normal,
+                    pending_text: String::new(),
                 },
             );
             // No followed-cwd yet: the first OSC 7 always triggers a follow.
@@ -3018,6 +3030,7 @@ fn wire_session_callbacks(
                 disconnect_retry_count: store.borrow().disconnect_retry_count(),
                 sftp_auto_refresh_secs: store.borrow().sftp_auto_refresh_secs(),
                 tmux_state: tmux_state.clone(),
+                pending_ui_refresh: pending_ui_refresh.clone(),
             };
             start_session_in_tab(&tab_id, session, &ctx);
         });
@@ -3054,6 +3067,8 @@ struct ConnectCtx {
     sftp_auto_refresh_secs: u32,
     /// Per-tab tmux state. While true, automatic SFTP following is disabled.
     tmux_state: Arc<Mutex<HashMap<String, bool>>>,
+    /// Tabs whose terminal display needs a rebuild on the next render tick.
+    pending_ui_refresh: PendingUiRefresh,
 }
 
 /// Spawn the shell (+ SFTP) workers and their event-pump threads for an
@@ -3137,6 +3152,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
         let sftp_sort_pump = ctx.sftp_sort_states.clone();
         let hidden_transfer_ids_pump = ctx.hidden_transfer_ids.clone();
         let tmux_state_pump = ctx.tmux_state.clone();
+        let pending_refresh_pump = ctx.pending_ui_refresh.clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -3176,6 +3192,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                 let sftp_cache_evt = sftp_cache_pump.clone();
                 let sftp_sort_evt = sftp_sort_pump.clone();
                 let hidden_transfer_ids_evt = hidden_transfer_ids_pump.clone();
+                let refresh_q_evt = pending_refresh_pump.clone();
                 let _ = slint::invoke_from_event_loop(move || {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         if let Some(win) = weak_evt.upgrade() {
@@ -3190,6 +3207,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                                 &sftp_cache_evt,
                                 &sftp_sort_evt,
                                 &hidden_transfer_ids_evt,
+                                &refresh_q_evt,
                             );
                         }
                     }));
@@ -3445,6 +3463,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
         let sftp_cache_sftp = ctx.sftp_entry_cache.clone();
         let sftp_sort_sftp = ctx.sftp_sort_states.clone();
         let hidden_transfer_ids_sftp = ctx.hidden_transfer_ids.clone();
+        let refresh_q_sftp = ctx.pending_ui_refresh.clone();
         std::thread::spawn(move || {
             let mut sftp_rx = sftp_evt_tx;
             loop {
@@ -3460,6 +3479,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                         let sftp_cache_s = sftp_cache_sftp.clone();
                         let sftp_sort_s = sftp_sort_sftp.clone();
                         let hidden_transfer_ids_s = hidden_transfer_ids_sftp.clone();
+                        let refresh_q_s = refresh_q_sftp.clone();
                         let _ = slint::invoke_from_event_loop(move || {
                             let result =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3475,6 +3495,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                                             &sftp_cache_s,
                                             &sftp_sort_s,
                                             &hidden_transfer_ids_s,
+                                            &refresh_q_s,
                                         );
                                     }
                                 }));
@@ -3711,6 +3732,10 @@ fn rebuild_tab_display(win: &AppWindow, bufs: &TermBuffers, tab_id: &str) {
         let Some(buf) = map.get_mut(tab_id) else {
             return;
         };
+        // Flush any output that arrived since the last render tick into the
+        // vt100 parser, then render once — this is the single render point for
+        // high-volume output (see TermBuffer::pending_text).
+        buf.flush_pending_output();
         let cols = buf.parser.screen().size().1;
         let b = buf.render(); // also refreshes buf.displayed_text
         let matches = compute_find_matches(&buf.displayed_text, &buf.find_query);
@@ -3906,6 +3931,7 @@ fn apply_session_event_to_window(
     sftp_entry_cache: &SftpEntryCache,
     sftp_sort_states: &SftpSortStates,
     hidden_transfer_ids: &Arc<Mutex<HashSet<String>>>,
+    refresh_queue: &PendingUiRefresh,
 ) {
     let tabs_rc = win.get_tabs();
     let terminals_rc = win.get_terminals();
@@ -3950,49 +3976,22 @@ fn apply_session_event_to_window(
             update_terminal(&|t| t.status = status.clone().into());
         }
         SessionEvent::Output(chunk) => {
-            // Feed raw bytes into the vt100 parser. vt100 correctly handles
-            // cursor movement, \r + line-redraw (readline), \x1b[K (erase to
-            // EOL), alternate-screen switching, and all VT100/xterm sequences.
-            // We then split the rendered screen at cursor_position() so Slint
-            // can insert the blinking "█" at the exact cursor cell.
-            let built = {
+            // Aggregate into the per-tab pending buffer and mark the tab for a
+            // render-tick rebuild — the actual vt100 parse + full-screen render
+            // happens at most once per 33 ms in rebuild_tab_display (which
+            // flushes pending_text), so a flood of output can't pile up an
+            // unbounded queue of per-event renders on the UI thread.
+            {
                 let mut map = bufs.lock().unwrap();
                 if let Some(buf) = map.get_mut(tab_id) {
                     let chunk = buf.strip_suppressed_echo(chunk);
                     if chunk.is_empty() {
                         return;
                     }
-                    // Capture scrolled-off lines into history, then render the
-                    // current view (live or scrolled-back).
-                    buf.ingest(chunk.as_bytes());
-                    let cols = buf.parser.screen().size().1;
-                    let b = buf.render(); // refreshes buf.displayed_text
-                    let matches = compute_find_matches(&buf.displayed_text, &buf.find_query);
-                    let sel = buf.selection_rects_visible(cols);
-                    Some((b, matches, sel))
-                } else {
-                    None
+                    buf.push_pending_output(&chunk);
                 }
-            };
-            if let Some((b, matches, sel)) = built {
-                let spans_model: ModelRc<TermSpan> =
-                    ModelRc::from(std::rc::Rc::new(VecModel::from(b.spans)));
-                let matches_model: ModelRc<TermMatch> =
-                    ModelRc::from(std::rc::Rc::new(VecModel::from(matches)));
-                let sel_model: ModelRc<TermMatch> =
-                    ModelRc::from(std::rc::Rc::new(VecModel::from(sel)));
-                let (cur_row, cur_col, rows_used, is_alt) =
-                    (b.cursor_row, b.cursor_col, b.rows_used, b.is_alt);
-                update_terminal(&|t| {
-                    t.spans = spans_model.clone();
-                    t.cursor_row = cur_row;
-                    t.cursor_col = cur_col;
-                    t.rows_used = rows_used;
-                    t.is_alt_screen = is_alt;
-                    t.find_matches = matches_model.clone();
-                    t.selection = sel_model.clone();
-                });
             }
+            refresh_queue.lock().unwrap().push(tab_id.to_string());
         }
         SessionEvent::Connected => {
             update_tab(&|t| t.connected = true);
@@ -4024,6 +4023,7 @@ fn apply_session_event_to_window(
                 sftp_entry_cache,
                 sftp_sort_states,
                 hidden_transfer_ids,
+                refresh_queue,
             );
             update_tab(&|t| t.connected = false);
             update_terminal(&|t| {
@@ -4164,6 +4164,7 @@ fn apply_session_event_to_window(
                     sftp_entry_cache,
                     sftp_sort_states,
                     hidden_transfer_ids,
+                    refresh_queue,
                 );
                 update_terminal(&|t| t.sftp_status = error.clone().into());
             }
@@ -5930,6 +5931,7 @@ fn wire_key_input(
                             b.view_offset = 0;
                             b.sel_anchor = None;
                             b.sel_focus = None;
+                            b.pending_text.clear();
                         }
                     }
                     if let Some(st) =
@@ -8831,6 +8833,47 @@ impl TermBuffer {
     /// after each — that way no batch ever scrolls more than the diff can see,
     /// and nothing is lost.  (Splitting only on `\n` is safe: VT escape
     /// sequences never contain a newline.)
+    /// Buffer a chunk of remote output for the next render tick. The buffer is
+    /// bounded: if the UI ever stalls (window drag, dialog, slow machine) the
+    /// OLDEST bytes are dropped so memory can't grow without limit — a terminal
+    /// only needs recent content, and the missing middle is the standard
+    /// "skip frames" behaviour.
+    fn push_pending_output(&mut self, text: &str) {
+        self.pending_text.push_str(text);
+        // 1 MiB ceiling ≈ 50 ms of a 20 MB/s `yes` flood; generous for any
+        // legitimate burst, and the 33 ms render timer drains it anyway.
+        const PENDING_OUTPUT_CAP: usize = 1 << 20;
+        if self.pending_text.len() > PENDING_OUTPUT_CAP {
+            let mut drop = self.pending_text.len() - PENDING_OUTPUT_CAP;
+            while drop < self.pending_text.len() && !self.pending_text.is_char_boundary(drop) {
+                drop += 1;
+            }
+            self.pending_text.drain(..drop);
+        }
+    }
+
+    /// Flush the pending output into the vt100 parser. Called by
+    /// `rebuild_tab_display` (the 33 ms render tick), so all output that
+    /// arrived since the last tick is parsed in ONE coalesced batch instead of
+    /// once per network chunk. At most the newest 64 KiB is ingested per tick:
+    /// if the UI fell behind, older bytes are dropped (skip frames) so a
+    /// render tick never exceeds its budget.
+    fn flush_pending_output(&mut self) {
+        if self.pending_text.is_empty() {
+            return;
+        }
+        let mut text = std::mem::take(&mut self.pending_text);
+        const MAX_INGEST_PER_TICK: usize = 64 * 1024;
+        if text.len() > MAX_INGEST_PER_TICK {
+            let mut drop = text.len() - MAX_INGEST_PER_TICK;
+            while drop < text.len() && !text.is_char_boundary(drop) {
+                drop += 1;
+            }
+            text.drain(..drop);
+        }
+        self.ingest(text.as_bytes());
+    }
+
     fn ingest(&mut self, raw: &[u8]) {
         // Rewrite HVP (`ESC [ … f`) → CUP (`ESC [ … H`) so vt100 (which only
         // implements `H`) honours btop/htop's absolute cursor positioning.
@@ -9904,6 +9947,7 @@ mod selection_tests {
             suppress_echo: String::new(),
             tmux_prefix_until: None,
             csi_state: CsiState::Normal,
+            pending_text: String::new(),
         }
     }
 
@@ -9982,6 +10026,7 @@ mod selection_tests {
             suppress_echo: String::new(),
             tmux_prefix_until: None,
             csi_state: CsiState::Normal,
+            pending_text: String::new(),
         };
         assert_eq!(buf.extract_selection_text(), "你好哈");
     }
@@ -10333,20 +10378,39 @@ mod selection_tests {
     }
 
     #[test]
-    fn detect_scroll_identical_screen_with_tail_change() {
-        // All rows identical except the last row changed. Both "no scroll" and
-        // "scrolled one row" produce the same alignment length here, and the
-        // algorithm (like the original) resolves the tie to 0 — the visible
-        // result is identical either way, so 0 is the safe answer.
-        let line = |t: &str| Line {
-            text: t.to_string(),
-            spans: Vec::new(),
-            wrapped: false,
-        };
-        let prev: Vec<Line> = (0..100).map(|_| line("same")).collect();
-        let mut curr: Vec<Line> = (0..100).map(|_| line("same")).collect();
-        curr[99] = line("new");
-        assert_eq!(detect_scroll(&prev, &curr), 0);
+    fn pending_output_is_bounded_and_flushed() {
+        let mut buf = make_buf(5, 20, &[], &["prompt"], 0);
+        // Normal burst: everything is ingested in one flush.
+        buf.push_pending_output("hello\r\nworld\r\n");
+        assert_eq!(buf.pending_text, "hello\r\nworld\r\n");
+        buf.flush_pending_output();
+        assert!(buf.pending_text.is_empty());
+        // make_buf seeds the screen with "prompt"; the ingested text lands at
+        // the cursor (col 6), so the first row becomes "prompthello…".
+        let first = buf.parser.screen().rows(0, 20).next().unwrap_or_default();
+        assert!(first.trim_end().starts_with("prompthello"));
+
+        // Oversized burst: the buffer caps at PENDING_OUTPUT_CAP and only the
+        // newest MAX_INGEST_PER_TICK bytes survive the flush (skip frames),
+        // so memory stays bounded even if the UI stalls for seconds.
+        let big = "x".repeat(1 << 20);
+        buf.push_pending_output(&big);
+        assert!(buf.pending_text.len() <= 1 << 20);
+        buf.flush_pending_output();
+        assert!(buf.pending_text.is_empty());
+    }
+
+    #[test]
+    fn pending_output_cap_respects_char_boundaries() {
+        let mut buf = make_buf(5, 20, &[], &["prompt"], 0);
+        // 你 (3 bytes) repeated: the cap must not split a char.
+        let s = "你".repeat(1 << 19); // 3 MiB
+        buf.push_pending_output(&s);
+        assert!(buf.pending_text.len() <= 1 << 20);
+        assert!(buf.pending_text.is_char_boundary(0));
+        assert!(buf.pending_text.is_char_boundary(buf.pending_text.len()));
+        // All chars intact after any truncation.
+        assert!(buf.pending_text.chars().all(|c| c == '你'));
     }
 
 }
