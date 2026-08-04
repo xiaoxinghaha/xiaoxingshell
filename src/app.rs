@@ -6783,7 +6783,10 @@ fn wire_key_input(
             let tid = tab_id.to_string();
             if let Some(buf) = bufs_clear.lock().unwrap().get_mut(&tid) {
                 let (rows, cols) = buf.parser.screen().size();
-                buf.parser = vt100::Parser::new(rows, cols, buf.max_history_lines);
+                // Parser scrollback stays 0 — scrollback lives only in our own
+                // `history` (see the init site for why), so keep the memory
+                // savings of 850a8ed consistent across all parser rebuilds.
+                buf.parser = vt100::Parser::new(rows, cols, 0);
                 buf.find_query.clear();
                 buf.history = Vec::new(); // recycle the session scrollback
                 buf.prev = Vec::new();
@@ -8972,10 +8975,15 @@ impl TermBuffer {
         let bytes = self.rewrite_hvp(raw);
         let bytes = &bytes[..];
         let rows = self.parser.screen().size().0 as usize;
-        // One batch per screen height (was rows/2): each batch rebuilds the
-        // whole screen for scroll detection, so the larger batch halves that
-        // per-flush cost for fast-scrolling output like `yes`.
-        let batch_lines = rows.max(1);
+        // Batch at most half a screen of lines per ingest_chunk call. This is
+        // NOT a performance knob: `detect_scroll` can only recover a shift of
+        // up to rows-1 lines from a before/after screen diff, so a batch that
+        // scrolls a full screen (or more) leaves prev/curr with no common
+        // rows and returns 0 — the whole batch's scrolled-off lines are lost
+        // (history stalls at a few hundred lines and the user's scrollback
+        // cap never comes into play). rows/2 keeps every batch well inside
+        // what the diff can see.
+        let batch_lines = (rows / 2).max(1);
         let mut start = 0usize;
         let mut nl = 0usize;
         for i in 0..bytes.len() {
