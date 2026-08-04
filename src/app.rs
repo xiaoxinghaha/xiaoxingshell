@@ -3022,6 +3022,9 @@ fn wire_session_callbacks(
                 cursor_col: 0,
                 rows_used: 0,
                 is_alt_screen: false,
+                scroll_total: 0,
+                scroll_offset: 0,
+                scroll_visible: 0,
                 find_matches: ModelRc::from(std::rc::Rc::new(VecModel::<TermMatch>::default())),
                 selection: ModelRc::from(std::rc::Rc::new(VecModel::<TermMatch>::default())),
                 sftp_path: "/".into(),
@@ -3825,9 +3828,15 @@ fn rebuild_tab_display(win: &AppWindow, bufs: &TermBuffers, tab_id: &str) {
         let b = buf.render(); // also refreshes buf.displayed_text
         let matches = compute_find_matches(&buf.displayed_text, &buf.find_query);
         let sel = buf.selection_rects_visible(cols);
-        (b, matches, sel)
+        // Scrollbar state: total scrollable lines (history + live screen) and
+        // the current view offset (0 = live bottom).
+        let (rows, _) = buf.parser.screen().size();
+        let scroll_total = buf.history.len() + rows as usize;
+        let scroll_offset = buf.view_offset;
+        let scroll_visible = rows as usize;
+        (b, matches, sel, scroll_total, scroll_offset, scroll_visible)
     };
-    let (b, matches, sel) = data;
+    let (b, matches, sel, scroll_total, scroll_offset, scroll_visible) = data;
     let spans = ModelRc::from(Rc::new(VecModel::from(b.spans)));
     let fm = ModelRc::from(Rc::new(VecModel::from(matches)));
     let sm = ModelRc::from(Rc::new(VecModel::from(sel)));
@@ -3840,6 +3849,9 @@ fn rebuild_tab_display(win: &AppWindow, bufs: &TermBuffers, tab_id: &str) {
         row.is_alt_screen = alt;
         row.find_matches = fm.clone();
         row.selection = sm.clone();
+        row.scroll_total = scroll_total as i32;
+        row.scroll_offset = scroll_offset as i32;
+        row.scroll_visible = scroll_visible as i32;
     });
 }
 

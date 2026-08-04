@@ -60,6 +60,9 @@ export struct TerminalState {
     cursor-col: int,
     rows-used: int,        // content rows, for viewport sizing
     is-alt-screen: bool,
+    scroll-total: int,     // total scrollable lines (history + screen), for the scrollbar
+    scroll-offset: int,    // current scrollback view offset (0 = live bottom)
+    scroll-visible: int,   // visible terminal rows (PTY height), for the scrollbar
     find-matches: [TermMatch], // search-highlight rectangles
     selection: [TermMatch],    // drag-selection highlight rectangles
 
@@ -935,6 +938,9 @@ export component AppWindow inherits Window {
                             cursor-col: term.cursor-col;
                             rows-used: term.rows-used;
                             is-alt-screen: term.is-alt-screen;
+                            scroll-total: term.scroll-total;
+                            scroll-offset: term.scroll-offset;
+                            scroll-visible: term.scroll-visible;
                             find-matches: term.find-matches;
                             selection: term.selection;
                             sftp-panel-height <=> root.sftp-panel-height;

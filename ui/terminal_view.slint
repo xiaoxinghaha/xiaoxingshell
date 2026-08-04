@@ -79,6 +79,92 @@ component MenuItem inherits Rectangle {
     }
 }
 
+// --- VScrollBar -----------------------------------------------------------
+// 16px vertical scrollbar for the terminal scrollback. Dragging the thumb
+// jumps proportionally (the actual scrolling stays on the Rust side via the
+// `scrolled` callback → terminal-scroll); clicking the track pages by one
+// screen. Shown only when there is more content than fits on screen.
+component VScrollBar inherits Rectangle {
+    in property <int> total;           // total scrollable lines (history + screen)
+    in property <int> visible-rows;    // visible rows
+    in property <int> offset;          // current view offset (0 = live bottom)
+    callback scrolled(int);            // request a delta scroll (+ = older)
+
+    property <int> max-scroll: max(0, root.total - root.visible-rows);
+    // Thumb size: visible/total of the track, min 24px so it stays grabbable.
+    // (Slint has no float casts; `1.0 * int` forces a float quotient.)
+    property <float> ratio: root.total > 0 ? 1.0 * root.visible-rows / (1.0 * root.total) : 0.0;
+    property <length> thumb-h: max(24px, root.height * min(1.0, root.ratio));
+    // Thumb position: bottom = live (offset 0), top = oldest (offset max).
+    property <float> pos-ratio: root.max-scroll > 0 ? 1.0 * (root.max-scroll - root.offset) / (1.0 * root.max-scroll) : 0.0;
+    property <length> thumb-y: root.pos-ratio * (root.height - root.thumb-h);
+
+    // Drag state for the thumb.
+    property <bool> dragging: false;
+    property <length> drag-start-y: 0px;
+    property <int> drag-start-offset: 0;
+    property <int> last-target: 0;
+
+    width: 16px;
+    background: transparent;
+
+    track := Rectangle {
+        x: 2px;
+        width: parent.width - 4px;
+        height: parent.height;
+        border-radius: 3px;
+        background: Theme.bg-panel;
+
+        // Click above/below the thumb pages up/down by one screen.
+        track-ta := TouchArea {
+            pointer-event(ev) => {
+                if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
+                    if (self.mouse-y < root.thumb-y) {
+                        root.scrolled(root.visible-rows);
+                    } else {
+                        root.scrolled(0 - root.visible-rows);
+                    }
+                }
+            }
+        }
+
+        thumb := Rectangle {
+            y: root.thumb-y;
+            width: parent.width;
+            height: root.thumb-h;
+            border-radius: 3px;
+            background: root.dragging ? Theme.text-secondary : Theme.text-muted;
+
+            thumb-ta := TouchArea {
+                pointer-event(ev) => {
+                    if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
+                        root.dragging = true;
+                        root.drag-start-y = self.mouse-y;
+                        root.drag-start-offset = root.offset;
+                        root.last-target = root.offset;
+                    } else if (ev.kind == PointerEventKind.up && ev.button == PointerEventButton.left) {
+                        root.dragging = false;
+                    }
+                }
+                moved => {
+                    if (root.dragging) {
+                        let maxScroll = max(1, root.max-scroll);
+                        let dragY = self.mouse-y - root.drag-start-y;
+                        // Map the mouse offset to a proportional scroll delta:
+                        // dragging up (negative dy) scrolls older (+target).
+                        let target = root.drag-start-offset + Math.round((0px - dragY) / root.height * (1.0 * maxScroll));
+                        let targetClamped = clamp(target, 0, root.max-scroll);
+                        if (targetClamped != root.last-target) {
+                            root.scrolled(targetClamped - root.last-target);
+                            root.last-target = targetClamped;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // --- TerminalView ----------------------------------------------------------
 
 export component TerminalView inherits Rectangle {
@@ -89,6 +175,9 @@ export component TerminalView inherits Rectangle {
     in property <int> cursor-col;
     in property <int> rows-used;        // content rows, for viewport sizing
     in property <bool>   is-alt-screen;
+    in property <int> scroll-total;     // total scrollable lines (history + screen)
+    in property <int> scroll-offset;    // current scrollback view offset (0 = live bottom)
+    in property <int> scroll-visible;   // visible terminal rows (PTY height)
     in property <[TermMatch]> find-matches; // search-highlight rectangles
     in property <[TermMatch]> selection;    // drag-selection highlight rectangles
     in property <image> terminal-bg-image;
@@ -363,6 +452,8 @@ export component TerminalView inherits Rectangle {
             VerticalLayout {
                 spacing: 0;
 
+                HorizontalLayout {
+                    spacing: 0;
                 flickable := Flickable {
                     vertical-stretch: 1;
                     // Non-interactive: a Flickable steals fast drags from child
@@ -585,6 +676,21 @@ export component TerminalView inherits Rectangle {
                                 }
                             }
                         }
+                    }
+                }
+
+                    // Scrollbar: only when there is more content than fits on
+                    // screen (and not on the alt-screen where the program owns
+                    // scrolling). Dragging/clicking routes through the same
+                    // terminal-scroll callback as the mouse wheel. Visibility
+                    // uses only Rust-side data (scroll-total/scroll-visible) so
+                    // it can never participate in a layout binding loop.
+                    if !root.is-alt-screen && root.scroll-total > root.scroll-visible : VScrollBar {
+                        width: 16px;
+                        total: root.scroll-total;
+                        visible-rows: max(1, root.scroll-visible);
+                        offset: root.scroll-offset;
+                        scrolled(d) => { root.terminal-scroll(d); }
                     }
                 }
 

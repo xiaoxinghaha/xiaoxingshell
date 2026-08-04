@@ -2,6 +2,22 @@
 
 ## 2026-08-04
 
+### 终端增加 16px 垂直滚动条：拖动滑块快速定位、点击轨道翻页
+
+- 背景/现象：
+  修复滚动历史累积后（见下条），缓存可到 9999 行；仅靠滚轮逐行翻看太慢，终端没有上下滚动条。
+- 改动/新增：
+  1. `src/app.rs`：`rebuild_tab_display` 每次渲染时把 `scroll_total`（history 行数 + 屏幕行数）、`scroll_offset`（当前 view_offset，0=底部）、`scroll_visible`（PTY 可视行数）写入模型；`TerminalState` 构造处补默认值。
+  2. `ui/app.slint`：`TerminalState` 新增 `scroll-total` / `scroll-offset` / `scroll-visible` 字段并绑定到 TerminalView。
+  3. `ui/terminal_view.slint`：新增 `VScrollBar` 组件（16px，轨道 + 滑块）；布局改为 Flickable 与滚动条并列（HorizontalLayout）；滑块高度 = 可视行/总行 × 轨道高（最小 24px），位置随 view_offset 变化（底部=最新）；拖动滑块按比例换算目标偏移，点击轨道上方/下方翻一屏；仅非 alt-screen 且内容超屏时显示。
+- 修复/效果：
+  - 9999 行缓存下可拖动滑块秒级定位任意位置，点击轨道快速翻页。
+  - alt-screen（vim/htop/btop）不显示滚动条，避免干扰全屏程序。
+- 涉及文件：
+  - `src/app.rs`、`ui/app.slint`、`ui/terminal_view.slint`
+
+## 2026-08-04
+
 ### 修复滚动历史只累积几百行：ingest 分批恢复 rows/2，并补齐清空缓存处 scrollback 置 0
 
 - 背景/现象：
