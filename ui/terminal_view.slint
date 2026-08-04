@@ -99,10 +99,11 @@ component VScrollBar inherits Rectangle {
     property <float> pos-ratio: root.max-scroll > 0 ? 1.0 * (root.max-scroll - root.offset) / (1.0 * root.max-scroll) : 0.0;
     property <length> thumb-y: root.pos-ratio * (root.height - root.thumb-h);
 
-    // Drag state for the thumb.
+    // Drag state for the thumb. The gesture lives on the (non-moving) track
+    // layer so the mouse coordinates stay in a stable frame of reference while
+    // the thumb itself follows the offset.
     property <bool> dragging: false;
-    property <length> drag-start-y: 0px;
-    property <int> drag-start-offset: 0;
+    property <length> drag-grab-offset: 0px;  // press: mouse-y − thumb-y (kept constant while dragging)
     property <int> last-target: 0;
 
     width: 16px;
@@ -115,14 +116,40 @@ component VScrollBar inherits Rectangle {
         border-radius: 3px;
         background: Theme.bg-panel;
 
-        // Click above/below the thumb pages up/down by one screen.
         track-ta := TouchArea {
             pointer-event(ev) => {
                 if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
-                    if (self.mouse-y < root.thumb-y) {
+                    if (self.mouse-y >= root.thumb-y && self.mouse-y <= root.thumb-y + root.thumb-h) {
+                        // Pressed on the thumb → start dragging. Keep the grab
+                        // offset so the thumb follows the mouse 1:1.
+                        root.dragging = true;
+                        root.drag-grab-offset = self.mouse-y - root.thumb-y;
+                        root.last-target = root.offset;
+                    } else if (self.mouse-y < root.thumb-y) {
+                        // Click above the thumb → page up (older).
                         root.scrolled(root.visible-rows);
                     } else {
+                        // Click below the thumb → page down (newer).
                         root.scrolled(0 - root.visible-rows);
+                    }
+                } else if (ev.kind == PointerEventKind.up && ev.button == PointerEventButton.left) {
+                    root.dragging = false;
+                }
+            }
+            moved => {
+                if (root.dragging) {
+                    let maxScroll = max(1, root.max-scroll);
+                    let trackInner = max(1px, root.height - root.thumb-h);
+                    // Thumb top = mouse position − grab offset (thumb is fully
+                    // hand-following; no ratio attenuation).
+                    let thumbTop = clamp(self.mouse-y - root.drag-grab-offset, 0px, trackInner);
+                    // Derive the scroll offset from the thumb position:
+                    // top = oldest (offset max), bottom = live (offset 0).
+                    let target = Math.round((1.0 - thumbTop / trackInner) * (1.0 * maxScroll));
+                    let targetClamped = clamp(target, 0, root.max-scroll);
+                    if (targetClamped != root.last-target) {
+                        root.scrolled(targetClamped - root.last-target);
+                        root.last-target = targetClamped;
                     }
                 }
             }
@@ -134,33 +161,6 @@ component VScrollBar inherits Rectangle {
             height: root.thumb-h;
             border-radius: 3px;
             background: root.dragging ? Theme.text-secondary : Theme.text-muted;
-
-            thumb-ta := TouchArea {
-                pointer-event(ev) => {
-                    if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
-                        root.dragging = true;
-                        root.drag-start-y = self.mouse-y;
-                        root.drag-start-offset = root.offset;
-                        root.last-target = root.offset;
-                    } else if (ev.kind == PointerEventKind.up && ev.button == PointerEventButton.left) {
-                        root.dragging = false;
-                    }
-                }
-                moved => {
-                    if (root.dragging) {
-                        let maxScroll = max(1, root.max-scroll);
-                        let dragY = self.mouse-y - root.drag-start-y;
-                        // Map the mouse offset to a proportional scroll delta:
-                        // dragging up (negative dy) scrolls older (+target).
-                        let target = root.drag-start-offset + Math.round((0px - dragY) / root.height * (1.0 * maxScroll));
-                        let targetClamped = clamp(target, 0, root.max-scroll);
-                        if (targetClamped != root.last-target) {
-                            root.scrolled(targetClamped - root.last-target);
-                            root.last-target = targetClamped;
-                        }
-                    }
-                }
-            }
         }
     }
 }

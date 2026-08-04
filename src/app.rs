@@ -9068,6 +9068,11 @@ impl TermBuffer {
         let has_erase_display =
             bytes.windows(4).any(|w| w == b"\x1b[2J") || bytes.windows(3).any(|w| w == b"\x1b[J");
         let is_fullscreen_refresh = has_cursor_home && has_erase_display;
+        // E3 (`\x1b[3J`) = "erase scrollback": `clear` (and friends) send it to
+        // also wipe the terminal's scrollback. Mirror that so our own history
+        // behaves like a native terminal — after `clear`, scrolling up shows
+        // nothing instead of the pre-clear output.
+        let has_clear_scrollback = bytes.windows(4).any(|w| w == b"\x1b[3J");
 
         self.parser.process(bytes);
         let (is_alt, rows, cols) = {
@@ -9082,6 +9087,12 @@ impl TermBuffer {
             self.view_offset = 0;
             self.prev.clear();
             return;
+        }
+        if has_clear_scrollback {
+            // `clear` wipes the scrollback (like native terminals): drop our
+            // history and snap back to the live view before the diff below.
+            self.history.clear();
+            self.view_offset = 0;
         }
         if is_fullscreen_refresh {
             // Non-alt-screen full-screen refresh (btop, htop with alt disabled…).
