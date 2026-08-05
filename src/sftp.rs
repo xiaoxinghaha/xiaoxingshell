@@ -121,10 +121,6 @@ pub enum SftpCommand {
     SetAutoRefreshSecs(u32),
     /// Internal periodic refresh of the current SFTP directory.
     RefreshCurrent,
-    /// Run a command via exec channel; report trimmed stdout as CwdChanged.
-    /// If the command fails and `fallback` is Some, report the fallback instead.
-    /// Used for tmux pane_current_path queries and tmux-exit detection.
-    ExecQueryCwd { cmd: String, fallback: Option<String> },
     /// Gracefully shut down the SFTP worker.
     Close,
 }
@@ -264,11 +260,6 @@ impl SftpHandle {
     }
     pub fn set_auto_refresh_secs(&self, secs: u32) {
         let _ = self.commands.send(SftpCommand::SetAutoRefreshSecs(secs));
-    }
-    /// Run a command via exec channel and report stdout as CwdChanged.
-    #[allow(dead_code)]
-    pub fn exec_query_cwd(&self, cmd: String, fallback: Option<String>) {
-        let _ = self.commands.send(SftpCommand::ExecQueryCwd { cmd, fallback });
     }
 }
 
@@ -576,7 +567,7 @@ async fn run_sftp(
     }
 
     // --- Command loop -------------------------------------------------------
-    // Wrap handle in Arc so ExecQueryCwd can spawn a non-blocking task.
+    // Shared by command handlers that open auxiliary exec channels.
     let handle = Arc::new(handle);
     while let Some(cmd) = commands.recv().await {
         match cmd {
@@ -665,40 +656,6 @@ async fn run_sftp(
                     }
                 }
             }
-
-            SftpCommand::ExecQueryCwd { cmd, fallback } => {
-                // Spawn a separate task so the exec channel query does not
-                // block the SFTP command loop (which would freeze the panel).
-                let h = handle.clone();
-                let ev = events.clone();
-                tokio::spawn(async move {
-                    let output = run_remote_exec_capture(&h, &cmd).await;
-                    let path = match &output {
-                        Ok(o) => o.trim().to_string(),
-                        Err(_) => String::new(),
-                    };
-                    if !path.is_empty() && path.starts_with('/') {
-                        let _ = ev.send(SessionEvent::CwdChanged(path));
-                        return;
-                    }
-                    if let Some(fb) = fallback {
-                        let _ = ev.send(SessionEvent::CwdChanged(fb));
-                        return;
-                    }
-                    // Transient failure or __TMUX_GONE__: retry once after 700ms.
-                    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-                    let retry = run_remote_exec_capture(&h, &cmd).await;
-                    let rpath = match &retry {
-                        Ok(o) => o.trim().to_string(),
-                        Err(_) => String::new(),
-                    };
-                    if !rpath.is_empty() && rpath.starts_with('/') {
-                        let _ = ev.send(SessionEvent::CwdChanged(rpath));
-                    }
-                    // Still no path → silently ignore; next poll retries.
-                });
-            }
-
 
             SftpCommand::ToggleTreeNode(path) => {
                 if tree_expanded.contains(&path) {

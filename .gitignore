@@ -4,4 +4,6 @@
 /.vscode
 /.idea
 /.claude
-.agents
+/.agents
+/.workbuddy
+agents.md
