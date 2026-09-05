@@ -505,6 +505,20 @@ pub fn init_panic_hook() {
     }));
 }
 
+/// `<config_dir>/notes.txt` — the nav-rail #3 notepad's persistent storage.
+/// Best-effort: failures are logged (WARN) but never fatal.
+fn write_notes_file(text: &str) {
+    match crate::config::app_config_dir() {
+        Ok(dir) => {
+            let _ = std::fs::create_dir_all(&dir);
+            if let Err(e) = std::fs::write(dir.join("notes.txt"), text.as_bytes()) {
+                tracing::warn!("notepad save failed: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("notepad save: config dir unavailable: {e:#}"),
+    }
+}
+
 pub fn run() -> Result<()> {
     // --- Runtime + store -------------------------------------------------
     let runtime = Arc::new(Runtime::new().context("failed to start tokio runtime")?);
@@ -1832,6 +1846,48 @@ pub fn run() -> Result<()> {
         Box::leak(Box::new(panic_timer));
     }
 
+    // Notepad (nav rail #3) shared state: the debounced autosave timer and the
+    // win-close flush below both write through these.
+    let pending_notes = Rc::new(RefCell::new(String::new()));
+    let notes_dirty = Rc::new(std::cell::Cell::new(false));
+    {
+        // Restore last session's text (missing file → empty notepad).
+        let notes = crate::config::app_config_dir()
+            .ok()
+            .and_then(|dir| std::fs::read_to_string(dir.join("notes.txt")).ok())
+            .unwrap_or_default();
+        window.set_notepad_text(notes.into());
+
+        // Debounced autosave: restart the single-shot timer on every edit so
+        // the write happens 500 ms after the last keystroke, not per keystroke.
+        let notes_timer = Rc::new(RefCell::new(slint::Timer::default()));
+        notes_timer.borrow().start(
+            slint::TimerMode::SingleShot,
+            std::time::Duration::from_millis(500),
+            {
+                let pending_notes = pending_notes.clone();
+                let notes_dirty = notes_dirty.clone();
+                move || {
+                    if !notes_dirty.get() {
+                        return;
+                    }
+                    notes_dirty.set(false);
+                    write_notes_file(&pending_notes.borrow());
+                }
+            },
+        );
+        window.on_notepad_text_changed({
+            let pending_notes = pending_notes.clone();
+            let notes_dirty = notes_dirty.clone();
+            let notes_timer = notes_timer.clone();
+            move |text: SharedString| {
+                *pending_notes.borrow_mut() = text.to_string();
+                notes_dirty.set(true);
+                notes_timer.borrow().restart();
+            }
+        });
+    }
+
     // --- System sampler (1 Hz) ------------------------------------------
     let sampler = Rc::new(Mutex::new(SystemSampler::new()));
     let weak = window.as_weak();
@@ -2011,6 +2067,12 @@ pub fn run() -> Result<()> {
         window.on_win_close(move || {
             if let Some(w) = weak.upgrade() {
                 save(&w);
+                // Flush a pending notepad edit so the last keystrokes survive
+                // the quit (the debounced timer won't fire after exit).
+                if notes_dirty.get() {
+                    notes_dirty.set(false);
+                    write_notes_file(&pending_notes.borrow());
+                }
                 // Mirror the native-X behaviour: confirm if sessions are open.
                 if close_handles.borrow().is_empty() {
                     let _ = slint::quit_event_loop();

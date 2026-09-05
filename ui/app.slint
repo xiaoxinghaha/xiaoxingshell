@@ -335,6 +335,11 @@ export component AppWindow inherits Window {
     in-out property <string> ui-font-family <=> Theme.ui-font-family;
     in property <[string]> term-fonts;             // installed monospace families
     in-out property <bool> interface-open: false;  // Interface settings dialog
+    // 记事本 (nav rail #3): free-form scratchpad for quick commands. The app
+    // shell auto-saves the text (debounced, notes.txt) and restores it on start.
+    in-out property <bool> notepad-open: false;
+    in-out property <string> notepad-text;
+    callback notepad-text-changed(string);
     out property <length> ifd-width: 700px;
     out property <length> ifd-height: 600px;
     // Interface dialog position (draggable by its title bar); init centered.
@@ -753,10 +758,13 @@ export component AppWindow inherits Window {
                         }
 
                         NavRailBtn {
-                            icon: "\u{E88F}";
-                            tooltip: root.lang-en ? "Reserved" : "预留";
-                            active: false;
-                            clicked => { root.nav-panel-open = 0; }
+                            icon: "\u{E873}";
+                            tooltip: root.lang-en ? "Notepad" : "记事本";
+                            active: root.notepad-open;
+                            clicked => {
+                                root.nav-panel-open = 0;
+                                root.notepad-open = !root.notepad-open;
+                            }
                         }
 
                         NavRailBtn {
@@ -2593,6 +2601,90 @@ export component AppWindow inherits Window {
                 }
             }
         }
+    }
+
+    // --- Notepad (nav rail #3) ---------------------------------------------
+    // Free-form scratchpad (quick commands etc.). Non-modal on purpose: the
+    // user can still interact with the terminal while jotting. The text is
+    // auto-saved by the app shell (debounced → notes.txt) and restored on
+    // startup. Editor + scrolling mirrors the SFTP file editor (ScrollView +
+    // multi-line TextInput), minus the line-number gutter.
+    if root.notepad-open : Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 520px;
+        height: 420px;
+        background: Theme.bg-panel;
+        border-radius: Theme.radius-md;
+        border-width: 1px;
+        border-color: Theme.border-strong;
+        drop-shadow-blur: 24px;
+        drop-shadow-color: #000000a0;
+        clip: true;
+
+        VerticalLayout {
+            // Title bar: name + auto-save hint + ✕ (fixed card, not draggable).
+            Rectangle {
+                height: 44px;
+                HorizontalLayout {
+                    padding: 14px;
+                    spacing: 8px;
+                    Text {
+                        text: root.lang-en ? "Notepad" : "记事本";
+                        color: Theme.text-primary;
+                        font-size: Theme.fs-lg;
+                        font-weight: 700;
+                        horizontal-stretch: 1;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        text: root.lang-en ? "auto-saved" : "自动保存";
+                        color: Theme.text-muted;
+                        font-size: Theme.fs-xs;
+                        vertical-alignment: center;
+                    }
+                    Rectangle {
+                        width: 22px; height: 22px;
+                        border-radius: Theme.radius-sm;
+                        background: np-close-ta.has-hover ? Theme.bg-hover : transparent;
+                        np-close-ta := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.notepad-open = false; }
+                        }
+                        Text { text: "\u{E5CD}"; font-family: "Material Icons";
+                               color: Theme.text-secondary; font-size: Theme.fs-sm;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                }
+            }
+            Rectangle { height: 1px; background: Theme.border-subtle; }
+
+            // Word-wrapped multi-line editor in a ScrollView so long notes
+            // scroll vertically (no horizontal scroll when wrapping).
+            Rectangle {
+                vertical-stretch: 1;
+                background: Theme.bg-root;
+                np-scroll := ScrollView {
+                    viewport-width: self.visible-width;
+                    viewport-height: max(self.visible-height, np-input.preferred-height + 16px);
+                    np-input := TextInput {
+                        x: 8px;
+                        y: 8px;
+                        width: parent.visible-width - 16px;
+                        height: max(24px, self.preferred-height);
+                        text <=> root.notepad-text;
+                        single-line: false;
+                        wrap: word-wrap;
+                        color: Theme.text-primary;
+                        font-family: Theme.ui-font-family;
+                        font-size: Theme.fs-md;
+                        edited => { root.notepad-text-changed(root.notepad-text); }
+                    }
+                }
+            }
+        }
+        // Focus the text as soon as the notepad opens.
+        init => { np-input.focus(); }
     }
 
     // --- Interface settings dialog (font family + size) -------------------
