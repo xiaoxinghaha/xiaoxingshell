@@ -266,6 +266,56 @@ fn find_incomplete_osc_tail(s: &str) -> Option<usize> {
     }
 }
 
+/// Given a raw byte buffer, return `(valid_len, tail_len)` where the trailing
+/// `tail_len` bytes (1–3) form the *incomplete* start of a multi-byte UTF-8
+/// character whose continuation bytes arrive in a later read.  Callers keep
+/// that tail and prepend it to the next chunk before decoding, so a character
+/// split across two SSH reads is never mangled into `�` by `from_utf8_lossy`.
+///
+/// Non-UTF-8 garbage is left in place for `from_utf8_lossy` to replace — we
+/// only hold back tails that could plausibly complete into a valid character.
+fn split_utf8_tail(buf: &[u8]) -> (usize, usize) {
+    let n = buf.len();
+    let mut cont = 0usize;
+    let mut i = n;
+    while i > 0 && cont < 4 {
+        let b = buf[i - 1];
+        if b & 0xC0 == 0x80 {
+            // Continuation byte (10xxxxxx): part of a multi-byte char.
+            cont += 1;
+            i -= 1;
+            continue;
+        }
+        // `b` is a lead byte (or ASCII / invalid lead).
+        let need = if b < 0x80 {
+            0
+        } else if b & 0xE0 == 0xC0 {
+            1
+        } else if b & 0xF0 == 0xE0 {
+            2
+        } else if b & 0xF8 == 0xF0 {
+            3
+        } else {
+            0 // 0x80–0xBF handled above; 0xC0/C1/F5–FF are invalid leads
+        };
+        if need == 0 {
+            // ASCII or invalid lead: nothing incomplete at the tail.
+            return (n, 0);
+        }
+        // lead + `cont` continuation bytes seen so far.
+        if cont >= need {
+            // Complete character (plus any valid prefix) — no carry.
+            return (n, 0);
+        }
+        // Missing `need - cont` continuation bytes → hold the whole
+        // lead+continuation prefix for the next chunk.
+        return (i.saturating_sub(1), cont + 1);
+    }
+    // Only lone continuation bytes (4+ in a row) or empty: not a truncated
+    // valid sequence, leave as-is for the lossy decoder.
+    (n, 0)
+}
+
 /// Percent-decode a URL path segment (e.g. `%20` → space).
 fn url_decode(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
@@ -773,6 +823,12 @@ async fn run_session(
     // Buffers output while `suppress_echo` so the (long) echoed setup line can be
     // stripped even when it splits across reads (#98).
     let mut echo_buf = String::new();
+    // A multi-byte UTF-8 character (e.g. tmux's dot-fill `·`) can straddle two
+    // SSH reads.  `from_utf8_lossy` on each chunk alone would turn the split
+    // bytes into `�`; keep the incomplete tail and prepend it to the next read.
+    let mut utf8_carry = Vec::new();
+    // Same carry for the stderr stream (its byte boundaries are independent).
+    let mut utf8_carry_stderr = Vec::new();
     // After a ZMODEM transfer finishes we briefly ignore ZMODEM detection so the
     // sender's lingering close frames can't spawn a spurious second receive (#76).
     let mut zmodem_done_at: Option<std::time::Instant> = None;
@@ -988,7 +1044,18 @@ async fn run_session(
                             continue;
                         }
 
-                        let chunk = String::from_utf8_lossy(&data).into_owned();
+                        // A multi-byte UTF-8 character may straddle two SSH
+                        // reads.  Prepend the carried incomplete tail, keep any
+                        // *new* incomplete tail for the next chunk, and decode
+                        // only the complete prefix so split characters don't
+                        // turn into `�` (tmux dot-fill `·` is a common victim).
+                        let mut raw = Vec::with_capacity(utf8_carry.len() + data.len());
+                        raw.extend_from_slice(&utf8_carry);
+                        raw.extend_from_slice(&data);
+                        let (valid_len, tail_len) = split_utf8_tail(&raw);
+                        utf8_carry = raw[valid_len..].to_vec();
+                        let chunk = String::from_utf8_lossy(&raw[..valid_len]).into_owned();
+                        debug_assert_eq!(tail_len, utf8_carry.len());
 
                         // Inject PROMPT_COMMAND after the first real shell output.
                         if !prompt_injected && !chunk.trim().is_empty() {
@@ -1080,7 +1147,14 @@ async fn run_session(
                         }
                     }
                     Some(ChannelMsg::ExtendedData { data, ext: _ }) => {
-                        let text = String::from_utf8_lossy(&data).into_owned();
+                        // Same UTF-8 carry treatment for stderr (its chunk
+                        // boundaries are independent of stdout's).
+                        let mut raw = Vec::with_capacity(utf8_carry_stderr.len() + data.len());
+                        raw.extend_from_slice(&utf8_carry_stderr);
+                        raw.extend_from_slice(&data);
+                        let (valid_len, _) = split_utf8_tail(&raw);
+                        utf8_carry_stderr = raw[valid_len..].to_vec();
+                        let text = String::from_utf8_lossy(&raw[..valid_len]).into_owned();
                         // High-volume stderr output → bounded channel with backpressure.
                         let _ = out_tx.send(SessionEvent::Output(text)).await;
                     }
@@ -1794,6 +1868,51 @@ mod osc_command_tests {
     #[test]
     fn plain_text_has_no_incomplete_tail() {
         assert!(find_incomplete_osc_tail("just normal output").is_none());
+    }
+
+    #[test]
+    fn utf8_tail_carries_split_2byte_char() {
+        // `·` (U+00B7) is 0xC2 0xB7; the lead byte lands at the chunk end.
+        let (valid, tail) = super::split_utf8_tail(b"dot-fill \xc2");
+        assert_eq!(valid, "dot-fill ".len());
+        assert_eq!(tail, 1);
+        // The carried lead byte stays in the buffer; the continuation byte
+        // arrives with the next read → the character reassembles cleanly.
+        let mut buf = b"dot-fill \xc2".to_vec();
+        buf.push(0xB7);
+        let (v2, t2) = super::split_utf8_tail(&buf);
+        assert_eq!(t2, 0);
+        assert_eq!(String::from_utf8_lossy(&buf[..v2]), "dot-fill ·");
+    }
+
+    #[test]
+    fn utf8_tail_carries_split_3byte_char() {
+        // `中` (U+4E2D) is 0xE4 0xB8 0xAD; two bytes at the chunk end.
+        let (valid, tail) = super::split_utf8_tail(b"dir/\xe4\xb8");
+        assert_eq!(valid, "dir/".len());
+        assert_eq!(tail, 2);
+        let mut buf = b"dir/\xe4\xb8".to_vec();
+        buf.push(0xAD);
+        let (v2, t2) = super::split_utf8_tail(&buf);
+        assert_eq!(t2, 0);
+        assert_eq!(String::from_utf8_lossy(&buf[..v2]), "dir/中");
+    }
+
+    #[test]
+    fn utf8_tail_ascii_and_complete_chars_have_no_carry() {
+        // ASCII tail → nothing held back.
+        assert_eq!(super::split_utf8_tail(b"plain ascii"), (11, 0));
+        // A complete multi-byte char at the end → nothing held back.
+        assert_eq!(super::split_utf8_tail("中".as_bytes()), (3, 0));
+        assert_eq!(super::split_utf8_tail(b"ab\xc2\xb7"), (4, 0));
+    }
+
+    #[test]
+    fn utf8_tail_does_not_hold_invalid_continuations() {
+        // Lone continuation bytes / invalid leads stay for the lossy decoder.
+        assert_eq!(super::split_utf8_tail(b"ab\xbf"), (3, 0));
+        assert_eq!(super::split_utf8_tail(b"\xbd\xbf\xbd"), (3, 0));
+        assert_eq!(super::split_utf8_tail(b""), (0, 0));
     }
 
     #[test]

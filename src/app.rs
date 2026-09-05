@@ -6775,6 +6775,18 @@ fn wire_key_input(
                         // backslash-continued commands paste correctly (see the
                         // function doc for the failure mode this prevents).
                         let bytes = normalize_pasted_newlines(&text).into_bytes();
+                        // Diagnostic: confirm how many bytes/lines actually reach
+                        // the PTY when multi-line paste only runs the first line.
+                        // Never log the text itself (may contain passwords, #15).
+                        // WARN so it lands in error.log without RUST_LOG.
+                        tracing::warn!(
+                            "paste: chars={} cr={} lf={} norm_bytes={} buffered={}",
+                            text.chars().count(),
+                            text.matches('\r').count(),
+                            text.matches('\n').count(),
+                            bytes.len(),
+                            locally_buffered
+                        );
                         for sender in &senders {
                             let _ = sender.send(SessionCommand::RawInput(bytes.clone()));
                         }
