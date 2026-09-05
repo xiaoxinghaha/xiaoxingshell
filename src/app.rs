@@ -1858,6 +1858,39 @@ pub fn run() -> Result<()> {
             .unwrap_or_default();
         window.set_notepad_text(notes.into());
 
+        // Restore the panel's last placement/size (absent → 1400x900 centered).
+        let (np_x, np_y, np_w, np_h) = store.borrow().notepad_geometry();
+        if let Some(w) = np_w {
+            window.set_np_width(w as f32);
+        }
+        if let Some(h) = np_h {
+            window.set_np_height(h as f32);
+        }
+        if let Some(x) = np_x {
+            window.set_np_x(x as f32);
+        }
+        if let Some(y) = np_y {
+            window.set_np_y(y as f32);
+        }
+
+        // Drag/resize finished → persist the placement right away.
+        {
+            let store = store.clone();
+            let weak = window.as_weak();
+            window.on_notepad_geometry_save(move || {
+                if let Some(w) = weak.upgrade() {
+                    let mut s = store.borrow_mut();
+                    s.set_notepad_geometry(
+                        w.get_np_x() as f64,
+                        w.get_np_y() as f64,
+                        w.get_np_width() as f64,
+                        w.get_np_height() as f64,
+                    );
+                    let _ = s.save();
+                }
+            });
+        }
+
         // Debounced autosave: restart the single-shot timer on every edit so
         // the write happens 500 ms after the last keystroke, not per keystroke.
         let notes_timer = Rc::new(RefCell::new(slint::Timer::default()));
@@ -1938,6 +1971,14 @@ pub fn run() -> Result<()> {
             if !is_max && !minimized_pos && size.width > 0 && size.height > 0 {
                 s.set_window_geometry(Some(pos.x), Some(pos.y), size.width, size.height);
             }
+            // Notepad panel placement rides along with every config save so
+            // its last drag/resize always lands on disk eventually too.
+            s.set_notepad_geometry(
+                w.get_np_x() as f64,
+                w.get_np_y() as f64,
+                w.get_np_width() as f64,
+                w.get_np_height() as f64,
+            );
             let _ = s.save();
         }
     });

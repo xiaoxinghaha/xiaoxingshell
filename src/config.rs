@@ -317,6 +317,20 @@ pub struct WindowState {
     pub maximized: bool,
 }
 
+/// Remember the nav-rail #3 notepad panel's last placement/size (logical px)
+/// so reopening restores it. All-optional → built-in defaults when absent.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NotepadState {
+    #[serde(default)]
+    pub x: Option<f64>,
+    #[serde(default)]
+    pub y: Option<f64>,
+    #[serde(default)]
+    pub width: Option<f64>,
+    #[serde(default)]
+    pub height: Option<f64>,
+}
+
 /// On-disk layout. Keep additive to ease forward-compat.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ConfigFile {
@@ -432,6 +446,9 @@ pub struct ConfigFile {
     /// Remember the main window's last placement so relaunch restores it.
     #[serde(default)]
     pub window_state: WindowState,
+    /// Remember the notepad panel's last placement/size (logical px).
+    #[serde(default)]
+    pub notepad_state: NotepadState,
 }
 
 /// Portable export file (issue #46): sessions with everything in plaintext
@@ -1093,6 +1110,21 @@ impl ConfigStore {
 
     pub fn set_window_maximized(&mut self, maximized: bool) {
         self.cache.window_state.maximized = maximized;
+    }
+
+    /// Saved notepad panel placement `(x, y, width, height)` in logical px;
+    /// `None` fields mean "use the built-in default".
+    pub fn notepad_geometry(&self) -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>) {
+        let n = &self.cache.notepad_state;
+        (n.x, n.y, n.width, n.height)
+    }
+
+    pub fn set_notepad_geometry(&mut self, x: f64, y: f64, width: f64, height: f64) {
+        let n = &mut self.cache.notepad_state;
+        n.x = Some(x);
+        n.y = Some(y);
+        n.width = Some(width);
+        n.height = Some(height);
     }
 
     // ── Session groups / folders (#41) ────────────────────────────────────
