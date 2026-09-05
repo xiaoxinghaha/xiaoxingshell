@@ -771,6 +771,14 @@ export component TerminalView inherits Rectangle {
                         // Restore focus explicitly so the cursor keeps blinking.
                         ime-input.focus();
                         accept
+                    // ── Ctrl+F: open the find bar ────────────────────────────
+                    // Mirrors the context-menu Find item. \u{0006} is the C0
+                    // ACK code some platforms deliver instead of the letter.
+                    } else if (event.modifiers.control
+                            && (event.text == "f" || event.text == "F"
+                                || event.text == "\u{0006}")) {
+                        root.find-active = true;
+                        accept
                     // ── All other keys (printable, Ctrl+X, arrows, …) ────────
                     // Return `accept` for everything: `reject` bubbles without
                     // inserting the char into TextInput, so `edited` never fires

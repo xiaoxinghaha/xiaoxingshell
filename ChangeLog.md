@@ -1,5 +1,18 @@
 # ChangeLog
 
+## 2026-09-05
+
+### 修复右键菜单"查找"导致软件崩溃
+
+- 背景/现象/根因:
+  - 终端里右键菜单点击"查找"后软件直接崩溃,error.log 记录 panic:`RefCell already borrowed`(位于 Slint winit 后端 `winitwindowadapter.rs` 的 `handle_focus_change`)。
+  - 根因:Slint 默认启用的 AccessKit 无障碍集成中,焦点变更处理对适配器 `RefCell::borrow_mut()` 没有重入防护(上游同类问题 slint-ui/slint#6015,最新 master 仍未修)。右键菜单(PopupWindow)打开时点击"查找"会同时触发查找栏创建与焦点切换,与 popup 无障碍树的重建发生重入借用,直接 panic。
+- 改动/新增:
+  - 关闭 Slint 的 `accessibility`(AccessKit)特性(`default-features = false` 并显式保留 std / backend-default / renderer-femtovg / renderer-software / compat-1-2),panic 路径在编译期整体移除。仅影响屏幕阅读器支持,任务栏图标、文件拖放、窗口拖拽调整等已用功能不受影响。
+  - 顺带新增:终端中按 Ctrl+F 直接打开查找框(与右键菜单"查找"等效);Ctrl+F 不再转发到远端(shell 默认键位无影响,`less`/`vim` 中 Ctrl+F 翻页会改为弹出查找框)。
+- 涉及文件:
+  - `Cargo.toml`、`ui/terminal_view.slint`
+
 ## 2026-08-06
 
 ### 修复 tmux 共享会话点阵填充区出现 `�` 乱码（UTF-8 多字节字符跨 SSH 数据块被拆散）
