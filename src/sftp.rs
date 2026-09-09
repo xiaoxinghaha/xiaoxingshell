@@ -1407,73 +1407,137 @@ async fn run_sftp(
                 program,
             } => {
                 // Sanitize the remote-controlled name before it becomes a local
-                // file path that we later hand to the OS "open" call.
-                let filename = temp_edit_filename(&session, &remote, edit);
-                let tmp_dir = std::env::temp_dir().join("xiaoxingshell");
-                let _ = tokio::fs::create_dir_all(&tmp_dir).await;
-                let local = tmp_dir.join(&filename);
+                // file path that we later hand to the OS "open" call. The path
+                // embeds the connection identity and the remote directory, so
+                // same-named files never share a temp copy (their watchers
+                // previously cross-uploaded into each other).
+                let filename = sanitize_filename(&base_name(&remote));
+                let rel = if edit {
+                    temp_edit_relpath(&session, &remote, None)
+                } else {
+                    temp_open_relpath(&session, &remote)
+                };
+                let local = std::env::temp_dir().join("xiaoxingshell").join(&rel);
+                if let Some(parent) = local.parent() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
                 let local_str = local.to_string_lossy().to_string();
-                let _ = events.send(SessionEvent::SftpStatus(format!(
-                    "{} {}...",
-                    t("打开", "Opening"),
-                    filename
-                )));
-                let xid = Uuid::new_v4().to_string();
-                match download_impl(
-                    &sftp,
-                    &ui_tab_id,
-                    &remote,
-                    &local_str,
-                    &filename,
-                    &xid,
-                    &events,
-                    &cancelled_transfers,
-                )
-                .await
-                {
-                    Ok(_) => {
+
+                // Edit-mode dedup (process-wide, so it also covers two tabs on
+                // the same server): one remote target = one local copy + one
+                // upload watcher. View mode (edit=false) re-downloads every
+                // time, which is the expected "show me the latest" semantics.
+                let key = edit.then(|| edit_key(&session, &remote, None));
+                let slot = match key.as_deref() {
+                    Some(k) => claim_edit_slot(k, &local_str),
+                    None => EditSlot::Bypass,
+                };
+                match slot {
+                    EditSlot::Downloading => {
+                        let _ = events.send(SessionEvent::SftpStatus(format!(
+                            "{}: {}",
+                            t("正在下载，请稍候", "Download in progress, try again shortly"),
+                            filename
+                        )));
+                    }
+                    EditSlot::Reuse(existing_local) => {
+                        // Already being edited: do NOT re-download (that would
+                        // clobber unsaved on-disk edits) and do NOT spawn a
+                        // second watcher (double uploads). Just bring the
+                        // editor window back up. On launch failure the key
+                        // stays: the original watcher is still alive, and
+                        // removing it would let the next double-click
+                        // re-download over unsaved edits.
                         let launch = match program.as_deref() {
-                            Some(p) => open_with_program(p, &local_str).map(Some),
+                            Some(p) => open_with_program(p, &existing_local).map(Some),
                             None => {
-                                open_with_os(&local_str);
+                                open_with_os(&existing_local);
                                 Ok(None)
                             }
                         };
-                        match launch {
-                            Ok(child) => {
-                                let _ = events.send(SessionEvent::SftpStatus(format!(
-                                    "{}: {}",
-                                    if edit {
-                                        t("已打开编辑", "Opened for editing")
-                                    } else {
-                                        t("已打开", "Opened")
-                                    },
-                                    filename
-                                )));
-                                if edit {
-                                    spawn_edit_watcher(
-                                        self_tx.clone(),
-                                        local_str,
-                                        remote.clone(),
-                                        filename,
-                                        events.clone(),
-                                        child,
-                                    );
+                        let _ = events.send(SessionEvent::SftpStatus(match launch {
+                            Ok(_) => format!(
+                                "{}: {}",
+                                t("已在编辑中，已重新打开", "Already being edited; reopened"),
+                                filename
+                            ),
+                            Err(e) => format!("{}: {e}", t("打开失败", "Open failed")),
+                        }));
+                    }
+                    EditSlot::Claimed | EditSlot::Bypass => {
+                        let _ = events.send(SessionEvent::SftpStatus(format!(
+                            "{} {}...",
+                            t("打开", "Opening"),
+                            filename
+                        )));
+                        let xid = Uuid::new_v4().to_string();
+                        match download_impl(
+                            &sftp,
+                            &ui_tab_id,
+                            &remote,
+                            &local_str,
+                            &filename,
+                            &xid,
+                            &events,
+                            &cancelled_transfers,
+                        )
+                        .await
+                        {
+                            Ok(_) => {
+                                let launch = match program.as_deref() {
+                                    Some(p) => open_with_program(p, &local_str).map(Some),
+                                    None => {
+                                        open_with_os(&local_str);
+                                        Ok(None)
+                                    }
+                                };
+                                match launch {
+                                    Ok(child) => {
+                                        if let Some(k) = key.as_deref() {
+                                            mark_edit_ready(k);
+                                        }
+                                        let _ = events.send(SessionEvent::SftpStatus(format!(
+                                            "{}: {}",
+                                            if edit {
+                                                t("已打开编辑", "Opened for editing")
+                                            } else {
+                                                t("已打开", "Opened")
+                                            },
+                                            filename
+                                        )));
+                                        if edit {
+                                            spawn_edit_watcher(
+                                                self_tx.clone(),
+                                                local_str,
+                                                remote.clone(),
+                                                filename,
+                                                key.unwrap_or_default(),
+                                                events.clone(),
+                                                child,
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        if let Some(k) = key.as_deref() {
+                                            remove_active_edit(k);
+                                        }
+                                        let _ = events.send(SessionEvent::SftpStatus(format!(
+                                            "{}: {e}",
+                                            t("打开失败", "Open failed")
+                                        )));
+                                    }
                                 }
                             }
                             Err(e) => {
+                                if let Some(k) = key.as_deref() {
+                                    remove_active_edit(k);
+                                }
                                 let _ = events.send(SessionEvent::SftpStatus(format!(
                                     "{}: {e}",
                                     t("打开失败", "Open failed")
                                 )));
                             }
                         }
-                    }
-                    Err(e) => {
-                        let _ = events.send(SessionEvent::SftpStatus(format!(
-                            "{}: {e}",
-                            t("打开失败", "Open failed")
-                        )));
                     }
                 }
             }
@@ -1484,65 +1548,127 @@ async fn run_sftp(
                 target_user,
                 password,
             } => {
-                let filename = temp_edit_filename(&session, &remote, edit);
-                let tmp_dir = std::env::temp_dir().join("xiaoxingshell");
-                let _ = tokio::fs::create_dir_all(&tmp_dir).await;
-                let local = tmp_dir.join(&filename);
+                // Same isolation as OpenTemp, but the sudo identity is part of
+                // both the temp path and the dedup key: a sudo edit uploads
+                // through a different channel (`sudo tee`) than a normal edit,
+                // so the two must never share a local copy or a watcher.
+                let filename = sanitize_filename(&base_name(&remote));
+                let rel = if edit {
+                    temp_edit_relpath(&session, &remote, Some(&target_user))
+                } else {
+                    temp_open_relpath(&session, &remote)
+                };
+                let local = std::env::temp_dir().join("xiaoxingshell").join(&rel);
+                if let Some(parent) = local.parent() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
                 let local_str = local.to_string_lossy().to_string();
-                let _ = events.send(SessionEvent::SftpStatus(format!(
-                    "{} {}...",
-                    t("root 打开", "Root opening"),
-                    filename
-                )));
-                match sudo_read_file_to_local(&handle, &remote, &local_str, &target_user, &password)
-                    .await
-                {
-                    Ok(owner_spec) => {
+
+                let key = edit.then(|| edit_key(&session, &remote, Some(&target_user)));
+                let slot = match key.as_deref() {
+                    Some(k) => claim_edit_slot(k, &local_str),
+                    None => EditSlot::Bypass,
+                };
+                match slot {
+                    EditSlot::Downloading => {
+                        let _ = events.send(SessionEvent::SftpStatus(format!(
+                            "{}: {}",
+                            t("正在下载，请稍候", "Download in progress, try again shortly"),
+                            filename
+                        )));
+                    }
+                    EditSlot::Reuse(existing_local) => {
+                        // Same reuse semantics as OpenTemp: keep the local
+                        // copy, keep the single watcher, just re-launch.
                         let launch = match program.as_deref() {
-                            Some(p) => open_with_program(p, &local_str).map(Some),
+                            Some(p) => open_with_program(p, &existing_local).map(Some),
                             None => {
-                                open_with_os(&local_str);
+                                open_with_os(&existing_local);
                                 Ok(None)
                             }
                         };
-                        match launch {
-                            Ok(child) => {
-                                let _ = events.send(SessionEvent::SftpStatus(format!(
-                                    "{}: {}",
-                                    if edit {
-                                        t("已打开 root 编辑", "Opened for root editing")
-                                    } else {
-                                        t("已打开", "Opened")
-                                    },
-                                    filename
-                                )));
-                                if edit {
-                                    spawn_sudo_edit_watcher(
-                                        self_tx.clone(),
-                                        local_str,
-                                        remote.clone(),
-                                        filename,
-                                        target_user,
-                                        owner_spec,
-                                        password,
-                                        events.clone(),
-                                        child,
-                                    );
+                        let _ = events.send(SessionEvent::SftpStatus(match launch {
+                            Ok(_) => format!(
+                                "{}: {}",
+                                t("已在编辑中，已重新打开", "Already being edited; reopened"),
+                                filename
+                            ),
+                            Err(e) => format!("{}: {e}", t("打开失败", "Open failed")),
+                        }));
+                    }
+                    EditSlot::Claimed | EditSlot::Bypass => {
+                        let _ = events.send(SessionEvent::SftpStatus(format!(
+                            "{} {}...",
+                            t("root 打开", "Root opening"),
+                            filename
+                        )));
+                        match sudo_read_file_to_local(
+                            &handle,
+                            &remote,
+                            &local_str,
+                            &target_user,
+                            &password,
+                        )
+                        .await
+                        {
+                            Ok(owner_spec) => {
+                                let launch = match program.as_deref() {
+                                    Some(p) => open_with_program(p, &local_str).map(Some),
+                                    None => {
+                                        open_with_os(&local_str);
+                                        Ok(None)
+                                    }
+                                };
+                                match launch {
+                                    Ok(child) => {
+                                        if let Some(k) = key.as_deref() {
+                                            mark_edit_ready(k);
+                                        }
+                                        let _ = events.send(SessionEvent::SftpStatus(format!(
+                                            "{}: {}",
+                                            if edit {
+                                                t("已打开 root 编辑", "Opened for root editing")
+                                            } else {
+                                                t("已打开", "Opened")
+                                            },
+                                            filename
+                                        )));
+                                        if edit {
+                                            spawn_sudo_edit_watcher(
+                                                self_tx.clone(),
+                                                local_str,
+                                                remote.clone(),
+                                                filename,
+                                                key.unwrap_or_default(),
+                                                target_user,
+                                                owner_spec,
+                                                password,
+                                                events.clone(),
+                                                child,
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        if let Some(k) = key.as_deref() {
+                                            remove_active_edit(k);
+                                        }
+                                        let _ = events.send(SessionEvent::SftpStatus(format!(
+                                            "{}: {e}",
+                                            t("打开失败", "Open failed")
+                                        )));
+                                    }
                                 }
                             }
                             Err(e) => {
+                                if let Some(k) = key.as_deref() {
+                                    remove_active_edit(k);
+                                }
                                 let _ = events.send(SessionEvent::SftpStatus(format!(
                                     "{}: {e}",
                                     t("打开失败", "Open failed")
                                 )));
                             }
                         }
-                    }
-                    Err(e) => {
-                        let _ = events.send(SessionEvent::SftpStatus(format!(
-                            "{}: {e}",
-                            t("打开失败", "Open failed")
-                        )));
                     }
                 }
             }
@@ -1892,17 +2018,153 @@ fn sanitize_filename(name: &str) -> String {
     }
 }
 
-fn temp_edit_filename(session: &Session, remote: &str, edit: bool) -> String {
-    let filename = sanitize_filename(&base_name(remote));
-    if !edit {
-        return filename;
-    }
-    let prefix = if session.name.trim().is_empty() {
-        format!("{}_{}", session.host.trim(), session.port)
+/// Connection identity for temp-file isolation. `session.name` is free-form
+/// user text and can be identical for two different servers, so it cannot be
+/// the uniqueness key; host+port+user is what actually identifies a remote
+/// account.
+fn conn_key(session: &Session) -> String {
+    let raw = format!(
+        "{}_{}_{}",
+        session.host.trim(),
+        session.port,
+        session.user.trim()
+    );
+    let key = sanitize_filename(&raw);
+    if key.is_empty() {
+        "conn".to_string()
     } else {
-        session.name.trim().to_string()
+        key
+    }
+}
+
+/// FNV-1a 64-bit, rendered as 16 lowercase hex chars. Written by hand to
+/// avoid a new dependency; remote paths can be arbitrarily deep, and hashing
+/// them keeps the local path well under the Windows 260-char limit.
+fn fnv1a_hex(s: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Edit-mode temp path (relative to the xiaoxingshell temp dir):
+/// `edit/{conn}[~sudo-{user}]/{dir_hash}/{filename}`. Every remote target —
+/// connection, sudo identity, directory — is part of the path, so two
+/// same-named files can never share a local copy (which previously made
+/// their watchers cross-upload into each other).
+fn temp_edit_relpath(session: &Session, remote: &str, sudo_user: Option<&str>) -> String {
+    let mut conn = conn_key(session);
+    if let Some(user) = sudo_user {
+        conn = format!("{conn}~sudo-{}", sanitize_filename(user));
+    }
+    format!(
+        "edit/{}/{}/{}",
+        conn,
+        fnv1a_hex(&parent_dir(remote)),
+        sanitize_filename(&base_name(remote))
+    )
+}
+
+/// View-mode (no re-upload) temp path: `open/{conn}/{dir_hash}/{filename}`.
+/// Isolated from `edit/` so opening a file for viewing can never clobber an
+/// editable copy, and same-named files from different dirs stay separate.
+fn temp_open_relpath(session: &Session, remote: &str) -> String {
+    format!(
+        "open/{}/{}/{}",
+        conn_key(session),
+        fnv1a_hex(&parent_dir(remote)),
+        sanitize_filename(&base_name(remote))
+    )
+}
+
+/// Dedup key for the ACTIVE_EDITS registry: connection + sudo identity +
+/// full remote path. One key = one local copy + one upload watcher.
+fn edit_key(session: &Session, remote: &str, sudo_user: Option<&str>) -> String {
+    match sudo_user {
+        Some(user) => format!("{}|sudo:{}|{}", conn_key(session), user, remote),
+        None => format!("{}||{}", conn_key(session), remote),
+    }
+}
+
+/// State of an in-flight external edit, process-wide.
+struct EditState {
+    local: String,
+    /// Set once the download finished; before that, another open request for
+    /// the same target is told to wait instead of racing the download.
+    ready: bool,
+}
+
+static ACTIVE_EDITS: std::sync::OnceLock<Mutex<HashMap<String, EditState>>> =
+    std::sync::OnceLock::new();
+
+fn active_edits() -> &'static Mutex<HashMap<String, EditState>> {
+    ACTIVE_EDITS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn remove_active_edit(key: &str) {
+    if let Ok(mut map) = active_edits().lock() {
+        map.remove(key);
+    }
+}
+
+/// Outcome of trying to claim an edit slot in ACTIVE_EDITS.
+enum EditSlot {
+    /// Another request is still downloading this target; the caller must not
+    /// start a second download over the same local file.
+    Downloading,
+    /// The target is already being edited; re-launch the editor on the
+    /// existing local copy instead of downloading again.
+    Reuse(String),
+    /// We claimed the slot; download, mark ready (or remove on failure), and
+    /// spawn the watcher.
+    Claimed,
+    /// No registry involvement (view mode, or the registry is unavailable).
+    Bypass,
+}
+
+fn claim_edit_slot(key: &str, local: &str) -> EditSlot {
+    let Ok(mut map) = active_edits().lock() else {
+        // Registry unavailable (poisoned): degrade to the plain download
+        // path rather than blocking the edit.
+        return EditSlot::Bypass;
     };
-    format!("{}_{}", sanitize_filename(&prefix), filename)
+    match map.get_mut(key) {
+        Some(state) if state.ready => EditSlot::Reuse(state.local.clone()),
+        Some(_) => EditSlot::Downloading,
+        None => {
+            map.insert(
+                key.to_string(),
+                EditState {
+                    local: local.to_string(),
+                    ready: false,
+                },
+            );
+            EditSlot::Claimed
+        }
+    }
+}
+
+fn mark_edit_ready(key: &str) {
+    if let Ok(mut map) = active_edits().lock() {
+        if let Some(state) = map.get_mut(key) {
+            state.ready = true;
+        }
+    }
+}
+
+/// Removes the edit from ACTIVE_EDITS when the watcher task exits, on every
+/// exit path (channel closed, editor exit, 40-min timeout). A Drop guard
+/// instead of manual calls before each `break` so no path can forget it.
+struct ActiveEditGuard {
+    key: String,
+}
+
+impl Drop for ActiveEditGuard {
+    fn drop(&mut self) {
+        remove_active_edit(&self.key);
+    }
 }
 
 /// Watch a downloaded temp file and re-upload it to the remote whenever it
@@ -1928,10 +2190,13 @@ fn spawn_edit_watcher(
     local: String,
     remote: String,
     filename: String,
+    edit_key: String,
     events: UnboundedSender<SessionEvent>,
     child: Option<std::process::Child>,
 ) {
     tokio::spawn(async move {
+        // Removes this edit from ACTIVE_EDITS on every exit path below.
+        let _guard = ActiveEditGuard { key: edit_key };
         use std::time::{Duration, Instant};
 
         let mut last = local_mtime(local.clone()).await;
@@ -2010,6 +2275,7 @@ fn spawn_sudo_edit_watcher(
     local: String,
     remote: String,
     filename: String,
+    edit_key: String,
     target_user: String,
     owner_spec: String,
     password: String,
@@ -2017,6 +2283,8 @@ fn spawn_sudo_edit_watcher(
     child: Option<std::process::Child>,
 ) {
     tokio::spawn(async move {
+        // Removes this edit from ACTIVE_EDITS on every exit path below.
+        let _guard = ActiveEditGuard { key: edit_key };
         use std::time::{Duration, Instant};
 
         let mut last = local_mtime(local.clone()).await;
@@ -3232,8 +3500,13 @@ const _: fn() = || {
 
 #[cfg(test)]
 mod sanitize_tests {
-    use super::{remote_zip_error_message, sanitize_filename, shell_quote, temp_edit_filename};
+    use super::{
+        claim_edit_slot, edit_key, fnv1a_hex, mark_edit_ready, parent_dir, remote_zip_error_message,
+        remove_active_edit, sanitize_filename, shell_quote, temp_edit_relpath, temp_open_relpath,
+        ActiveEditGuard, EditSlot,
+    };
     use crate::config::Session;
+    use uuid::Uuid;
 
     #[test]
     fn plain_names_pass_through() {
@@ -3291,29 +3564,131 @@ mod sanitize_tests {
     }
 
     #[test]
-    fn edit_temp_filename_is_prefixed_by_session_label() {
-        let mut session = Session::new_empty();
-        session.name = "ss1".into();
-        session.host = "10.0.0.1".into();
-        assert_eq!(
-            temp_edit_filename(&session, "/root/aaa.py", true),
-            "ss1_aaa.py"
-        );
-        assert_eq!(
-            temp_edit_filename(&session, "/root/aaa.py", false),
-            "aaa.py"
+    fn edit_temp_relpath_isolates_same_named_files_in_different_dirs() {
+        // 同一连接、不同目录的同名文件：本地副本必须分开（否则两个
+        // watcher 会互相把对方的内容上传到错的远端文件）。
+        let session = Session::new_empty();
+        let a = temp_edit_relpath(&session, "/tmp/a/config.yml", None);
+        let b = temp_edit_relpath(&session, "/tmp/b/config.yml", None);
+        assert_ne!(a, b);
+        assert!(a.starts_with("edit/"));
+        assert!(a.ends_with("/config.yml"));
+        assert!(b.ends_with("/config.yml"));
+    }
+
+    #[test]
+    fn edit_temp_relpath_isolates_different_servers_with_same_label() {
+        // 连接名是自由文本、可重复，不能作为唯一键；不同服务器即使
+        // 连接名相同也必须隔离。
+        let mut s1 = Session::new_empty();
+        s1.name = "prod".into();
+        s1.host = "10.0.0.1".into();
+        let mut s2 = Session::new_empty();
+        s2.name = "prod".into();
+        s2.host = "10.0.0.2".into();
+        assert_ne!(
+            temp_edit_relpath(&s1, "/etc/app.conf", None),
+            temp_edit_relpath(&s2, "/etc/app.conf", None)
         );
     }
 
     #[test]
-    fn edit_temp_filename_falls_back_to_host_port() {
+    fn edit_temp_relpath_is_stable_for_same_target() {
+        // 去重的前提：同一目标生成的路径必须稳定，且前缀来自
+        // host_port_user 而非 session.name。
         let mut session = Session::new_empty();
         session.host = "10.0.0.8".into();
         session.port = 2222;
         assert_eq!(
-            temp_edit_filename(&session, "/tmp/aaa.py", true),
-            "10.0.0.8_2222_aaa.py"
+            temp_edit_relpath(&session, "/tmp/aaa.py", None),
+            temp_edit_relpath(&session, "/tmp/aaa.py", None)
         );
+        assert!(temp_edit_relpath(&session, "/tmp/aaa.py", None)
+            .starts_with("edit/10.0.0.8_2222_root/"));
+    }
+
+    #[test]
+    fn sudo_edit_temp_relpath_is_separate_from_normal() {
+        // sudo 编辑走 `sudo tee` 上传通道，与普通编辑必须互相隔离。
+        let mut session = Session::new_empty();
+        session.host = "10.0.0.1".into();
+        assert_ne!(
+            temp_edit_relpath(&session, "/etc/shadow", None),
+            temp_edit_relpath(&session, "/etc/shadow", Some("root"))
+        );
+        assert!(temp_edit_relpath(&session, "/etc/shadow", Some("root"))
+            .starts_with("edit/10.0.0.1_22_root~sudo-root/"));
+    }
+
+    #[test]
+    fn open_relpath_lives_under_open_and_differs_from_edit() {
+        let mut session = Session::new_empty();
+        session.host = "10.0.0.1".into();
+        let open = temp_open_relpath(&session, "/var/log/app.log");
+        let edit = temp_edit_relpath(&session, "/var/log/app.log", None);
+        assert!(open.starts_with("open/"));
+        assert!(edit.starts_with("edit/"));
+        assert_ne!(open, edit);
+    }
+
+    #[test]
+    fn edit_key_distinguishes_conn_sudo_and_path() {
+        let mut s = Session::new_empty();
+        s.host = "h1".into();
+        assert_eq!(edit_key(&s, "/a", None), edit_key(&s, "/a", None));
+        assert_ne!(edit_key(&s, "/a", None), edit_key(&s, "/b", None));
+        assert_ne!(edit_key(&s, "/a", None), edit_key(&s, "/a", Some("root")));
+        let mut other = Session::new_empty();
+        other.host = "h2".into();
+        assert_ne!(edit_key(&s, "/a", None), edit_key(&other, "/a", None));
+    }
+
+    #[test]
+    fn fnv1a_hex_known_vectors() {
+        // FNV-1a 64 标准测试向量（draft-eastlake-fnv）。
+        assert_eq!(fnv1a_hex(""), "cbf29ce484222325");
+        assert_eq!(fnv1a_hex("a"), "af63dc4c8601ec8c");
+        assert_eq!(fnv1a_hex("foobar"), "85944171f73967e8");
+    }
+
+    #[test]
+    fn parent_dir_variants() {
+        // 既有 parent_dir（POSIX 语义）：顶层文件的父目录统一为根 "/"。
+        assert_eq!(parent_dir("/a/b/c.txt"), "/a/b");
+        assert_eq!(parent_dir("c.txt"), "/");
+        assert_eq!(parent_dir("/x"), "/");
+        assert_eq!(parent_dir("/x/"), "/");
+        assert_eq!(parent_dir("/x/y"), "/x");
+    }
+
+    #[test]
+    fn edit_slot_claim_reuse_and_cleanup() {
+        // 用随机 key 隔离全局 ACTIVE_EDITS，避免与并行测试互相干扰。
+        let key = format!("test-edit-slot-{}", Uuid::new_v4());
+        assert!(matches!(
+            claim_edit_slot(&key, "/tmp/one"),
+            EditSlot::Claimed
+        ));
+        // 首次请求还在下载中：第二次请求不得再下载。
+        assert!(matches!(
+            claim_edit_slot(&key, "/tmp/one"),
+            EditSlot::Downloading
+        ));
+        // 下载完成：重复双击 → 复用首次登记的本地副本。
+        mark_edit_ready(&key);
+        match claim_edit_slot(&key, "/tmp/one") {
+            EditSlot::Reuse(local) => assert_eq!(local, "/tmp/one"),
+            _ => panic!("expected Reuse"),
+        }
+        // watcher 的 Drop guard 清理后，可再次占用（跨 tab 自愈的前提）。
+        {
+            let _guard = ActiveEditGuard { key: key.clone() };
+        }
+        assert!(matches!(
+            claim_edit_slot(&key, "/tmp/one"),
+            EditSlot::Claimed
+        ));
+        remove_active_edit(&key);
     }
 
     #[test]
