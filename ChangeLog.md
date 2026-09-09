@@ -2,6 +2,25 @@
 
 ## 2026-09-09
 
+### 修复 yes 刷屏时 UI 完全冻结、Ctrl+C 仍需数秒停止（二次修复）
+
+### 背景/现象/根因
+- 上一轮追帧修复后，纯 `yes`（ASCII）回车卡几秒才出现输出且 UI 完全无法拖动，Ctrl+C 也卡几秒；`yes "世界,你好"`（中文）UI 勉强可拖动但 Ctrl+C 仍慢。
+- 根因：换行密集的 ASCII 输出（`y\r\n` 每行仅 3 字节）让"行数"成为真实成本单位——256KiB 追帧 = 13 万行 ÷ 每批 12 行 = 1.09 万批，每批 `ingest_chunk` 做全屏快照（build_row × 24 行逐格分配）+ `detect_scroll` diff + history push（约 150~250µs），单 tick 耗时 1.6~3 秒且全部在 Slint UI 线程：窗口无法拖动、`on_key`（同线程）排队导致 Ctrl+C 发不出去、渲染冻结。中文行 14 字节/行仅 1.87 万行（约 300ms/tick），故"中文反而没那么卡"，与观察完全吻合。
+
+### 改动/新增
+- `ingest()` 新增纯文本洪流快捷路径：无任何转义序列（ESC）且换行数 > 2×rows 时，旧屏幕快照先按时间序 push 进 history，洪流中除最后一屏外的行直接构造 `Line` push（受 `max_history_lines` 约束，13 万行洪流只构造约 1 万个 Line，避免无效分配），随后重置 parser 干净网格，最后一屏 + 无换行尾巴走原 vt100 路径（屏幕/光标/prompt 状态正确，无重复 push）。
+- 新增 `plain_line_to_line` 辅助：构造与 `build_row` 同构的默认颜色行——CJK 字符独立 2-cell span + `WIDE_CONT_PLACEHOLDER` 对齐、连续窄字符合并 span、空行无 span，保证滚动回看/选择/查找/reflow 行为一致。
+- `flush_pending_output` 追帧加 ESC 感知回落：积压含 `\x1b` 时回落为 `max_ingest_per_tick`（带色日志/全屏程序维持旧版节奏，不恶化），无 ESC 时维持 256KiB 全额追帧。
+
+### 修复/效果
+- `yes`（ASCII/中文）单 tick 处理耗时从 1.6~3 秒降至 <10ms（扫描 + 1 万行构造）；Ctrl+C 后 <100ms 屏幕静止；窗口拖动流畅；UI 线程不再冻结、按键即时送达。全量 119 个单测通过（新增洪流快捷路径/历史上限/软换行/CJK span/空行/CRLF/prev 时序/ESC 回退/短文本原路径/13 万行性能冒烟等 10 项测试）。
+
+### 涉及文件
+- `src/app.rs`
+
+## 2026-09-09
+
 ### 修复 yes 刷屏按 Ctrl+C 需 4 秒才停止及末行乱码 `你好�^C`
 
 ### 背景/现象/根因

@@ -8217,6 +8217,71 @@ fn build_row(screen: &vt100::Screen, r: u16, cols: u16) -> Line {
     }
 }
 
+/// Build a default-coloured [`Line`] from one plain-text line that contains no
+/// escape sequences — the fast-path sibling of [`build_row`] used by the
+/// plain-text flood shortcut in `ingest` (`yes`, plain `cat` of a big file).
+///
+/// The output is structurally identical to what `build_row` produces for
+/// default-attribute content, so scrollback rendering, selection, find and
+/// reflow all behave the same as for vt100-parsed lines:
+///  - each CJK glyph becomes its own 2-cell span, with a
+///    WIDE_CONT_PLACEHOLDER appended to the plain text so a char index still
+///    equals a grid column;
+///  - runs of narrow chars merge into one span (cells = char count);
+///  - blank-only runs produce no spans (like build_row skips them).
+fn plain_line_to_line(text: &str) -> Line {
+    let mut plain = String::with_capacity(text.len());
+    let mut spans: Vec<HistSpan> = Vec::new();
+    let mut narrow_run = String::new();
+    let mut run_col: i32 = 0;
+    let mut col: i32 = 0;
+    let flush_narrow =
+        |spans: &mut Vec<HistSpan>, run: &mut String, run_col: &mut i32, col: i32| {
+            let blank = run.chars().all(|ch| ch == ' ');
+            if !run.is_empty() && !blank {
+                spans.push(HistSpan {
+                    text: std::mem::take(run),
+                    fg: vt100::Color::Default,
+                    bg: vt100::Color::Default,
+                    bold: false,
+                    col: *run_col,
+                    cells: col - *run_col,
+                });
+            } else {
+                run.clear();
+            }
+            *run_col = col;
+        };
+    for ch in text.chars() {
+        if contains_cjk(&ch.to_string()) {
+            flush_narrow(&mut spans, &mut narrow_run, &mut run_col, col);
+            plain.push(ch);
+            plain.push(WIDE_CONT_PLACEHOLDER);
+            spans.push(HistSpan {
+                text: ch.to_string(),
+                fg: vt100::Color::Default,
+                bg: vt100::Color::Default,
+                bold: false,
+                col,
+                cells: 2,
+            });
+            col += 2;
+            // The next narrow run starts after this glyph's two cells.
+            run_col = col;
+        } else {
+            plain.push(ch);
+            narrow_run.push(ch);
+            col += 1;
+        }
+    }
+    flush_narrow(&mut spans, &mut narrow_run, &mut run_col, col);
+    Line {
+        text: plain,
+        spans,
+        wrapped: false,
+    }
+}
+
 /// Detect how many lines scrolled off the top between two screen snapshots by
 /// finding the vertical shift `k` that best aligns `prev` onto `curr` (longest
 /// top-anchored run of equal plain-text lines).  `k` lines left the top.
@@ -9150,12 +9215,14 @@ impl TermBuffer {
     /// tick: if the UI fell behind, older bytes are dropped (skip frames) so a
     /// render tick never exceeds its budget.
     ///
-    /// Catch-up: when the backlog exceeds the per-tick budget, raise this
-    /// tick's ingest limit to the full cap below instead of replaying the
-    /// backlog at `budget / tick` speed — during a flood the backlog is capped
-    /// at 256 KiB, which the vt100 parser ingests in ~10–20 ms, so the screen
-    /// stays glued to the newest output (`^C` + prompt) without stalling the
-    /// UI thread.
+    /// Catch-up: when the escape-free backlog exceeds the per-tick budget,
+    /// raise this tick's ingest limit to the full cap below — the plain-text
+    /// flood fast path in `ingest` handles escape-free floods in <10 ms, so
+    /// the screen stays glued to the newest output (`^C` + prompt) without
+    /// stalling the UI thread. Backlog containing escape sequences does NOT
+    /// get the raise: those go through the per-batch vt100 + screen-diff path
+    /// (colour logs, full-screen programs), whose per-line cost would freeze
+    /// the UI for seconds at 256 KiB — they keep the old per-tick pacing.
     fn flush_pending_output(&mut self) {
         if self.pending_text.is_empty() {
             return;
@@ -9163,7 +9230,11 @@ impl TermBuffer {
         let mut text = std::mem::take(&mut self.pending_text);
         const MAX_CATCHUP_PER_TICK: usize = 256 * 1024;
         let cap = if text.len() > self.max_ingest_per_tick {
-            MAX_CATCHUP_PER_TICK.min(text.len())
+            if text.contains('\x1b') {
+                self.max_ingest_per_tick
+            } else {
+                MAX_CATCHUP_PER_TICK.min(text.len())
+            }
         } else {
             text.len()
         };
@@ -9178,11 +9249,29 @@ impl TermBuffer {
     }
 
     fn ingest(&mut self, raw: &[u8]) {
+        let rows = self.parser.screen().size().0 as usize;
+        // ── Plain-text flood fast path ─────────────────────────────────────
+        // `yes` / plain `cat` output is pure text + newlines, yet newline-
+        // dense ASCII (`y\n` = 2 bytes/line) turns a 256 KiB catch-up tick into
+        // 131072 lines ÷ (rows/2) batches ≈ 10k × (full-screen snapshot +
+        // detect_scroll) ≈ seconds of UI-thread work — the window froze and
+        // Ctrl+C couldn't even be delivered (the key handler runs on the same
+        // thread). For flood output with NO escape sequences we can skip vt100
+        // and the per-batch screen diff entirely: everything except the last
+        // screenful scrolls off anyway, so push those lines straight into
+        // history (bounded by max_history_lines) and let the vt100 handle only
+        // the tail.
+        if self.csi_state == CsiState::Normal
+            && !raw.contains(&0x1b)
+            && raw.iter().filter(|&&b| b == b'\n').count() > rows * 2
+        {
+            self.ingest_plain_flood(raw, rows);
+            return;
+        }
         // Rewrite HVP (`ESC [ … f`) → CUP (`ESC [ … H`) so vt100 (which only
         // implements `H`) honours btop/htop's absolute cursor positioning.
         let bytes = self.rewrite_hvp(raw);
         let bytes = &bytes[..];
-        let rows = self.parser.screen().size().0 as usize;
         // Batch at most half a screen of lines per ingest_chunk call. This is
         // NOT a performance knob: `detect_scroll` can only recover a shift of
         // up to rows-1 lines from a before/after screen diff, so a batch that
@@ -9206,6 +9295,97 @@ impl TermBuffer {
         }
         if start < bytes.len() {
             self.ingest_chunk(&bytes[start..]);
+        }
+    }
+
+    /// Fast path for escape-free scrolling floods (see `ingest`).  Pushes the
+    /// pre-flood screen snapshot and all but the last screenful of flood lines
+    /// directly into history, then runs the remaining tail through the normal
+    /// vt100 path so the live screen, cursor and prompt state stay correct.
+    fn ingest_plain_flood(&mut self, raw: &[u8], rows: usize) {
+        let cols = self.parser.screen().size().1;
+        // Line boundaries (start offsets); the final segment after the last
+        // \n is the unterminated tail that goes through vt100.
+        let mut line_starts: Vec<usize> = vec![0];
+        for (i, &b) in raw.iter().enumerate() {
+            if b == b'\n' && i + 1 < raw.len() {
+                line_starts.push(i + 1);
+            }
+        }
+
+        // The old screen snapshot's rows scroll off first (in time order).
+        let prev_lines = std::mem::take(&mut self.prev);
+        for line in prev_lines {
+            self.history.push(line);
+        }
+        // The pre-flood grid is now fully captured in history. Rebuild the
+        // parser so the vt100 tail renders the last screenful from a clean
+        // (0,0) grid: every line the tail batches later diff-push then comes
+        // from the flood itself, never a duplicate of the pre-flood screen
+        // rows already pushed above. Rebuilding is safe here because an
+        // escape-free flood can only happen on the primary screen (alt-screen
+        // programs redraw with escape sequences) — same pattern as the
+        // catch_unwind rebuild in ingest_chunk. Cursor/colour state loss is
+        // irrelevant for plain text.
+        self.parser = vt100::Parser::new(rows as u16, cols, 0);
+
+        // Keep only the last screenful for the vt100 path; everything before
+        // is history. Cap the history work at max_history_lines so a 130k-line
+        // flood with a 10k-line scrollback cap only ever allocates ~10k Lines.
+        // Base this on the TOTAL line count (line_starts includes the
+        // unterminated tail), not complete_lines, or the vt100 tail steals
+        // one extra line when the flood's last line has no trailing \n.
+        let vt100_first_line = line_starts.len().saturating_sub(rows);
+        let hist_capacity = self
+            .max_history_lines
+            .saturating_sub(self.history.len());
+        let push_from = vt100_first_line.saturating_sub(hist_capacity);
+
+        // wrapped marks: a row is a soft-wrap continuation when the previous
+        // row filled the grid width.
+        let mut prev_full = self
+            .history
+            .last()
+            .map(|l| line_is_full(l, cols))
+            .unwrap_or(false);
+        for li in push_from..vt100_first_line {
+            let start = line_starts[li];
+            let end = if li + 1 < line_starts.len() {
+                line_starts[li + 1] - 1 // drop the \n
+            } else {
+                raw.len()
+            };
+            let text = String::from_utf8_lossy(&raw[start..end]);
+            let text = text.trim_end_matches('\r');
+            let mut line = plain_line_to_line(text);
+            line.wrapped = prev_full;
+            prev_full = line_is_full(&line, cols);
+            self.history.push(line);
+        }
+        self.trim_history_to_limit();
+
+        // Remaining screenful + unterminated tail → normal vt100 path. `prev`
+        // was already pushed to history above, so the first ingest_chunk only
+        // rebuilds its snapshot (no double push).
+        if vt100_first_line < line_starts.len() {
+            let tail_start = line_starts[vt100_first_line];
+            let bytes = &raw[tail_start..];
+            let batch_lines = (rows / 2).max(1);
+            let mut start = 0usize;
+            let mut nl = 0usize;
+            for i in 0..bytes.len() {
+                if bytes[i] == b'\n' {
+                    nl += 1;
+                    if nl >= batch_lines {
+                        self.ingest_chunk(&bytes[start..=i]);
+                        start = i + 1;
+                        nl = 0;
+                    }
+                }
+            }
+            if start < bytes.len() {
+                self.ingest_chunk(&bytes[start..]);
+            }
         }
     }
 
@@ -10799,6 +10979,180 @@ mod selection_tests {
         assert!(buf.pending_text.is_char_boundary(buf.pending_text.len()));
         // All chars intact after any truncation.
         assert!(buf.pending_text.chars().all(|c| c == '你'));
+    }
+
+    #[test]
+    fn plain_flood_pushes_history_and_keeps_tail_on_screen() {
+        // 20 lines > 2×rows(5): fast path. History gets L0..L14 (all but the
+        // last screenful), the vt100 renders L15..L19 on screen. PTY output
+        // goes through ONLCR, so lines end with \r\n; the flood deliberately
+        // has NO trailing newline (chunk boundaries are random).
+        let mut buf = make_buf(5, 20, &[], &[], 0);
+        let flood: String =
+            (0..19).map(|i| format!("L{i}\r\n")).collect::<String>() + "L19";
+        buf.ingest(flood.as_bytes());
+        assert_eq!(buf.history.len(), 15);
+        assert_eq!(buf.history[0].text, "L0");
+        assert_eq!(buf.history[14].text, "L14");
+        let built = buf.render();
+        assert_eq!(buf.displayed_text, vec!["L15", "L16", "L17", "L18", "L19"]);
+        assert_eq!(built.rows_used, 5);
+    }
+
+    #[test]
+    fn plain_flood_respects_history_limit() {
+        // 50-line flood with a 20-line scrollback cap: only the newest 20 of
+        // the 45 history-bound lines are materialised.
+        let mut buf = make_buf(5, 20, &[], &[], 0);
+        buf.max_history_lines = 20;
+        let flood: String =
+            (0..49).map(|i| format!("L{i}\r\n")).collect::<String>() + "L49";
+        buf.ingest(flood.as_bytes());
+        assert_eq!(buf.history.len(), 20);
+        assert_eq!(buf.history[0].text, "L25");
+        assert_eq!(buf.history[19].text, "L44");
+        // Last screenful still rendered live.
+        buf.render();
+        assert_eq!(buf.displayed_text[0], "L45");
+    }
+
+    #[test]
+    fn plain_flood_marks_soft_wraps() {
+        // cols=10: the 10-char full line soft-wraps, so the NEXT line is a
+        // continuation; short lines don't.
+        let mut buf = make_buf(5, 10, &[], &[], 0);
+        let flood = "0123456789\r\nshort\r\n0123456789\r\nshort\r\n0123456789\r\nshort\r\n0123456789\r\nshort\r\n0123456789\r\nshort\r\n0123456789\r\nshort".to_string();
+        buf.ingest(flood.as_bytes());
+        let wrapped: Vec<bool> = buf.history.iter().map(|l| l.wrapped).collect();
+        // Pairs: full, continuation, full, continuation, …
+        assert_eq!(
+            wrapped,
+            vec![false, true, false, true, false, true, false]
+        );
+    }
+
+    #[test]
+    fn plain_flood_cjk_lines_build_same_structure_as_build_row() {
+        let mut buf = make_buf(5, 20, &[], &[], 0);
+        let flood = "a你b\r\n世界\r\n".repeat(10);
+        buf.ingest(flood.as_bytes());
+        // Spot-check the first CJK-mixed line: narrow run, then a 2-cell span
+        // per glyph, with WIDE_CONT_PLACEHOLDER keeping cell alignment.
+        let l0 = &buf.history[0];
+        assert_eq!(l0.text, "a你\u{FDD0}b");
+        let spans: Vec<(i32, i32, &str)> = l0
+            .spans
+            .iter()
+            .map(|s| (s.col, s.cells, s.text.as_str()))
+            .collect();
+        assert_eq!(spans, vec![(0, 1, "a"), (1, 2, "你"), (3, 1, "b")]);
+        let l1 = &buf.history[1];
+        assert_eq!(l1.text, "世\u{FDD0}界\u{FDD0}");
+        let spans: Vec<(i32, i32)> = l1.spans.iter().map(|s| (s.col, s.cells)).collect();
+        assert_eq!(spans, vec![(0, 2), (2, 2)]);
+    }
+
+    #[test]
+    fn plain_flood_handles_empty_lines_and_crlf() {
+        // `yes ""` — a flood of bare newlines must not panic (line boundaries
+        // include empty lines) and produces empty history rows.
+        let mut buf = make_buf(5, 20, &[], &[], 0);
+        buf.ingest(&b"\r\n".repeat(50));
+        assert_eq!(buf.history.len(), 45);
+        assert!(buf.history.iter().all(|l| l.text.is_empty()));
+
+        // CRLF lines: the \r is stripped from history text.
+        let mut buf = make_buf(5, 20, &[], &[], 0);
+        buf.ingest(&b"row\r\n".repeat(20));
+        assert!(buf.history.iter().all(|l| l.text == "row"));
+    }
+
+    #[test]
+    fn plain_flood_pushes_prev_screen_first() {
+        // The pre-flood screen snapshot scrolls off before the flood lines,
+        // so it must land in history ahead of them (time order).
+        let mut buf = make_buf(5, 20, &[], &["OLD0", "OLD1"], 0);
+        // Simulate a previous tick having snapshotted the screen.
+        buf.prev = {
+            let s = buf.parser.screen();
+            (0..5).map(|r| build_row(s, r, 20)).collect()
+        };
+        let flood: String =
+            (0..19).map(|i| format!("L{i}\r\n")).collect::<String>() + "L19";
+        buf.ingest(flood.as_bytes());
+        // prev rows first (5 rows incl. blanks), then the flood lines.
+        assert_eq!(buf.history.len(), 20);
+        assert_eq!(buf.history[0].text.trim_end(), "OLD0");
+        assert_eq!(buf.history[1].text.trim_end(), "OLD1");
+        assert_eq!(buf.history[5].text, "L0");
+        assert_eq!(buf.history[19].text, "L14");
+    }
+
+    #[test]
+    fn escape_flood_takes_vt100_path() {
+        // Output containing ESC never enters the fast path: the vt100 +
+        // detect_scroll pipeline still pushes the lines. Line texts are
+        // unique so detect_scroll can see the shift (identical lines make
+        // its diff return 0 — see ingest's batching comment).
+        let mut buf = make_buf(5, 20, &[], &[], 0);
+        let flood: String = (0..30)
+            .map(|i| format!("\x1b[31mred{i}\x1b[0m\r\n"))
+            .collect();
+        buf.ingest(flood.as_bytes());
+        assert!(buf.history.iter().any(|l| l.text.trim_end() == "red0"));
+        buf.render();
+        // Trailing newline scrolls once: screen ends [..., red29, ""].
+        assert_eq!(buf.displayed_text[3], "red29");
+    }
+
+    #[test]
+    fn short_text_still_takes_vt100_path() {
+        // ≤ 2×rows lines: normal batching path (fast path not triggered).
+        let mut buf = make_buf(5, 20, &[], &[], 0);
+        let text: String =
+            (0..9).map(|i| format!("L{i}\r\n")).collect::<String>() + "L9";
+        buf.ingest(text.as_bytes());
+        // Detect-scroll pushes scrolled-off lines (build_row pads to cols).
+        assert_eq!(buf.history.len(), 5);
+        assert_eq!(buf.history[0].text.trim_end(), "L0");
+        buf.render();
+        assert_eq!(buf.displayed_text[4], "L9");
+    }
+
+    #[test]
+    fn flush_catchup_backs_off_for_escape_backlog() {
+        // Escape-free backlog: catch-up ingests everything in one flush
+        // (fast path caps history at max_history_lines).
+        let mut plain = make_buf(5, 20, &[], &[], 0);
+        plain.push_pending_output(&"y\r\n".repeat(40000));
+        plain.flush_pending_output();
+        assert_eq!(plain.history.len(), 9_999);
+
+        // Backlog with escape sequences: catch-up falls back to the per-tick
+        // budget, so only the newest 32 KiB are ingested.
+        let mut esc = make_buf(5, 20, &[], &[], 0);
+        esc.push_pending_output(&"\x1b[31my\x1b[0m\r\n".repeat(12000));
+        esc.flush_pending_output();
+        assert!(esc.pending_text.is_empty());
+        assert!(esc.history.len() < 9_999);
+    }
+
+    #[test]
+    fn plain_flood_131k_lines_ingests_quickly() {
+        // A full 256 KiB catch-up tick of `y\r\n` (131k lines). The per-batch
+        // screen-diff path took seconds of UI-thread time on this input and
+        // froze the whole window; the fast path must stay far under a tick.
+        // Generous bound to stay robust on slow/loaded CI machines.
+        let mut buf = make_buf(24, 80, &[], &[], 0);
+        let flood = "y\r\n".repeat(131_000);
+        let t = std::time::Instant::now();
+        buf.ingest(flood.as_bytes());
+        let elapsed = t.elapsed();
+        assert_eq!(buf.history.len(), 9_999);
+        assert!(
+            elapsed.as_millis() < 500,
+            "fast path took {elapsed:?} for 131k lines"
+        );
     }
 
     #[test]
