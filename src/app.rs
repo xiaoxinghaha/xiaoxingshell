@@ -543,6 +543,10 @@ pub fn run() -> Result<()> {
     // Per-tab tmux state. While true, automatic SFTP following is disabled.
     let tmux_state: Arc<Mutex<HashMap<String, bool>>> = Arc::new(Mutex::new(HashMap::new()));
     let pending_ui_refresh: PendingUiRefresh = Arc::new(Mutex::new(Vec::new()));
+    // 输入侧 cd 跟随的兜底目标与退出 tmux 后的一次性跟随抑制(见 ConnectCtx 字段注释)。
+    let sftp_pending_follow: Arc<Mutex<HashMap<String, String>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let suppress_cwd_follow: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
     // Per-tab vt100 parsers + history logs (Arc<Mutex> so they can be cloned
     // into the thread that pumps session events into invoke_from_event_loop).
@@ -1053,6 +1057,8 @@ pub fn run() -> Result<()> {
         sftp_follow_cd.clone(),
         tmux_state.clone(),
         pending_ui_refresh.clone(),
+        sftp_pending_follow.clone(),
+        suppress_cwd_follow.clone(),
     );
 
     {
@@ -1723,6 +1729,8 @@ pub fn run() -> Result<()> {
         sftp_entry_cache.clone(),
         sftp_sort_states.clone(),
         sudo_states.clone(),
+        sftp_pending_follow.clone(),
+        suppress_cwd_follow.clone(),
     );
     wire_system_info_callbacks(
         &window,
@@ -1768,6 +1776,8 @@ pub fn run() -> Result<()> {
             sftp_auto_refresh_secs: store.borrow().sftp_auto_refresh_secs(),
             tmux_state: tmux_state.clone(),
             pending_ui_refresh: pending_ui_refresh.clone(),
+            sftp_pending_follow: sftp_pending_follow.clone(),
+            suppress_cwd_follow: suppress_cwd_follow.clone(),
         },
     );
 
@@ -2494,6 +2504,8 @@ fn wire_session_callbacks(
     sftp_follow_cd: Arc<std::sync::atomic::AtomicBool>,
     tmux_state: Arc<Mutex<HashMap<String, bool>>>,
     pending_ui_refresh: PendingUiRefresh,
+    sftp_pending_follow: Arc<Mutex<HashMap<String, String>>>,
+    suppress_cwd_follow: Arc<Mutex<HashSet<String>>>,
 ) {
     let group_options_model = |store: &ConfigStore| -> ModelRc<SharedString> {
         ModelRc::from(Rc::new(VecModel::from(
@@ -3071,6 +3083,8 @@ fn wire_session_callbacks(
         let local_net_hist = local_net_hist.clone();
         let sftp_follow_cd = sftp_follow_cd.clone();
         let tmux_state = tmux_state.clone();
+        let sftp_pending_follow = sftp_pending_follow.clone();
+        let suppress_cwd_follow = suppress_cwd_follow.clone();
         window.on_connect_session(move |id: SharedString| {
             let id = id.to_string();
             let session = match store.borrow().get(&id).cloned() {
@@ -3222,6 +3236,8 @@ fn wire_session_callbacks(
                 sftp_auto_refresh_secs: store.borrow().sftp_auto_refresh_secs(),
                 tmux_state: tmux_state.clone(),
                 pending_ui_refresh: pending_ui_refresh.clone(),
+                sftp_pending_follow: sftp_pending_follow.clone(),
+                suppress_cwd_follow: suppress_cwd_follow.clone(),
             };
             start_session_in_tab(&tab_id, session, &ctx);
         });
@@ -3260,6 +3276,11 @@ struct ConnectCtx {
     tmux_state: Arc<Mutex<HashMap<String, bool>>>,
     /// Tabs whose terminal display needs a rebuild on the next render tick.
     pending_ui_refresh: PendingUiRefresh,
+    /// 输入侧 cd 跟随的兜底目标(tab → 解析出的目标路径)。
+    /// CwdChanged 真值到达即抢占移除;1.2s 超时后仍存在则执行兜底 list_dir。
+    sftp_pending_follow: Arc<Mutex<HashMap<String, String>>>,
+    /// 退出 tmux 后抑制一次 CwdChanged 跟随(只同步基准,不跳转)。
+    suppress_cwd_follow: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Spawn the shell (+ SFTP) workers and their event-pump threads for an
@@ -3344,6 +3365,8 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
         let hidden_transfer_ids_pump = ctx.hidden_transfer_ids.clone();
         let tmux_state_pump = ctx.tmux_state.clone();
         let pending_refresh_pump = ctx.pending_ui_refresh.clone();
+        let sftp_pending_follow_pump = ctx.sftp_pending_follow.clone();
+        let suppress_cwd_follow_pump = ctx.suppress_cwd_follow.clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -3356,7 +3379,6 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
             let mut out_rx = out_rx;
             let mut out_closed = out_rx.is_none();
             let mut cwd_debounce: Option<tokio::task::JoinHandle<()>> = None;
-            let mut last_cwd_reported: Option<String> = None;
 
             // --- Output batching ---
             // High-volume `Output` events are aggregated here and posted to the
@@ -3497,53 +3519,34 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                     }
                 };
                         if let SessionEvent::CommandRan(ref cmd) = shell_evt {
-                            let is_cd = is_cd_command(cmd);
-                            // 用 resolve_cd_follow_target 解析 cd 命令得到目标路径，
-                            // 不依赖 OSC 7 cwd（可能在 tmux 下被截断）（#158）
-                            let in_tmux = tmux_state_pump
-                                .lock()
-                                .ok()
-                                .and_then(|ts| ts.get(tab_id_pump.as_str()).copied())
-                                .unwrap_or(false);
-                            if is_cd && !in_tmux {
-                                if let Some(cwd) = last_cwd_reported.clone() {
-                                    let home = statuses_pump
-                                        .lock()
-                                        .ok()
-                                        .and_then(|m| {
-                                            m.get(tab_id_pump.as_str())
-                                                .map(|st| st.sftp_home.clone())
-                                        })
-                                        .filter(|h| !h.trim().is_empty());
-                                    let resolved = resolve_cd_follow_target(
-                                        cmd.as_str(),
-                                        Some(&cwd),
-                                        home.as_deref(),
-                                    );
-                                    let target = resolved.unwrap_or(cwd);
-                                    if follow_cd_pump.load(std::sync::atomic::Ordering::Relaxed) {
-                                        if let Some(prev) = cwd_debounce.take() {
-                                            prev.abort();
-                                        }
-                                        let sftp_h = sftp_handles_pump.clone();
-                                        let tid = tab_id_pump.clone();
-                                        cwd_debounce = Some(rt_pump.spawn(async move {
-                                            tokio::time::sleep(std::time::Duration::from_millis(
-                                                500,
-                                            ))
-                                            .await;
-                                            if let Ok(handles) = sftp_h.lock() {
-                                                if let Some(h) = handles.get(&tid) {
-                                                    h.list_dir(target);
-                                                }
-                                            }
-                                        }));
+                            // OSC 697 捕获的是真实执行的命令(不依赖用户输入方式)，
+                            // 用它补强 tmux 进入/退出检测：history 上箭头调出的
+                            // `tmux` 不会经过按键追踪器，只在这里能看到 (#158)。
+                            if is_tmux_command(cmd.trim()) {
+                                if let Ok(mut ts) = tmux_state_pump.lock() {
+                                    ts.insert(tab_id_pump.clone(), true);
+                                }
+                            } else {
+                                let in_tmux = tmux_state_pump
+                                    .lock()
+                                    .ok()
+                                    .and_then(|ts| ts.get(tab_id_pump.as_str()).copied())
+                                    .unwrap_or(false);
+                                if in_tmux && is_tmux_exit_command(cmd.trim()) {
+                                    if let Ok(mut ts) = tmux_state_pump.lock() {
+                                        ts.insert(tab_id_pump.clone(), false);
+                                    }
+                                    if let Ok(mut set) = suppress_cwd_follow_pump.lock() {
+                                        set.insert(tab_id_pump.clone());
                                     }
                                 }
                             }
+                            // cd 命令本身不做任何调度：同一 shell hook 在 OSC 697
+                            // 之后紧跟着发 OSC 7($PWD 真值)，跟随由 CwdChanged
+                            // 分支执行。这里若再按命令文本解析路径，相对路径会基于
+                            // 可能过期的 cwd 拼出错误目标(/a/b/b 症状)。
                         }
                         if let SessionEvent::CwdChanged(ref cwd) = shell_evt {
-                            last_cwd_reported = Some(cwd.clone());
                             // Only re-enable local buffering when NOT in tmux.
                             // In tmux the echo behaviour breaks type-ahead.
                             let in_tmux = tmux_state_pump
@@ -3558,12 +3561,31 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                                     }
                                 }
                             }
+                            // 真值已到达：取消输入侧为该 tab 注册的兜底跟随，
+                            // 无论后续是否跳转(cd 失败时 PWD 不变，真值同样会
+                            // 到达并取消兜底，消除"cd 失败仍报无法访问")。
+                            let _ = take_pending_follow(
+                                &sftp_pending_follow_pump,
+                                tab_id_pump.as_str(),
+                            );
+                            // 退出 tmux 后的第一份真值：只同步基准、不跳转
+                            // (用户要求退出 tmux 环境不跟随)。
+                            let suppressed = suppress_cwd_follow_pump
+                                .lock()
+                                .map(|mut set| set.remove(tab_id_pump.as_str()))
+                                .unwrap_or(false);
                             // Swallow the event entirely when follow-cd is off:
                             // forwarding it would set sftp_loading without any
                             // ListDir to clear it (the #59 stuck-"loading" trap).
                             if in_tmux
                                 || !follow_cd_pump.load(std::sync::atomic::Ordering::Relaxed)
                             {
+                                continue;
+                            }
+                            if suppressed {
+                                if let Ok(mut m) = sftp_last_cwd_pump.lock() {
+                                    m.insert(tab_id_pump.clone(), cwd.clone());
+                                }
                                 continue;
                             }
                             // 目录真正变化时才跟随；prompt 重复报同一目录则跳过。
@@ -3603,7 +3625,16 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                             {
                                 if let Ok(mut ts) = tmux_state_pump.lock() {
                                     if let Some(state) = ts.get_mut(tab_id_pump.as_str()) {
-                                        *state = false;
+                                        if *state {
+                                            *state = false;
+                                            // 退出 tmux 后外层 shell 的第一份
+                                            // OSC 7 只同步基准,不触发跟随。
+                                            if let Ok(mut set) =
+                                                suppress_cwd_follow_pump.lock()
+                                            {
+                                                set.insert(tab_id_pump.clone());
+                                            }
+                                        }
                                     }
                                 }
                                 if let Ok(mut map) = bufs_thread.lock() {
@@ -3701,21 +3732,13 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
     }
 }
 
-fn schedule_sftp_follow_dir(
-    runtime: Arc<Runtime>,
-    sftp_handles: SftpHandles,
-    tab_id: String,
-    dir: String,
-    delay_ms: u64,
-) {
-    runtime.spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-        if let Ok(handles) = sftp_handles.lock() {
-            if let Some(h) = handles.get(&tab_id) {
-                h.list_dir(dir);
-            }
-        }
-    });
+/// 原子取出该 tab 的兜底跟随目标。CwdChanged 真值到达会先调用它抢占移除;
+/// 兜底任务到期时调用,拿到 `None` 即说明真值已处理过,放弃兜底。
+fn take_pending_follow(
+    pending: &Arc<Mutex<HashMap<String, String>>>,
+    tab_id: &str,
+) -> Option<String> {
+    pending.lock().ok().and_then(|mut m| m.remove(tab_id))
 }
 
 fn schedule_input_cd_follow(ctx: &ConnectCtx, tab_id: &str, dir: String) {
@@ -3725,16 +3748,27 @@ fn schedule_input_cd_follow(ctx: &ConnectCtx, tab_id: &str, dir: String) {
     {
         return;
     }
-    if let Ok(mut map) = ctx.sftp_last_cwd.lock() {
-        map.insert(tab_id.to_string(), dir.clone());
+    // 只注册兜底目标,不直接跳转、不预写 sftp_last_cwd:
+    // 有 OSC 7 钩子的 shell(bash/zsh)会由 CwdChanged 真值触发跟随并抢占
+    // 移除该目标;1.2s 后目标仍在,说明 shell 无钩子(fish/dash),才用
+    // 解析结果兜底(此时 cd 失败也会报错,与 shell 行为一致)。
+    if let Ok(mut map) = ctx.sftp_pending_follow.lock() {
+        map.insert(tab_id.to_string(), dir);
     }
-    schedule_sftp_follow_dir(
-        ctx.runtime.clone(),
-        ctx.sftp_handles.clone(),
-        tab_id.to_string(),
-        dir,
-        700,
-    );
+    let pending = ctx.sftp_pending_follow.clone();
+    let sftp_handles = ctx.sftp_handles.clone();
+    let tid = tab_id.to_string();
+    ctx.runtime.clone().spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        let Some(dir) = take_pending_follow(&pending, &tid) else {
+            return;
+        };
+        if let Ok(handles) = sftp_handles.lock() {
+            if let Some(h) = handles.get(&tid) {
+                h.list_dir(dir);
+            }
+        }
+    });
 }
 
 /// Map of tab-id → the SFTP panel's current path, read from the terminals
@@ -4956,6 +4990,8 @@ fn wire_tab_callbacks(
     sftp_entry_cache: SftpEntryCache,
     sftp_sort_states: SftpSortStates,
     sudo_states: SudoStates,
+    sftp_pending_follow: Arc<Mutex<HashMap<String, String>>>,
+    suppress_cwd_follow: Arc<Mutex<HashSet<String>>>,
 ) {
     // Selecting a tab is already applied inside the Slint callback; we just
     // need to keep the C++/Rust state in sync if needed.
@@ -5028,6 +5064,8 @@ fn wire_tab_callbacks(
         let sftp_entry_cache = sftp_entry_cache.clone();
         let sftp_sort_states = sftp_sort_states.clone();
         let sudo_states = sudo_states.clone();
+        let sftp_pending_follow = sftp_pending_follow.clone();
+        let suppress_cwd_follow = suppress_cwd_follow.clone();
         window.on_tab_closed(move |id: SharedString| {
             let id = id.to_string();
             if id == "welcome" {
@@ -5073,6 +5111,8 @@ fn wire_tab_callbacks(
             sftp_entry_cache.lock().unwrap().remove(&id);
             sftp_sort_states.lock().unwrap().remove(&id);
             sudo_states.borrow_mut().remove(&id);
+            sftp_pending_follow.lock().unwrap().remove(&id);
+            suppress_cwd_follow.lock().unwrap().remove(&id);
             bufs.lock().unwrap().remove(&id);
 
             // Remove from tabs + terminals models.
@@ -6379,12 +6419,25 @@ fn wire_key_input(
             let mut local_mode_was_active = false;
             let mut submitted_line_for_cd: Option<String> = None;
             let mut locally_buffered_text: Option<String> = None;
+            let mut tab_handoff_for_cd = false;
             {
                 let mut map = bufs.lock().unwrap();
                 if let Some(buf) = map.get_mut(tid.as_str()) {
                     local_mode_was_active = buf.can_local_buffer_input();
                     if buf.can_local_buffer_input() {
-                        if ctrl || alt || key_for_pty == "\t" {
+                        if key_for_pty == "\t" {
+                            // Tab 补全后行编辑由远端 shell 接管，补全插入的
+                            // 字符不会进入本地缓冲，本地记录的行从此不可靠。
+                            // handoff 发送后锁定直通到下个 prompt，该行的
+                            // cd 跟随交给 OSC 7 真值链(命令钩子必伴随 cwd
+                            // 钩子)，避免按残缺行解析出错误目录。
+                            if let Some(flush) = buf.handoff_local_line_to_remote() {
+                                locally_queued_send = Some(flush.into_bytes());
+                                repaint_after_local = true;
+                            }
+                            buf.lock_local_input_until_prompt();
+                            tab_handoff_for_cd = true;
+                        } else if ctrl || alt {
                             if let Some(flush) = buf.handoff_local_line_to_remote() {
                                 locally_queued_send = Some(flush.into_bytes());
                                 repaint_after_local = true;
@@ -6443,8 +6496,11 @@ fn wire_key_input(
             // Local-mode characters are mirrored into the passthrough tracker
             // for handoff scenarios. Once the complete line is committed,
             // discard that mirror so a later mode switch cannot reuse a stale
-            // or partial `cd` command.
-            if local_mode_was_active && submitted_line_for_cd.is_some() {
+            // or partial `cd` command. Tab 补全同样作废 mirror：远端补全后的
+            // 实际命令行本地已不可知，残缺 mirror 只会解析出错误目录。
+            if local_mode_was_active
+                && (submitted_line_for_cd.is_some() || tab_handoff_for_cd)
+            {
                 pending_cd_input.lock().unwrap().remove(tid.as_str());
                 rejected_cd_input.lock().unwrap().remove(tid.as_str());
             }
@@ -6458,28 +6514,41 @@ fn wire_key_input(
                     alt,
                 );
             }
-            let cd_follow_target = submitted_line_for_cd.as_deref().and_then(|line| {
-                let cwd = ctx
-                    .sftp_last_cwd
-                    .lock()
-                    .unwrap()
-                    .get(tid.as_str())
-                    .cloned()
-                    .or_else(|| {
-                        ctx.weak.upgrade().and_then(|w| {
-                            let path = active_sftp_path(&w, tid.as_str());
-                            (!path.trim().is_empty()).then_some(path)
-                        })
-                    });
-                let home = ctx
-                    .tab_statuses
-                    .lock()
-                    .unwrap()
-                    .get(tid.as_str())
-                    .map(|st| st.sftp_home.clone())
-                    .filter(|home| !home.trim().is_empty());
-                resolve_cd_follow_target(line, cwd.as_deref(), home.as_deref())
-            });
+            // vim/nano/htop 等全屏程序(备用屏幕)中,回车提交的是编辑文本或
+            // 程序命令,不是 shell 命令行;直通追踪器无法区分,必须在跟随
+            // 前用备用屏幕状态拦截(否则编辑内容里的 "cd xxx" 会误跟随)。
+            let in_alt_screen = {
+                let map = bufs.lock().unwrap();
+                map.get(tid.as_str())
+                    .map(|buf| buf.parser.screen().alternate_screen())
+                    .unwrap_or(false)
+            };
+            let cd_follow_target = if in_alt_screen {
+                None
+            } else {
+                submitted_line_for_cd.as_deref().and_then(|line| {
+                    let cwd = ctx
+                        .sftp_last_cwd
+                        .lock()
+                        .unwrap()
+                        .get(tid.as_str())
+                        .cloned()
+                        .or_else(|| {
+                            ctx.weak.upgrade().and_then(|w| {
+                                let path = active_sftp_path(&w, tid.as_str());
+                                (!path.trim().is_empty()).then_some(path)
+                            })
+                        });
+                    let home = ctx
+                        .tab_statuses
+                        .lock()
+                        .unwrap()
+                        .get(tid.as_str())
+                        .map(|st| st.sftp_home.clone())
+                        .filter(|home| !home.trim().is_empty());
+                    resolve_cd_follow_target(line, cwd.as_deref(), home.as_deref())
+                })
+            };
             // --- tmux directory follow ---
             // Detect tmux entry so input buffering follows tmux's echo behavior.
             if let Some(ref line) = submitted_line_for_cd {
@@ -8257,17 +8326,6 @@ fn should_force_passthrough_for_command(cmd: &str) -> bool {
     )
 }
 
-fn is_cd_command(cmd: &str) -> bool {
-    let trimmed = cmd.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    let Some(first) = trimmed.split_whitespace().next() else {
-        return false;
-    };
-    first.trim_matches(|c: char| c == '\'' || c == '"' || c == '`') == "cd"
-}
-
 /// Detect commands that enter tmux: `tmux`, `tmux attach`, `tmux new`, etc.
 fn is_tmux_command(cmd: &str) -> bool {
     let trimmed = cmd.trim();
@@ -8303,6 +8361,14 @@ fn update_pending_cd_input(
     if key == "\n" || key == "\r" {
         rejected.lock().unwrap().remove(tab_id);
         return pending.lock().unwrap().remove(tab_id);
+    }
+    // Tab 补全:远端 shell 会向命令行插入本地追踪不到的补全字符,追踪到
+    // 的行从此与实际命令不一致(如 "cd /ro" 补全成 "cd /root"),按残缺行
+    // 解析只会得到错误目录。作废当前追踪并拒绝本行后续字符。
+    if key.contains('\t') {
+        pending.lock().unwrap().remove(tab_id);
+        rejected.lock().unwrap().insert(tab_id.to_string());
+        return None;
     }
     if rejected.lock().unwrap().contains(tab_id) {
         return None;
@@ -9940,17 +10006,6 @@ mod key_tests {
     }
 
     #[test]
-    fn sftp_follow_only_treats_cd_as_cd() {
-        assert!(is_cd_command("cd"));
-        assert!(is_cd_command(" cd /var/log "));
-        assert!(is_cd_command("\"cd\" /tmp"));
-        assert!(!is_cd_command(""));
-        assert!(!is_cd_command("ls"));
-        assert!(!is_cd_command("echo cd /tmp"));
-        assert!(!is_cd_command("cdx /tmp"));
-    }
-
-    #[test]
     fn tmux_entry_and_exit_are_detected() {
         // Entering tmux sets the in_tmux flag (SFTP queries tmux natively).
         assert!(is_tmux_command("tmux"));
@@ -10140,6 +10195,48 @@ mod key_tests {
             update_pending_cd_input(&pending, &rejected, "t7", "\r", false, false).as_deref(),
             Some("cd my_files/")
         );
+    }
+
+    #[test]
+    fn pending_cd_tracker_discards_line_after_tab() {
+        let pending: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+        let rejected: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        for ch in ["c", "d", " ", "/", "r", "o"] {
+            assert!(update_pending_cd_input(&pending, &rejected, "t1", ch, false, false).is_none());
+        }
+        // Tab 补全后,本地追踪的行与远端实际命令行不再一致,必须作废。
+        assert!(update_pending_cd_input(&pending, &rejected, "t1", "\t", false, false).is_none());
+        assert!(pending.lock().unwrap().get("t1").is_none());
+        assert!(rejected.lock().unwrap().contains("t1"));
+        // 同一 key 块里带 Tab 也作废(如 "cd\t")。
+        assert!(update_pending_cd_input(&pending, &rejected, "t2", "cd\t", false, false).is_none());
+        assert!(pending.lock().unwrap().get("t2").is_none());
+        assert!(rejected.lock().unwrap().contains("t2"));
+        // 后续字符不再追踪,回车不产生候选(该行跟随交给 OSC 7 真值)。
+        assert!(update_pending_cd_input(&pending, &rejected, "t1", "o", false, false).is_none());
+        assert!(update_pending_cd_input(&pending, &rejected, "t1", "t", false, false).is_none());
+        assert!(update_pending_cd_input(&pending, &rejected, "t1", "\n", false, false).is_none());
+        assert!(pending.lock().unwrap().get("t1").is_none());
+    }
+
+    #[test]
+    fn pending_follow_is_taken_exactly_once() {
+        let pending: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+        pending
+            .lock()
+            .unwrap()
+            .insert("t1".to_string(), "/root/logs".to_string());
+        // 真值先到(CwdChanged)抢占移除 → 兜底任务到期拿到 None,放弃。
+        assert_eq!(take_pending_follow(&pending, "t1").as_deref(), Some("/root/logs"));
+        assert!(take_pending_follow(&pending, "t1").is_none());
+        // 真值未到 → 兜底任务到期拿到 Some,执行兜底 list_dir。
+        pending
+            .lock()
+            .unwrap()
+            .insert("t2".to_string(), "/var/log".to_string());
+        assert_eq!(take_pending_follow(&pending, "t2").as_deref(), Some("/var/log"));
+        // 其他 tab 不受影响。
+        assert!(take_pending_follow(&pending, "t3").is_none());
     }
 
     #[test]
