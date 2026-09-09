@@ -9189,7 +9189,22 @@ impl TermBuffer {
         // nothing instead of the pre-clear output.
         let has_clear_scrollback = bytes.windows(4).any(|w| w == b"\x1b[3J");
 
-        self.parser.process(bytes);
+        // vt100 0.15.2 的 restore_cursor 不做边界 clamp（grid.rs 直接
+        // `self.pos = self.saved_pos`）：在 alt-screen 里缩小行数后再退出
+        // （tmux detach 必发 `ESC[?1049l`），恢复的光标行就越界，随后的
+        // exit repaint 文本会在 screen.rs:934 处 unwrap panic，整个进程退出
+        // （error.log 2026-08-02 / 09-09 的崩溃记录）。这里兜住 panic：
+        // 按当前尺寸重建干净网格的 Parser、丢弃本批输出，代价只是一帧
+        // 丢渲染；全局 panic hook 仍会写 error.log 并弹出内部错误对话框。
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.parser.process(bytes);
+        }));
+        if result.is_err() {
+            tracing::error!("vt100 parse panicked; parser rebuilt, batch dropped");
+            let (rows, cols) = self.parser.screen().size();
+            self.parser = vt100::Parser::new(rows, cols, 0);
+            self.prev.clear();
+        }
         let (is_alt, rows, cols) = {
             let s = self.parser.screen();
             let (r, c) = s.size();
@@ -10654,6 +10669,42 @@ mod selection_tests {
         assert!(buf.pending_text.is_char_boundary(buf.pending_text.len()));
         // All chars intact after any truncation.
         assert!(buf.pending_text.chars().all(|c| c == '你'));
+    }
+
+    #[test]
+    fn vt100_stale_cursor_after_shrink_is_contained() {
+        // ── 根因复现：裸 vt100 0.15.2 在该序列上 panic ──
+        // 光标停在大窗口底部（row 44）→ 进 alt-screen（DECSC 保存光标）
+        // → 缩行到 20（set_size 只 clamp 当前 pos，不碰 saved_pos）
+        // → 退 alt-screen（DECRC 恢复越界光标，无 clamp）
+        // → exit repaint 文本 → screen.rs:934 `drawing_cell().unwrap()` panic。
+        // 对应真实场景：tmux 会话里窗口/面板缩行后 Ctrl+B d detach。
+        let stale = std::panic::catch_unwind(|| {
+            let mut p = vt100::Parser::new(50, 80, 0);
+            p.process(b"\x1b[45;10H"); // cursor → (44, 9)
+            p.process(b"\x1b[?1049h"); // tmux 启动：保存光标 + 进 alt screen
+            p.set_size(20, 80); // 窗口缩行
+            p.process(b"\x1b[?1049l"); // tmux detach：恢复越界光标
+            p.process(b"[detached]\r\nroot@host:~# "); // exit repaint
+        });
+        assert!(
+            stale.is_err(),
+            "vt100 0.15.2 应在此序列上 panic（根因复现；若上游已修复请移除防御）"
+        );
+
+        // ── 修复验证：ingest_chunk 兜住 panic、重建 Parser、进程不退出 ──
+        let mut buf = make_buf(50, 80, &[], &["prompt"], 0);
+        buf.parser.process(b"\x1b[45;10H");
+        buf.parser.process(b"\x1b[?1049h");
+        buf.parser.set_size(20, 80);
+        buf.parser.process(b"\x1b[?1049l");
+        buf.ingest(b"[detached (from session 0)]\r\nroot@host:~# ");
+        // parser 已按缩小后的尺寸重建，后续输出正常渲染。
+        assert_eq!(buf.parser.screen().size(), (20, 80));
+        assert!(!buf.parser.screen().alternate_screen());
+        buf.ingest(b"echo ok\r\n");
+        let built = buf.render();
+        assert!(built.rows_used >= 0);
     }
 
 }

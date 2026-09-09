@@ -1,5 +1,22 @@
 # ChangeLog
 
+## 2026-09-09
+
+### 背景/现象/根因
+- 在 tmux 内按 Ctrl+B d detach 时偶发整个软件崩溃退出。error.log 记录 2026-08-02、09-09 共三次崩溃，均为 `vt100-0.15.2\src\screen.rs:934:18: called Option::unwrap() on a None value`（主线程）。
+- 根因：vt100 0.15.2 的 `restore_cursor` 恢复光标时不做边界 clamp（grid.rs 直接 `self.pos = self.saved_pos`）。tmux 会话（alt-screen）期间窗口/面板曾缩小行数时，detach 必发的 `ESC[?1049l` 会把越界光标恢复到主屏，随后的 exit repaint 文本在 `Screen::text` 的 `drawing_cell(pos).unwrap()` 处 panic；该解析发生在 Slint 主线程渲染定时器路径（`rebuild_tab_display → ingest_chunk → parser.process`），无 catch_unwind，进程直接退出。
+- "偶发"条件：进入 tmux 后发生过缩行，且 detach 前保存的光标行落在被裁掉的区域。
+
+### 改动/新增
+- `TermBuffer::ingest_chunk`：用 `catch_unwind` 包裹 `parser.process()`（与 event-pump 线程现有防御同款模式）；panic 时记录 error.log、按当前尺寸重建 Parser、清空 prev 检测缓存。
+- 新增回归测试 `vt100_stale_cursor_after_shrink_is_contained`：先在裸 vt100 上复现原 panic（断言必然发生），再验证 ingest_chunk 兜住 panic 后 parser 重建、后续渲染正常。
+
+### 修复/效果
+- tmux detach 场景及任何 vt100 内部 panic 不再导致进程退出，最坏丢一帧渲染（由后续输出恢复）并弹一次内部错误对话框；error.log 仍保留完整 panic 记录便于追踪。全量 89 个单测通过。
+
+### 涉及文件
+- `src/app.rs`
+
 ## 2026-09-05
 
 ### 记事本面板改进:初始 1400x900、可拖动/缩放并记住位置、修复点击穿透
