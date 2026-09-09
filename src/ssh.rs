@@ -266,6 +266,68 @@ fn find_incomplete_osc_tail(s: &str) -> Option<usize> {
     }
 }
 
+/// Remove "valid lead byte + partial continuation bytes + a <0x80 terminator"
+/// fragments from `raw`.  Such a fragment can never complete into a valid
+/// character: something was spliced into the stream mid-character — most
+/// commonly the kernel tty echoing `^C` (0x03 0x43) when Ctrl+C kills the
+/// foreground job, which lands anywhere, including between the continuation
+/// bytes of a multi-byte character (e.g. `你` = E4 BD A0 truncated to
+/// `E4 BD` + `^C`).  `from_utf8_lossy` would render the stub as U+FFFD (`�`);
+/// dropping it yields the cleaner `你好^C`.
+///
+/// Only this exact pattern is stripped:
+///  - complete sequences are kept,
+///  - a trailing incomplete sequence with no terminator is kept (the caller's
+///    `split_utf8_tail` carry may still complete it with the next read),
+///  - other invalid bytes (lone continuations, bad leads) are kept for the
+///    lossy decoder to mark.
+fn strip_broken_utf8_sequences(raw: &mut Vec<u8>) {
+    let n = raw.len();
+    let mut out: Vec<u8> = Vec::with_capacity(n);
+    let mut i = 0usize;
+    while i < n {
+        let b = raw[i];
+        let need = if (0xC2..=0xDF).contains(&b) {
+            1
+        } else if (0xE0..=0xEF).contains(&b) {
+            2
+        } else if (0xF0..=0xF4).contains(&b) {
+            3
+        } else {
+            0
+        };
+        if need == 0 {
+            out.push(b);
+            i += 1;
+            continue;
+        }
+        // Count how many continuation bytes actually follow the lead.
+        let mut got = 0usize;
+        while got < need && i + 1 + got < n && raw[i + 1 + got] & 0xC0 == 0x80 {
+            got += 1;
+        }
+        if got == need || i + 1 + got >= n {
+            // Complete character, or a trailing stub with no terminator: keep.
+            let keep = 1 + got;
+            out.extend_from_slice(&raw[i..i + keep]);
+            i += keep;
+        } else if raw[i + 1 + got] < 0x80 {
+            // Interrupted mid-character by an ASCII byte (tty-echoed ^C, EOL,
+            // …): drop the stub, keep the terminator for normal processing.
+            i += 1 + got;
+        } else {
+            // Interrupted by a non-continuation high byte (binary garbage):
+            // keep everything for the lossy decoder to mark.
+            let keep = 1 + got;
+            out.extend_from_slice(&raw[i..i + keep]);
+            i += keep;
+        }
+    }
+    if out.len() != n {
+        *raw = out;
+    }
+}
+
 /// Given a raw byte buffer, return `(valid_len, tail_len)` where the trailing
 /// `tail_len` bytes (1–3) form the *incomplete* start of a multi-byte UTF-8
 /// character whose continuation bytes arrive in a later read.  Callers keep
@@ -1052,6 +1114,11 @@ async fn run_session(
                         let mut raw = Vec::with_capacity(utf8_carry.len() + data.len());
                         raw.extend_from_slice(&utf8_carry);
                         raw.extend_from_slice(&data);
+                        // Drop multi-byte stubs that were interrupted by an
+                        // ASCII byte spliced into the stream (the tty echoing
+                        // `^C` when Ctrl+C kills the job) so the last line
+                        // reads `你好^C` instead of `你好�^C` (#164).
+                        strip_broken_utf8_sequences(&mut raw);
                         let (valid_len, tail_len) = split_utf8_tail(&raw);
                         utf8_carry = raw[valid_len..].to_vec();
                         let chunk = String::from_utf8_lossy(&raw[..valid_len]).into_owned();
@@ -1152,6 +1219,7 @@ async fn run_session(
                         let mut raw = Vec::with_capacity(utf8_carry_stderr.len() + data.len());
                         raw.extend_from_slice(&utf8_carry_stderr);
                         raw.extend_from_slice(&data);
+                        strip_broken_utf8_sequences(&mut raw);
                         let (valid_len, _) = split_utf8_tail(&raw);
                         utf8_carry_stderr = raw[valid_len..].to_vec();
                         let text = String::from_utf8_lossy(&raw[..valid_len]).into_owned();
@@ -1913,6 +1981,58 @@ mod osc_command_tests {
         assert_eq!(super::split_utf8_tail(b"ab\xbf"), (3, 0));
         assert_eq!(super::split_utf8_tail(b"\xbd\xbf\xbd"), (3, 0));
         assert_eq!(super::split_utf8_tail(b""), (0, 0));
+    }
+
+    #[test]
+    fn broken_utf8_stripped_before_ascii_interrupt() {
+        // `你` = E4 BD A0 truncated to E4 BD by the tty echoing `^C` (03 43).
+        let mut raw = b"\xe4\xbd\xa0\n\xe4\xbd\x03\x43\x0d\x0a".to_vec();
+        super::strip_broken_utf8_sequences(&mut raw);
+        // "你" + \n survive; the interrupted E4 BD stub is dropped, ^C\r\n kept.
+        assert_eq!(raw, b"\xe4\xbd\xa0\n\x03\x43\x0d\x0a");
+    }
+
+    #[test]
+    fn broken_utf8_strips_2byte_and_4byte_stubs() {
+        // `·` (C2 B7) interrupted after the lead by a NUL byte.
+        let mut raw = b"\xc2\x00x".to_vec();
+        super::strip_broken_utf8_sequences(&mut raw);
+        assert_eq!(raw, b"\x00x");
+        // `🙂` (F0 9F 99 82) interrupted after two continuations by `^C`.
+        let mut raw = b"\xf0\x9f\x99\x03\x43".to_vec();
+        super::strip_broken_utf8_sequences(&mut raw);
+        assert_eq!(raw, b"\x03\x43");
+    }
+
+    #[test]
+    fn broken_utf8_keeps_complete_and_trailing_stubs() {
+        // Valid text passes through untouched.
+        let mut raw = "你好，世界\n".as_bytes().to_vec();
+        let before = raw.clone();
+        super::strip_broken_utf8_sequences(&mut raw);
+        assert_eq!(raw, before);
+        // A trailing incomplete stub has no terminator: kept for the carry.
+        let mut raw = b"text\xe4\xbd".to_vec();
+        super::strip_broken_utf8_sequences(&mut raw);
+        assert_eq!(raw, b"text\xe4\xbd");
+        // Binary garbage after a stub (non-continuation high byte): kept.
+        let mut raw = b"\xe4\xbd\xf5\xf5".to_vec();
+        super::strip_broken_utf8_sequences(&mut raw);
+        assert_eq!(raw, b"\xe4\xbd\xf5\xf5");
+    }
+
+    #[test]
+    fn broken_utf8_stripped_only_between_chars() {
+        // A stub, its ASCII interrupt, then a *complete* character: only the
+        // stub goes, the interrupt and the complete character survive intact.
+        let mut raw = b"\xe4\xbd\x03\xe4\xbd\xa0".to_vec();
+        super::strip_broken_utf8_sequences(&mut raw);
+        assert_eq!(raw, b"\x03\xe4\xbd\xa0");
+        // A stub terminated by a non-continuation HIGH byte (binary garbage),
+        // not an ASCII interrupt: everything is kept for the lossy decoder.
+        let mut raw = b"\xe4\xbd\xe4\xbd\xa0".to_vec();
+        super::strip_broken_utf8_sequences(&mut raw);
+        assert_eq!(raw, b"\xe4\xbd\xe4\xbd\xa0");
     }
 
     #[test]

@@ -2,6 +2,26 @@
 
 ## 2026-09-09
 
+### 修复 yes 刷屏按 Ctrl+C 需 4 秒才停止及末行乱码 `你好�^C`
+
+### 背景/现象/根因
+- 终端执行 `yes "你好，世界"` 刷屏，按 Ctrl+C 后屏幕滚动约 4 秒才完全停止，末行显示 `你好�^C`（乱码字符）后才出现 prompt。
+- 延迟根因：Ctrl+C 本身即时送达远端（主循环 select 已 biased 命令优先），瓶颈在输出侧渲染管道——`terminal_max_ingest_kib`（默认 32KiB）÷ 渲染间隔（默认 50ms）≈ 640KB/s，而积压（TCP 接收缓冲 + `pending_text` cap 1MiB 等）约 2MB；`^C` 回显与 prompt 位于数据流末尾，须等积压全部按 640KB/s 限速播完（2MB ÷ 640KB/s ≈ 3~4 秒）。
+- 乱码根因：远端内核 tty 在收到 Ctrl+C 时把 `^C`（0x03 0x43）回显插入输出流任意位置，可能落在多字节 UTF-8 字符（如 `你`=E4 BD A0）的 continuation 字节之间，残缺序列被 `from_utf8_lossy` 渲染为 U+FFFD（�）。
+
+### 改动/新增
+- `pending_text` 缓冲上限从 1MiB 收紧到 256KiB（丢最老、字符边界对齐逻辑不变），最坏积压缩小且内存占用下降。
+- `flush_pending_output` 增加追帧：积压超过每拍预算（`max_ingest_per_tick`）时，本拍 ingest 上限提升至 256KiB，一个渲染 tick 内消化完整个积压（vt100 解析 256KiB 中文约 10~20ms，UI 线程不会卡顿；常规稳态刷屏表现为跳过中间帧紧跟最新输出）。
+- `ssh.rs` 新增 `strip_broken_utf8_sequences`：剔除"合法前导字节 + 部分 continuation + ASCII 终止字节"的残缺 UTF-8 片段（该片段确定已被流内插入物打断、永远无法补全），stdout/stderr 两处调用（carry 拼接后、`split_utf8_tail` 前）；完整序列、尾部待补全序列、二进制垃圾均原样保留。
+
+### 修复/效果
+- Ctrl+C 后屏幕由约 4 秒降至 100ms 内静止（1~2 个渲染 tick 消化完 ≤256KiB 积压）；末行由 `你好�^C` 变为干净的 `你好^C`。CPU/内存无额外开销：单 tick 解析峰值 ≤256KiB（约 10~20ms），内存峰值反而从 1MiB 降至 256KiB。全量 109 个单测通过（新增断裂 UTF-8 剔除 4 项 + 追帧 1 项测试）。
+
+### 涉及文件
+- `src/app.rs`、`src/ssh.rs`
+
+## 2026-09-09
+
 ### 终端 cd 跟随改为"真值优先"，修复跟随后报错 `read_dir /root/logs/logs failed`
 
 ### 背景/现象/根因

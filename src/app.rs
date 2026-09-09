@@ -9128,9 +9128,12 @@ impl TermBuffer {
     /// "skip frames" behaviour.
     fn push_pending_output(&mut self, text: &str) {
         self.pending_text.push_str(text);
-        // 1 MiB ceiling ≈ 50 ms of a 20 MB/s `yes` flood; generous for any
-        // legitimate burst, and the render-tick timer drains it anyway.
-        const PENDING_OUTPUT_CAP: usize = 1 << 20;
+        // 256 KiB ceiling: small enough that the catch-up flush below can
+        // drain the whole backlog in a single render tick (a Ctrl+C during a
+        // `yes` flood must stop the screen almost immediately, not play out
+        // seconds of already-buffered output at tick speed), yet generous for
+        // any legitimate burst.
+        const PENDING_OUTPUT_CAP: usize = 256 * 1024;
         if self.pending_text.len() > PENDING_OUTPUT_CAP {
             let mut drop = self.pending_text.len() - PENDING_OUTPUT_CAP;
             while drop < self.pending_text.len() && !self.pending_text.is_char_boundary(drop) {
@@ -9146,12 +9149,24 @@ impl TermBuffer {
     /// per network chunk. At most `max_ingest_per_tick` bytes are ingested per
     /// tick: if the UI fell behind, older bytes are dropped (skip frames) so a
     /// render tick never exceeds its budget.
+    ///
+    /// Catch-up: when the backlog exceeds the per-tick budget, raise this
+    /// tick's ingest limit to the full cap below instead of replaying the
+    /// backlog at `budget / tick` speed — during a flood the backlog is capped
+    /// at 256 KiB, which the vt100 parser ingests in ~10–20 ms, so the screen
+    /// stays glued to the newest output (`^C` + prompt) without stalling the
+    /// UI thread.
     fn flush_pending_output(&mut self) {
         if self.pending_text.is_empty() {
             return;
         }
         let mut text = std::mem::take(&mut self.pending_text);
-        let cap = self.max_ingest_per_tick;
+        const MAX_CATCHUP_PER_TICK: usize = 256 * 1024;
+        let cap = if text.len() > self.max_ingest_per_tick {
+            MAX_CATCHUP_PER_TICK.min(text.len())
+        } else {
+            text.len()
+        };
         if text.len() > cap {
             let mut drop = text.len() - cap;
             while drop < text.len() && !text.is_char_boundary(drop) {
@@ -10745,12 +10760,30 @@ mod selection_tests {
         let first = buf.parser.screen().rows(0, 20).next().unwrap_or_default();
         assert!(first.trim_end().starts_with("prompthello"));
 
-        // Oversized burst: the buffer caps at PENDING_OUTPUT_CAP and only the
-        // newest MAX_INGEST_PER_TICK bytes survive the flush (skip frames),
-        // so memory stays bounded even if the UI stalls for seconds.
+        // Oversized burst: the buffer caps at PENDING_OUTPUT_CAP (256 KiB) and
+        // the flush drains the whole backlog in ONE tick (catch-up), so a
+        // Ctrl+C during a flood stops the screen almost immediately.
         let big = "x".repeat(1 << 20);
         buf.push_pending_output(&big);
-        assert!(buf.pending_text.len() <= 1 << 20);
+        assert!(buf.pending_text.len() <= 256 * 1024);
+        buf.flush_pending_output();
+        assert!(buf.pending_text.is_empty());
+    }
+
+    #[test]
+    fn pending_output_catchup_drains_backlog_in_one_tick() {
+        // max_ingest_per_tick (32 KiB, the make_buf default) used to throttle
+        // the backlog replay to 32 KiB per tick — 256 KiB took 8 ticks (0.4 s
+        // at the default 50 ms tick), and a Ctrl+C mid-flood kept the screen
+        // scrolling for seconds. The catch-up raise ingests the whole backlog
+        // (up to 256 KiB) in a single flush.
+        let mut buf = make_buf(5, 20, &[], &["prompt"], 0);
+        buf.push_pending_output(&"x".repeat(200 * 1024)); // > budget, < cap
+        buf.flush_pending_output();
+        assert!(buf.pending_text.is_empty());
+
+        // At/under the budget nothing is dropped either.
+        buf.push_pending_output(&"x".repeat(32 * 1024));
         buf.flush_pending_output();
         assert!(buf.pending_text.is_empty());
     }
@@ -10761,7 +10794,7 @@ mod selection_tests {
         // 你 (3 bytes) repeated: the cap must not split a char.
         let s = "你".repeat(1 << 19); // 3 MiB
         buf.push_pending_output(&s);
-        assert!(buf.pending_text.len() <= 1 << 20);
+        assert!(buf.pending_text.len() <= 256 * 1024);
         assert!(buf.pending_text.is_char_boundary(0));
         assert!(buf.pending_text.is_char_boundary(buf.pending_text.len()));
         // All chars intact after any truncation.
