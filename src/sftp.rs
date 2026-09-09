@@ -1408,10 +1408,12 @@ async fn run_sftp(
             } => {
                 // Sanitize the remote-controlled name before it becomes a local
                 // file path that we later hand to the OS "open" call. The path
-                // embeds the connection identity and the remote directory, so
+                // embeds the connection identity and the remote directory, and
+                // the file name itself carries a readable dir fragment, so
                 // same-named files never share a temp copy (their watchers
-                // previously cross-uploaded into each other).
-                let filename = sanitize_filename(&base_name(&remote));
+                // previously cross-uploaded into each other) and stay
+                // distinguishable in the editor's tab bar.
+                let filename = distinguishable_filename(&session, &remote, None);
                 let rel = if edit {
                     temp_edit_relpath(&session, &remote, None)
                 } else {
@@ -1552,7 +1554,13 @@ async fn run_sftp(
                 // both the temp path and the dedup key: a sudo edit uploads
                 // through a different channel (`sudo tee`) than a normal edit,
                 // so the two must never share a local copy or a watcher.
-                let filename = sanitize_filename(&base_name(&remote));
+                // View mode (edit=false) lands in temp_open_relpath, whose
+                // name hash excludes sudo — mirror that for the display name.
+                let filename = distinguishable_filename(
+                    &session,
+                    &remote,
+                    if edit { Some(target_user.as_str()) } else { None },
+                );
                 let rel = if edit {
                     temp_edit_relpath(&session, &remote, Some(&target_user))
                 } else {
@@ -2049,6 +2057,41 @@ fn fnv1a_hex(s: &str) -> String {
     format!("{hash:016x}")
 }
 
+/// Local file name for a temp copy that keeps same-named files distinguishable
+/// in the editor's tab bar: `stem__{dir}~{hash4}{ext}`, e.g.
+/// `config__tmp_a~3f2a.py`. The readable dir fragment comes from the remote
+/// parent directory (truncated, sanitized); the 4-hex suffix hashes
+/// connection + sudo identity + parent dir, so any two copies open at the
+/// same time always carry different names (same server → dir fragment
+/// differs; same path on two servers, or sudo vs normal → hash differs).
+/// The extension is preserved for editor syntax detection; stem/ext are
+/// capped so even pathological names stay well under the Windows path limit.
+/// True uniqueness never relies on this name — the containing folder already
+/// carries the full dir hash.
+fn distinguishable_filename(session: &Session, remote: &str, sudo_user: Option<&str>) -> String {
+    let name = sanitize_filename(&base_name(remote));
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (name[..i].to_string(), name[i..].to_string()),
+        _ => (name, String::new()),
+    };
+    let parent = parent_dir(remote);
+    let mut dir = parent.trim_matches('/').replace('/', "_");
+    if dir.is_empty() {
+        dir = "root".to_string();
+    }
+    let dir: String = sanitize_filename(&dir.chars().take(24).collect::<String>());
+    let stem: String = stem.chars().take(48).collect();
+    let ext: String = ext.chars().take(32).collect();
+    let hash_input = format!(
+        "{}|{}|{}",
+        conn_key(session),
+        sudo_user.unwrap_or(""),
+        parent
+    );
+    let hash4 = &fnv1a_hex(&hash_input)[..4];
+    format!("{stem}__{dir}~{hash4}{ext}")
+}
+
 /// Edit-mode temp path (relative to the xiaoxingshell temp dir):
 /// `edit/{conn}[~sudo-{user}]/{dir_hash}/{filename}`. Every remote target —
 /// connection, sudo identity, directory — is part of the path, so two
@@ -2063,7 +2106,7 @@ fn temp_edit_relpath(session: &Session, remote: &str, sudo_user: Option<&str>) -
         "edit/{}/{}/{}",
         conn,
         fnv1a_hex(&parent_dir(remote)),
-        sanitize_filename(&base_name(remote))
+        distinguishable_filename(session, remote, sudo_user)
     )
 }
 
@@ -2075,7 +2118,7 @@ fn temp_open_relpath(session: &Session, remote: &str) -> String {
         "open/{}/{}/{}",
         conn_key(session),
         fnv1a_hex(&parent_dir(remote)),
-        sanitize_filename(&base_name(remote))
+        distinguishable_filename(session, remote, None)
     )
 }
 
@@ -3501,9 +3544,9 @@ const _: fn() = || {
 #[cfg(test)]
 mod sanitize_tests {
     use super::{
-        claim_edit_slot, edit_key, fnv1a_hex, mark_edit_ready, parent_dir, remote_zip_error_message,
-        remove_active_edit, sanitize_filename, shell_quote, temp_edit_relpath, temp_open_relpath,
-        ActiveEditGuard, EditSlot,
+        claim_edit_slot, distinguishable_filename, edit_key, fnv1a_hex, mark_edit_ready,
+        parent_dir, remote_zip_error_message, remove_active_edit, sanitize_filename, shell_quote,
+        temp_edit_relpath, temp_open_relpath, ActiveEditGuard, EditSlot,
     };
     use crate::config::Session;
     use uuid::Uuid;
@@ -3566,14 +3609,68 @@ mod sanitize_tests {
     #[test]
     fn edit_temp_relpath_isolates_same_named_files_in_different_dirs() {
         // 同一连接、不同目录的同名文件：本地副本必须分开（否则两个
-        // watcher 会互相把对方的内容上传到错的远端文件）。
+        // watcher 会互相把对方的内容上传到错的远端文件），且文件名本身
+        // 带可读目录片段，编辑器标签栏可直接区分。
         let session = Session::new_empty();
         let a = temp_edit_relpath(&session, "/tmp/a/config.yml", None);
         let b = temp_edit_relpath(&session, "/tmp/b/config.yml", None);
         assert_ne!(a, b);
         assert!(a.starts_with("edit/"));
-        assert!(a.ends_with("/config.yml"));
-        assert!(b.ends_with("/config.yml"));
+        assert!(a.contains("config__tmp_a~"));
+        assert!(b.contains("config__tmp_b~"));
+        assert!(a.ends_with(".yml") && b.ends_with(".yml"));
+    }
+
+    #[test]
+    fn distinguishable_filename_keeps_same_named_files_apart() {
+        // 同服务器同名文件：文件名本身就要可区分（编辑器标签栏可见），
+        // 同一目标重复生成必须稳定。
+        let session = Session::new_empty();
+        let a = distinguishable_filename(&session, "/tmp/a/config.py", None);
+        let b = distinguishable_filename(&session, "/tmp/b/config.py", None);
+        assert_ne!(a, b);
+        assert!(a.starts_with("config__tmp_a~"));
+        assert!(b.starts_with("config__tmp_b~"));
+        assert!(a.ends_with(".py") && b.ends_with(".py"));
+        assert_eq!(a, distinguishable_filename(&session, "/tmp/a/config.py", None));
+    }
+
+    #[test]
+    fn distinguishable_filename_separates_servers_and_sudo() {
+        // 短哈希覆盖「连接+sudo+父目录」：不同服务器同路径同名、以及
+        // sudo 与普通编辑，文件名都互不相同。
+        let mut s1 = Session::new_empty();
+        s1.host = "10.0.0.1".into();
+        let mut s2 = Session::new_empty();
+        s2.host = "10.0.0.2".into();
+        assert_ne!(
+            distinguishable_filename(&s1, "/app/config.py", None),
+            distinguishable_filename(&s2, "/app/config.py", None)
+        );
+        assert_ne!(
+            distinguishable_filename(&s1, "/etc/config.py", None),
+            distinguishable_filename(&s1, "/etc/config.py", Some("root"))
+        );
+    }
+
+    #[test]
+    fn distinguishable_filename_edge_cases() {
+        let mut s = Session::new_empty();
+        s.host = "h".into();
+        // 根目录文件 → 目录片段为 root。
+        assert!(distinguishable_filename(&s, "/config.txt", None).starts_with("config__root~"));
+        // dotfile 保留前导点，扩展名不误判。
+        assert!(
+            distinguishable_filename(&s, "/root/.bashrc", None).starts_with(".bashrc__root~")
+        );
+        // 多级后缀保留最后一段（编辑器语法高亮依据）。
+        assert!(distinguishable_filename(&s, "/a/pkg.tar.gz", None).ends_with(".gz"));
+        // 超长文件名截断，防止逼近 Windows 260 路径限制。
+        let long = format!("{}.py", "x".repeat(200));
+        let n = distinguishable_filename(&s, &format!("/d/{long}"), None);
+        assert!(n.chars().count() < 120 && n.ends_with(".py"));
+        // 目录片段取自远端父目录，中文目录可读。
+        assert!(distinguishable_filename(&s, "/数据/报表.csv", None).contains("__数据~"));
     }
 
     #[test]
