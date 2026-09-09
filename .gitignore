@@ -1,10 +1,12 @@
 /target
+/dist
 *.rs.bk
 .DS_Store
 /.vscode
 /.idea
 /.claude
 /.agents
+/.trae
 /.workbuddy
 agents.md
 /release
