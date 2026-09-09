@@ -1814,7 +1814,8 @@ export component AppWindow inherits Window {
                             property <length> menu-x;
                             property <length> menu-y;
                             property <bool> has-local-file: t.local-path != "";
-                            height: t.completed-at == "" ? 36px : 52px;
+                            height: (t.completed-at == "" ? 36px : 52px)
+                                  + (t.remote-path != "" ? 33px : 0px);
                             border-radius: Theme.radius-sm;
                             background: Theme.bg-root;
                             touch := TouchArea {
@@ -1860,6 +1861,23 @@ export component AppWindow inherits Window {
                                     color: Theme.text-muted;
                                     font-size: Theme.fs-xs;
                                     horizontal-alignment: right;
+                                }
+                                // The server-side path of this record: what got
+                                // overwritten (upload) or where it came from
+                                // (download). Char-wrap so long no-space paths
+                                // still fold; fixed 2-line box keeps the row
+                                // height stable instead of stretching wildly.
+                                if t.remote-path != "" : Rectangle {
+                                    height: 30px;
+                                    clip: true;
+                                    Text {
+                                        width: parent.width;
+                                        text: t.remote-path;
+                                        color: Theme.text-muted;
+                                        font-size: Theme.fs-xs;
+                                        wrap: char-wrap;
+                                        vertical-alignment: top;
+                                    }
                                 }
                                 // progress bar
                                 Rectangle {
