@@ -6770,7 +6770,7 @@ fn wire_key_input(
                         buf.parser.process(format!("\x1b[{scroll}S").as_bytes());
                     }
                 }
-                buf.parser.set_size(new_rows, cols as u16);
+                buf.parser.screen_mut().set_size(new_rows, cols as u16);
                 // The pre/post-resize screens differ in size+content; drop the
                 // scroll-detection snapshot so the next output isn't mis-read as
                 // a scroll (which would double-capture lines).
@@ -8138,7 +8138,7 @@ fn cell_attrs(
             } else if s.is_empty() {
                 " ".to_string()
             } else {
-                s
+                s.to_string()
             };
             (s, fg, bg, cell.bold(), cell.is_wide())
         }
@@ -11157,33 +11157,34 @@ mod selection_tests {
 
     #[test]
     fn vt100_stale_cursor_after_shrink_is_contained() {
-        // ── 根因复现：裸 vt100 0.15.2 在该序列上 panic ──
-        // 光标停在大窗口底部（row 44）→ 进 alt-screen（DECSC 保存光标）
-        // → 缩行到 20（set_size 只 clamp 当前 pos，不碰 saved_pos）
-        // → 退 alt-screen（DECRC 恢复越界光标，无 clamp）
-        // → exit repaint 文本 → screen.rs:934 `drawing_cell().unwrap()` panic。
-        // 对应真实场景：tmux 会话里窗口/面板缩行后 Ctrl+B d detach。
+        // ── 根因序列：光标停在大窗口底部（row 44）→ 进 alt-screen（DECSC 保存
+        // 光标）→ 缩行到 20 → 退 alt-screen（DECRC 恢复光标）→ exit repaint。
+        // vt100 0.15.2 在 set_size 时不 clamp saved_pos，DECRC 恢复越界光标，
+        // repaint 时 drawing_cell().unwrap() panic（error.log 中每天 1~2 次）。
+        // 升级 0.16.2（官方修复：decrc-after-resize 光标越界 clamp）后同序列
+        // 不再 panic —— 本断言即为升级生效的直接验证。
         let stale = std::panic::catch_unwind(|| {
             let mut p = vt100::Parser::new(50, 80, 0);
             p.process(b"\x1b[45;10H"); // cursor → (44, 9)
             p.process(b"\x1b[?1049h"); // tmux 启动：保存光标 + 进 alt screen
-            p.set_size(20, 80); // 窗口缩行
-            p.process(b"\x1b[?1049l"); // tmux detach：恢复越界光标
+            p.screen_mut().set_size(20, 80); // 窗口缩行
+            p.process(b"\x1b[?1049l"); // tmux detach：恢复光标（0.16.2 clamp）
             p.process(b"[detached]\r\nroot@host:~# "); // exit repaint
         });
         assert!(
-            stale.is_err(),
-            "vt100 0.15.2 应在此序列上 panic（根因复现；若上游已修复请移除防御）"
+            stale.is_ok(),
+            "vt100 0.16.2 不应在此序列上 panic（若失败说明升级未生效）"
         );
 
-        // ── 修复验证：ingest_chunk 兜住 panic、重建 Parser、进程不退出 ──
+        // ── 兜底验证：ingest_chunk 的 catch_unwind 防御保留，即使上游回归
+        // （或未来引入新 panic）也不会崩溃进程 ──
         let mut buf = make_buf(50, 80, &[], &["prompt"], 0);
         buf.parser.process(b"\x1b[45;10H");
         buf.parser.process(b"\x1b[?1049h");
-        buf.parser.set_size(20, 80);
+        buf.parser.screen_mut().set_size(20, 80);
         buf.parser.process(b"\x1b[?1049l");
         buf.ingest(b"[detached (from session 0)]\r\nroot@host:~# ");
-        // parser 已按缩小后的尺寸重建，后续输出正常渲染。
+        // 后续输出正常渲染。
         assert_eq!(buf.parser.screen().size(), (20, 80));
         assert!(!buf.parser.screen().alternate_screen());
         buf.ingest(b"echo ok\r\n");

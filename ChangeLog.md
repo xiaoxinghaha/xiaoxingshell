@@ -1,5 +1,26 @@
 # ChangeLog
 
+## 2026-09-11
+
+### 升级 vt100 0.15.2 → 0.16.2，根治 tmux/窗口缩行后的解析 panic
+
+### 背景/现象/根因
+- error.log 出现 `panic in thread 'main': vt100-0.15.2/src/screen.rs:934 called Option::unwrap() on a None value`（9/9、9/11 各 1~2 次），之后紧跟 `vt100 parse panicked; parser rebuilt, batch dropped`（catch_unwind 兜底生效，进程未崩溃但丢失一帧输出）。
+- 根因是 vt100 0.15.2 库缺陷：全屏程序（tmux/vim）保存光标（ESC 7）后终端缩行（拖动分隔条/调整窗口触发 set_size），0.15.2 只 clamp 当前光标不 clamp `saved_pos`；退出时恢复光标（ESC 8）得到越界坐标，repaint 时 `drawing_cell().unwrap()` panic。官方 0.16.2 已修复（CHANGELOG: "Fixed potential cursor out of bounds when using decrc after resizing (#13)"，set_size 中新增 saved_pos 行/列 clamp）。
+
+### 改动/新增
+- `Cargo.toml`：vt100 0.15 → 0.16（0.16.2，2025-07 发布、下载 484 万次）。
+- `set_size` 适配新 API（从 Parser 移至 Screen）：`parser.set_size(...)` → `parser.screen_mut().set_size(...)`（生产 1 处 + 测试 2 处）。
+- `cell_attrs` 适配 `Cell::contents` 返回类型变化（String → &str）：else 分支加 `.to_string()`。
+- 测试 `vt100_stale_cursor_after_shrink_is_contained` 改写：原"0.15.2 应 panic"根因复现断言改为"0.16.2 同序列不再 panic"（升级生效的直接验证）；catch_unwind 兜底验证保留。
+- 附带收益：消除 unicode-width 0.1.14 与 0.2.2 双版本共存（0.16.2 已依赖 0.2.2）。
+
+### 修复/效果
+- tmux 会话缩行后 detach、vim 全屏中调整窗口等场景不再触发解析 panic（屏幕不再闪失一帧，error.log 不再出现该 ERROR）。升级前逐项核对了项目使用的全部 17 个 vt100 API：15 个签名不变，仅 2 处需机械适配；被移除的 API（title/bells 等）项目零使用。全量 119 个单测一次通过。catch_unwind 防御保留，即使上游未来引入新 panic 也有兜底。
+
+### 涉及文件
+- `Cargo.toml`、`Cargo.lock`、`src/app.rs`
+
 ## 2026-09-09
 
 ### 修复 yes 刷屏时 UI 完全冻结、Ctrl+C 仍需数秒停止（二次修复）
