@@ -21,6 +21,23 @@
 ### 涉及文件
 - `Cargo.toml`、`Cargo.lock`、`src/app.rs`
 
+### 记事本改为系统默认程序打开可配置的 md 文件
+
+### 背景/现象/根因
+- 原导航栏 #3 记事本是内置 Slint 弹出面板（文本框 + 自动保存 notes.txt + 窗口几何记忆），编辑能力简陋，与外部编辑器体验割裂。
+- 需求：点击按钮直接用系统默认程序打开一个固定的 md 文件，路径在配置文件中设置。
+
+### 改动/新增
+- `config.rs`：删除 `NotepadState` 几何套件（x/y/width/height）；新增 `notepad_file` 配置字段及 `notepad_file()`/`set_notepad_file()`/`notepad_file_raw()` 方法，未配置时默认 `<配置目录>/notes.md`；新增单测覆盖默认路径与自定义路径往返。
+- `app.rs`：删除内置面板逻辑（防抖保存、几何恢复、关窗 flush）；新增 `on_open_notepad`（文件不存在时先自动创建空文件，再调用 `sftp::open_with_os` 用系统默认程序打开）、`on_set_notepad_file`（保存配置路径）、`on_pick_notepad_file`（用保存对话框选择路径，因目标 md 文件往往尚未存在）。
+- `app.slint`：删除内置记事本面板及 `notepad-open`/`notepad-text`/`np-*` 属性；#3 按钮改为触发 `open-notepad` 回调；设置页"编辑器"页新增"记事本文件"配置区块（路径输入框 + 保存/选择按钮）。
+
+### 修复/效果
+- 点击导航栏 #3 记事本按钮即用系统默认程序打开配置的 md 文件；未配置时使用配置目录下 notes.md，首次点击自动创建空文件。全量 120 个单测通过（新增 1 项 notepad 配置测试）。
+
+### 涉及文件
+- `src/config.rs`、`src/app.rs`、`ui/app.slint`
+
 ## 2026-09-09
 
 ### 修复 yes 刷屏时 UI 完全冻结、Ctrl+C 仍需数秒停止（二次修复）

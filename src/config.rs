@@ -317,20 +317,6 @@ pub struct WindowState {
     pub maximized: bool,
 }
 
-/// Remember the nav-rail #3 notepad panel's last placement/size (logical px)
-/// so reopening restores it. All-optional → built-in defaults when absent.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct NotepadState {
-    #[serde(default)]
-    pub x: Option<f64>,
-    #[serde(default)]
-    pub y: Option<f64>,
-    #[serde(default)]
-    pub width: Option<f64>,
-    #[serde(default)]
-    pub height: Option<f64>,
-}
-
 /// On-disk layout. Keep additive to ease forward-compat.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ConfigFile {
@@ -446,9 +432,10 @@ pub struct ConfigFile {
     /// Remember the main window's last placement so relaunch restores it.
     #[serde(default)]
     pub window_state: WindowState,
-    /// Remember the notepad panel's last placement/size (logical px).
+    /// Notepad (nav rail #3) opens this md file with the OS default app.
+    /// Empty = built-in default (notes.md in the config dir).
     #[serde(default)]
-    pub notepad_state: NotepadState,
+    pub notepad_file: String,
 }
 
 /// Portable export file (issue #46): sessions with everything in plaintext
@@ -1112,19 +1099,26 @@ impl ConfigStore {
         self.cache.window_state.maximized = maximized;
     }
 
-    /// Saved notepad panel placement `(x, y, width, height)` in logical px;
-    /// `None` fields mean "use the built-in default".
-    pub fn notepad_geometry(&self) -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>) {
-        let n = &self.cache.notepad_state;
-        (n.x, n.y, n.width, n.height)
+    /// Saved notepad md-file path; empty = the built-in default
+    /// (`notes.md` in the config dir).
+    pub fn notepad_file(&self) -> std::path::PathBuf {
+        let configured = self.cache.notepad_file.trim();
+        if !configured.is_empty() {
+            return std::path::PathBuf::from(configured);
+        }
+        match app_config_dir() {
+            Ok(dir) => dir.join("notes.md"),
+            Err(_) => std::path::PathBuf::from("notes.md"),
+        }
     }
 
-    pub fn set_notepad_geometry(&mut self, x: f64, y: f64, width: f64, height: f64) {
-        let n = &mut self.cache.notepad_state;
-        n.x = Some(x);
-        n.y = Some(y);
-        n.width = Some(width);
-        n.height = Some(height);
+    pub fn set_notepad_file(&mut self, path: String) {
+        self.cache.notepad_file = path.trim().to_string();
+    }
+
+    /// Raw configured value for the settings UI (empty = default).
+    pub fn notepad_file_raw(&self) -> &str {
+        self.cache.notepad_file.trim()
     }
 
     // ── Session groups / folders (#41) ────────────────────────────────────
@@ -1382,6 +1376,27 @@ mod tests {
         let _ = std::fs::remove_file(&export_path);
         let _ = std::fs::remove_file(&a.path);
         let _ = std::fs::remove_file(&b.path);
+    }
+
+    #[test]
+    fn notepad_file_defaults_and_custom_roundtrip() {
+        let mut store = temp_store();
+        // Empty config → the built-in default (notes.md under the config dir,
+        // or a bare relative fallback if the dir can't be resolved).
+        let default = store.notepad_file();
+        assert!(default.ends_with("notes.md"));
+
+        // Custom path wins; whitespace is trimmed.
+        store.set_notepad_file("  D:/notes/todo.md  ".into());
+        assert_eq!(store.notepad_file(), std::path::PathBuf::from("D:/notes/todo.md"));
+        assert_eq!(store.notepad_file_raw(), "D:/notes/todo.md");
+
+        // Round-trips through save (re-parse the on-disk JSON directly).
+        store.save().unwrap();
+        let raw = std::fs::read_to_string(&store.path).unwrap();
+        let cfg: ConfigFile = serde_json::from_str(&raw).unwrap();
+        assert_eq!(cfg.notepad_file, "D:/notes/todo.md");
+        let _ = std::fs::remove_file(&store.path);
     }
 
     #[test]

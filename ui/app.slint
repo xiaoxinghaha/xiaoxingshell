@@ -315,6 +315,10 @@ export component AppWindow inherits Window {
     callback add-external-editor-rule(string /* suffix */, string /* program */);
     callback delete-external-editor-rule(int /* index */);
     callback pick-external-editor-rule-program();
+    // Notepad md file (nav rail #3 opens it with the OS default app).
+    in-out property <string> notepad-file;   // raw config value ("" = default)
+    callback set-notepad-file(string);
+    callback pick-notepad-file();
     in property <[TransferInfo]> transfers; // download/upload records (newest first)
     in property <[string]> about-libs;      // open-source libraries used
     in-out property <bool> lang-en: false;  // current UI language (false = 中文)
@@ -335,28 +339,9 @@ export component AppWindow inherits Window {
     in-out property <string> ui-font-family <=> Theme.ui-font-family;
     in property <[string]> term-fonts;             // installed monospace families
     in-out property <bool> interface-open: false;  // Interface settings dialog
-    // 记事本 (nav rail #3): free-form scratchpad for quick commands. The app
-    // shell auto-saves the text (debounced, notes.txt) and restores it on start.
-    in-out property <bool> notepad-open: false;
-    in-out property <string> notepad-text;
-    callback notepad-text-changed(string);
-    // Panel placement/size (logical px). Defaults: 1400x900 centered; the app
-    // shell overwrites them from config at startup and persists on change.
-    in-out property <length> np-width: 1400px;
-    in-out property <length> np-height: 900px;
-    in-out property <length> np-x: max(0px, (root.width - root.np-width) / 2);
-    in-out property <length> np-y: max(0px, (root.height - root.np-height) / 2);
-    property <bool> np-dragging;
-    property <length> np-base-x;
-    property <length> np-base-y;
-    property <length> np-grab-x;
-    property <length> np-grab-y;
-    property <bool> np-resizing;
-    property <length> np-rs-base-w;
-    property <length> np-rs-base-h;
-    property <length> np-rs-grab-x;
-    property <length> np-rs-grab-y;
-    callback notepad-geometry-save();   // drag/resize finished → persist
+    // Notepad (nav rail #3): opens the configured md file with the OS default
+    // app (see set-notepad-file / pick-notepad-file in the editor settings).
+    callback open-notepad();
     out property <length> ifd-width: 700px;
     out property <length> ifd-height: 600px;
     // Interface dialog position (draggable by its title bar); init centered.
@@ -777,10 +762,10 @@ export component AppWindow inherits Window {
                         NavRailBtn {
                             icon: "\u{E873}";
                             tooltip: root.lang-en ? "Notepad" : "记事本";
-                            active: root.notepad-open;
+                            active: false;
                             clicked => {
                                 root.nav-panel-open = 0;
-                                root.notepad-open = !root.notepad-open;
+                                root.open-notepad();
                             }
                         }
 
@@ -2638,161 +2623,6 @@ export component AppWindow inherits Window {
         }
     }
 
-    // --- Notepad (nav rail #3) ---------------------------------------------
-    // Free-form scratchpad (quick commands etc.). Non-modal on purpose: the
-    // user can still interact with the terminal while jotting. The text is
-    // auto-saved by the app shell (debounced → notes.txt) and restored on
-    // startup. Editor + scrolling mirrors the SFTP file editor (ScrollView +
-    // multi-line TextInput), minus the line-number gutter.
-    if root.notepad-open : Rectangle {
-        x: root.np-x;
-        y: root.np-y;
-        width: root.np-width;
-        height: root.np-height;
-        background: Theme.bg-panel;
-        border-radius: Theme.radius-md;
-        border-width: 1px;
-        border-color: Theme.border-strong;
-        drop-shadow-blur: 24px;
-        drop-shadow-color: #000000a0;
-        clip: true;
-
-        // Swallow clicks on the card (blank areas included) so they never fall
-        // through to the session list / terminal underneath. Declared before
-        // the content so the ✕ / editor / resize grip stay interactive above.
-        TouchArea {}
-
-        VerticalLayout {
-            // Title bar — drag to move the panel (clamped inside the window).
-            Rectangle {
-                height: 44px;
-                np-title-drag := TouchArea {
-                    mouse-cursor: move;
-                    pointer-event(e) => {
-                        if (e.kind == PointerEventKind.down) {
-                            root.np-dragging = true;
-                            root.np-base-x = root.np-x;
-                            root.np-base-y = root.np-y;
-                            root.np-grab-x = self.absolute-position.x + self.mouse-x;
-                            root.np-grab-y = self.absolute-position.y + self.mouse-y;
-                        } else if (e.kind == PointerEventKind.up) {
-                            root.np-dragging = false;
-                            root.notepad-geometry-save();
-                        }
-                    }
-                    moved => {
-                        if (root.np-dragging) {
-                            root.np-x = clamp(
-                                root.np-base-x + (self.absolute-position.x + self.mouse-x - root.np-grab-x),
-                                0px, max(0px, root.width - root.np-width));
-                            root.np-y = clamp(
-                                root.np-base-y + (self.absolute-position.y + self.mouse-y - root.np-grab-y),
-                                0px, max(0px, root.height - root.np-height));
-                        }
-                    }
-                }
-                HorizontalLayout {
-                    padding: 14px;
-                    spacing: 8px;
-                    Text {
-                        text: root.lang-en ? "Notepad" : "记事本";
-                        color: Theme.text-primary;
-                        font-size: Theme.fs-lg;
-                        font-weight: 700;
-                        horizontal-stretch: 1;
-                        vertical-alignment: center;
-                    }
-                    Text {
-                        text: root.lang-en ? "auto-saved" : "自动保存";
-                        color: Theme.text-muted;
-                        font-size: Theme.fs-xs;
-                        vertical-alignment: center;
-                    }
-                    Rectangle {
-                        width: 22px; height: 22px;
-                        border-radius: Theme.radius-sm;
-                        background: np-close-ta.has-hover ? Theme.bg-hover : transparent;
-                        np-close-ta := TouchArea {
-                            mouse-cursor: pointer;
-                            clicked => { root.notepad-open = false; }
-                        }
-                        Text { text: "\u{E5CD}"; font-family: "Material Icons";
-                               color: Theme.text-secondary; font-size: Theme.fs-sm;
-                               horizontal-alignment: center; vertical-alignment: center; }
-                    }
-                }
-            }
-            Rectangle { height: 1px; background: Theme.border-subtle; }
-
-            // Word-wrapped multi-line editor in a ScrollView so long notes
-            // scroll vertically (no horizontal scroll when wrapping).
-            Rectangle {
-                vertical-stretch: 1;
-                background: Theme.bg-root;
-                np-scroll := ScrollView {
-                    viewport-width: self.visible-width;
-                    viewport-height: max(self.visible-height, np-input.preferred-height + 16px);
-                    np-input := TextInput {
-                        x: 8px;
-                        y: 8px;
-                        width: parent.visible-width - 16px;
-                        height: max(24px, self.preferred-height);
-                        text <=> root.notepad-text;
-                        single-line: false;
-                        wrap: word-wrap;
-                        color: Theme.text-primary;
-                        font-family: Theme.ui-font-family;
-                        font-size: Theme.fs-md;
-                        edited => { root.notepad-text-changed(root.notepad-text); }
-                    }
-                }
-            }
-        }
-
-        // Bottom-right resize grip (#70 pattern): drag to resize, clamped to
-        // the window bounds so the panel can never grow past the window edge.
-        Rectangle {
-            x: parent.width - 18px;
-            y: parent.height - 18px;
-            width: 18px;
-            height: 18px;
-            np-resize-ta := TouchArea {
-                mouse-cursor: nwse-resize;
-                pointer-event(e) => {
-                    if (e.kind == PointerEventKind.down) {
-                        root.np-resizing = true;
-                        root.np-rs-base-w = root.np-width;
-                        root.np-rs-base-h = root.np-height;
-                        root.np-rs-grab-x = self.absolute-position.x + self.mouse-x;
-                        root.np-rs-grab-y = self.absolute-position.y + self.mouse-y;
-                    } else if (e.kind == PointerEventKind.up) {
-                        root.np-resizing = false;
-                        root.notepad-geometry-save();
-                    }
-                }
-                moved => {
-                    if (root.np-resizing) {
-                        root.np-width = clamp(
-                            root.np-rs-base-w + (self.absolute-position.x + self.mouse-x - root.np-rs-grab-x),
-                            420px, max(420px, root.width - root.np-x));
-                        root.np-height = clamp(
-                            root.np-rs-base-h + (self.absolute-position.y + self.mouse-y - root.np-rs-grab-y),
-                            280px, max(280px, root.height - root.np-y));
-                    }
-                }
-            }
-            Text {
-                text: "◢";
-                color: np-resize-ta.has-hover ? Theme.text-secondary : Theme.text-muted;
-                font-size: 10px;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-            }
-        }
-        // Focus the text as soon as the notepad opens.
-        init => { np-input.focus(); }
-    }
-
     // --- Interface settings dialog (font family + size) -------------------
     if root.interface-open : Rectangle {
         width: parent.width;
@@ -3527,6 +3357,42 @@ export component AppWindow inherits Window {
                                                 text: root.lang-en ? "Choose" : "选择";
                                                 clicked => { root.pick-external-editor(); }
                                             }
+                                        }
+                                    }
+
+                                    Rectangle { height: 1px; background: Theme.border-subtle; }
+
+                                    VerticalLayout {
+                                        spacing: 6px;
+                                        Text {
+                                            text: root.lang-en ? "Notepad file (nav rail #3 opens it with the system default app)" : "记事本文件（导航栏 #3 用系统默认程序打开）";
+                                            color: Theme.text-secondary;
+                                            font-size: Theme.fs-sm;
+                                        }
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            np-file-input := LineEdit {
+                                                horizontal-stretch: 1;
+                                                text <=> root.notepad-file;
+                                                placeholder-text: root.lang-en ? "default: config dir / notes.md" : "默认：配置目录 / notes.md";
+                                                accepted => { root.set-notepad-file(self.text); }
+                                            }
+                                            Button {
+                                                text: root.lang-en ? "Save" : "保存";
+                                                clicked => { root.set-notepad-file(root.notepad-file); }
+                                            }
+                                            Button {
+                                                text: root.lang-en ? "Choose" : "选择";
+                                                clicked => { root.pick-notepad-file(); }
+                                            }
+                                        }
+                                        Text {
+                                            text: root.lang-en
+                                                ? "Empty = built-in default path. The file is created automatically on first open."
+                                                : "留空使用内置默认路径，首次打开时自动创建文件。";
+                                            color: Theme.text-muted;
+                                            font-size: Theme.fs-sm;
+                                            wrap: word-wrap;
                                         }
                                     }
 

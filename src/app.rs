@@ -505,20 +505,6 @@ pub fn init_panic_hook() {
     }));
 }
 
-/// `<config_dir>/notes.txt` — the nav-rail #3 notepad's persistent storage.
-/// Best-effort: failures are logged (WARN) but never fatal.
-fn write_notes_file(text: &str) {
-    match crate::config::app_config_dir() {
-        Ok(dir) => {
-            let _ = std::fs::create_dir_all(&dir);
-            if let Err(e) = std::fs::write(dir.join("notes.txt"), text.as_bytes()) {
-                tracing::warn!("notepad save failed: {e}");
-            }
-        }
-        Err(e) => tracing::warn!("notepad save: config dir unavailable: {e:#}"),
-    }
-}
-
 pub fn run() -> Result<()> {
     // --- Runtime + store -------------------------------------------------
     let runtime = Arc::new(Runtime::new().context("failed to start tokio runtime")?);
@@ -1856,77 +1842,63 @@ pub fn run() -> Result<()> {
         Box::leak(Box::new(panic_timer));
     }
 
-    // Notepad (nav rail #3) shared state: the debounced autosave timer and the
-    // win-close flush below both write through these.
-    let pending_notes = Rc::new(RefCell::new(String::new()));
-    let notes_dirty = Rc::new(std::cell::Cell::new(false));
+    // Notepad (nav rail #3): the button opens the configured md file with the
+    // OS default application (no more in-app panel).
     {
-        // Restore last session's text (missing file → empty notepad).
-        let notes = crate::config::app_config_dir()
-            .ok()
-            .and_then(|dir| std::fs::read_to_string(dir.join("notes.txt")).ok())
-            .unwrap_or_default();
-        window.set_notepad_text(notes.into());
+        window.set_notepad_file(store.borrow().notepad_file_raw().into());
 
-        // Restore the panel's last placement/size (absent → 1400x900 centered).
-        let (np_x, np_y, np_w, np_h) = store.borrow().notepad_geometry();
-        if let Some(w) = np_w {
-            window.set_np_width(w as f32);
-        }
-        if let Some(h) = np_h {
-            window.set_np_height(h as f32);
-        }
-        if let Some(x) = np_x {
-            window.set_np_x(x as f32);
-        }
-        if let Some(y) = np_y {
-            window.set_np_y(y as f32);
-        }
+        window.on_open_notepad({
+            let store = store.clone();
+            move || {
+                let path = store.borrow().notepad_file();
+                // First click on a fresh install: materialise an empty file so
+                // the OS default app has something to open. Best-effort.
+                if !path.exists() {
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if let Err(e) = std::fs::write(&path, b"") {
+                        tracing::warn!("notepad file create failed at {}: {e}", path.display());
+                    }
+                }
+                crate::sftp::open_with_os(&path.to_string_lossy());
+            }
+        });
 
-        // Drag/resize finished → persist the placement right away.
-        {
+        window.on_set_notepad_file({
             let store = store.clone();
             let weak = window.as_weak();
-            window.on_notepad_geometry_save(move || {
+            move |path: SharedString| {
+                let mut s = store.borrow_mut();
+                s.set_notepad_file(path.to_string());
+                let saved = s.notepad_file_raw().to_string();
+                let _ = s.save();
+                drop(s);
                 if let Some(w) = weak.upgrade() {
-                    let mut s = store.borrow_mut();
-                    s.set_notepad_geometry(
-                        w.get_np_x() as f64,
-                        w.get_np_y() as f64,
-                        w.get_np_width() as f64,
-                        w.get_np_height() as f64,
-                    );
-                    let _ = s.save();
+                    w.set_notepad_file(saved.into());
                 }
-            });
-        }
+            }
+        });
 
-        // Debounced autosave: restart the single-shot timer on every edit so
-        // the write happens 500 ms after the last keystroke, not per keystroke.
-        let notes_timer = Rc::new(RefCell::new(slint::Timer::default()));
-        notes_timer.borrow().start(
-            slint::TimerMode::SingleShot,
-            std::time::Duration::from_millis(500),
-            {
-                let pending_notes = pending_notes.clone();
-                let notes_dirty = notes_dirty.clone();
-                move || {
-                    if !notes_dirty.get() {
-                        return;
-                    }
-                    notes_dirty.set(false);
-                    write_notes_file(&pending_notes.borrow());
+        window.on_pick_notepad_file({
+            let store = store.clone();
+            let weak = window.as_weak();
+            move || {
+                // Save dialog: the target md file often doesn't exist yet
+                // (e.g. D:/notes/todo.md), which a pick-file dialog can't select.
+                let selected = rfd::FileDialog::new()
+                    .set_title(t("选择记事本文件", "Choose notepad file"))
+                    .set_file_name("notes.md")
+                    .save_file();
+                let Some(selected) = selected else { return };
+                let mut s = store.borrow_mut();
+                s.set_notepad_file(selected.to_string_lossy().to_string());
+                let saved = s.notepad_file_raw().to_string();
+                let _ = s.save();
+                drop(s);
+                if let Some(w) = weak.upgrade() {
+                    w.set_notepad_file(saved.into());
                 }
-            },
-        );
-        window.on_notepad_text_changed({
-            let pending_notes = pending_notes.clone();
-            let notes_dirty = notes_dirty.clone();
-            let notes_timer = notes_timer.clone();
-            move |text: SharedString| {
-                *pending_notes.borrow_mut() = text.to_string();
-                notes_dirty.set(true);
-                notes_timer.borrow().restart();
             }
         });
     }
@@ -1981,14 +1953,6 @@ pub fn run() -> Result<()> {
             if !is_max && !minimized_pos && size.width > 0 && size.height > 0 {
                 s.set_window_geometry(Some(pos.x), Some(pos.y), size.width, size.height);
             }
-            // Notepad panel placement rides along with every config save so
-            // its last drag/resize always lands on disk eventually too.
-            s.set_notepad_geometry(
-                w.get_np_x() as f64,
-                w.get_np_y() as f64,
-                w.get_np_width() as f64,
-                w.get_np_height() as f64,
-            );
             let _ = s.save();
         }
     });
@@ -2118,12 +2082,6 @@ pub fn run() -> Result<()> {
         window.on_win_close(move || {
             if let Some(w) = weak.upgrade() {
                 save(&w);
-                // Flush a pending notepad edit so the last keystrokes survive
-                // the quit (the debounced timer won't fire after exit).
-                if notes_dirty.get() {
-                    notes_dirty.set(false);
-                    write_notes_file(&pending_notes.borrow());
-                }
                 // Mirror the native-X behaviour: confirm if sessions are open.
                 if close_handles.borrow().is_empty() {
                     let _ = slint::quit_event_loop();
