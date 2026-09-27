@@ -2,6 +2,23 @@
 
 ## 2026-09-27
 
+### Alpine 等 ash/dash 系统按↑出现 hook 注入命令；所有系统 MOTD 欢迎语不再显示
+
+### 背景/现象/根因
+- Alpine Linux v3.20 连接后按向上键翻出一大段 `__ms7`/`__msc` 命令。这段命令是 meatshell 的 shell hook 安装行（OSC 7 报告 cwd 供 SFTP 跟随 cd、OSC 697 捕获终端命令进命令框历史）。bash 下它会用 `history -d` 自删；但 Alpine 默认 shell 是 BusyBox ash——没有 `history` 内建、不支持 PROMPT_COMMAND、也不支持 HISTCONTROL 前导空格，于是这行命令留在 ash 历史里按 ↑ 就翻出来，且 hook 本身在这些 shell 上根本无法生效。
+- 连接后不再打印 MOTD 欢迎语（任何系统均如此）：hook 注入逻辑在"第一个非空输出块"到达时就注入并开启回显抑制——把从该块开始直到 OSC 7 出现的所有输出缓冲后丢弃（为了藏掉注入命令的回显）。但多数系统的第一个非空输出是 MOTD+prompt 而非裸 prompt，MOTD 被整个丢进丢弃缓冲。
+
+### 改动/新增
+- `src/ssh.rs`：新增 `probe_login_shell`（exec 通道 `echo "$SHELL"`，sshd 会将其设为账户登录 shell，2 秒超时兜底）与 `shell_supports_prompt_hook`（仅 bash/zsh 返回 true；探测失败回退旧行为注入）。hook 仅注入到能承载它的 shell。
+- 注入时机改为"输出静默 250ms 后"（自首个输出起最长 3 秒兜底，select 新增 deadline 臂）：首个输出块（MOTD+prompt）立即转发显示，回显抑制窗口只可能吞掉 hook 自身的回显，不再吞掉欢迎语。
+
+### 修复/效果
+- Alpine/ash、dash、fish 等系统不再向历史注入无用的 hook 行，按 ↑ 干净；bash/zsh 的 cd 跟随与命令捕获不受影响。
+- MOTD 欢迎语在任何系统上恢复正常显示（ssh 流量仍走 `request_shell`，PAM motd 正常打印）；bash/zsh 下回显抑制与 #98 的防回显逻辑保持不变。cargo build 与全量 120 个单测通过。
+
+### 涉及文件
+- `src/ssh.rs`
+
 ### root 视角修复：密码框眼睛/记忆、新建/上传/删除等操作真正走 sudo
 
 ### 背景/现象/根因

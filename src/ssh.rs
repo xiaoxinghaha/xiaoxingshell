@@ -859,6 +859,14 @@ async fn run_session(
         .context("request PTY")?;
     channel.request_shell(true).await.context("request shell")?;
 
+    // Probe the login shell so the OSC-7/697 hook is only installed into
+    // shells that can actually host it — see shell_supports_prompt_hook.
+    // BusyBox ash (Alpine), dash and friends have no PROMPT_COMMAND and no
+    // `history -d`, so the injected line used to just rot in their history
+    // and pop up on the Up arrow. Falls back to "yes" when the probe fails
+    // (old behaviour).
+    let shell_hook_ok = shell_supports_prompt_hook(&probe_login_shell(&handle).await);
+
     let _ = events.send(SessionEvent::Connected);
     let _ = events.send(SessionEvent::Status(format!(
         "{} {}@{}",
@@ -875,6 +883,12 @@ async fn run_session(
     // We wait for the first non-empty data chunk (the initial shell prompt)
     // before sending so the command doesn't interleave with banner text.
     let mut prompt_injected = false;
+    // Output-silence scheduling for that injection (see the chunk loop): the
+    // first chunk — usually the MOTD banner, not the prompt — is forwarded
+    // immediately, and the hook goes out only after output has been quiet for
+    // a moment, so the echo-suppress window can never swallow the banner.
+    let mut first_output_at: Option<std::time::Instant> = None;
+    let mut inject_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
     // True from injecting PROMPT_SETUP until the echoed setup line has been
     // received and stripped; output is buffered (not shown) during that window.
     let mut suppress_echo = false;
@@ -1124,13 +1138,34 @@ async fn run_session(
                         let chunk = String::from_utf8_lossy(&raw[..valid_len]).into_owned();
                         debug_assert_eq!(tail_len, utf8_carry.len());
 
-                        // Inject PROMPT_COMMAND after the first real shell output.
+                        // Inject PROMPT_COMMAND after the banner has finished
+                        // streaming. Forward this chunk right away (it is the
+                        // MOTD banner + first prompt on most distros — the old
+                        // code buffered it into the echo-suppress window, which
+                        // threw the welcome banner away on every system), then
+                        // arm a short silence timer: the hook goes out only
+                        // once output has been quiet for a moment, so by the
+                        // time it runs the banner is fully on screen and the
+                        // suppress window can only swallow the hook's own echo.
                         if !prompt_injected && !chunk.trim().is_empty() {
-                            prompt_injected = true;
-                            suppress_echo = true;
-                            let _ = channel.data(prompt_setup.as_bytes()).await;
-                            // Fall through: this chunk is buffered below so the
-                            // echoed setup line is stripped as a single piece.
+                            let now = std::time::Instant::now();
+                            if first_output_at.is_none() {
+                                first_output_at = Some(now);
+                            }
+                            let since_first = now - first_output_at.unwrap();
+                            // Hard cap: a server that keeps streaming output
+                            // would otherwise postpone the hook forever.
+                            const HOOK_SILENCE: std::time::Duration =
+                                std::time::Duration::from_millis(250);
+                            const HOOK_MAX_WAIT: std::time::Duration =
+                                std::time::Duration::from_secs(3);
+                            let remaining = if since_first >= HOOK_MAX_WAIT {
+                                std::time::Duration::ZERO
+                            } else {
+                                HOOK_SILENCE.min(HOOK_MAX_WAIT - since_first)
+                            };
+                            inject_deadline =
+                                Some(Box::pin(tokio::time::sleep(remaining)));
                         }
 
                         // While suppressing, buffer output until the injected
@@ -1283,6 +1318,23 @@ async fn run_session(
                     _ => {}
                 }
             }
+            // Output has been quiet (or the 3 s cap hit): install the prompt
+            // hook now. While `inject_deadline` is `None` (already injected,
+            // shell can't host the hook, or no output yet) this arm is
+            // forever pending.
+            _ = async {
+                match inject_deadline.as_mut() {
+                    Some(sleep) => sleep.as_mut().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                inject_deadline = None;
+                if shell_hook_ok {
+                    prompt_injected = true;
+                    suppress_echo = true;
+                    let _ = channel.data(prompt_setup.as_bytes()).await;
+                }
+            }
         }
     }
 
@@ -1302,6 +1354,38 @@ async fn run_session(
         t("连接已关闭", "connection closed").into(),
     ));
     Ok(())
+}
+
+/// Probe the login user's shell via a short exec channel: sshd seeds `$SHELL`
+/// with the account's login shell even for non-interactive commands. Returns
+/// an empty string on any failure — callers then fall back to the old
+/// always-inject behaviour.
+async fn probe_login_shell(handle: &Handle<ClientHandler>) -> String {
+    let probe = async {
+        let mut ch = handle.channel_open_session().await.ok()?;
+        ch.exec(true, b"echo \"$SHELL\"").await.ok()?;
+        let mut out = Vec::new();
+        while let Some(msg) = ch.wait().await {
+            if let ChannelMsg::Data { data } = msg {
+                out.extend_from_slice(&data);
+            }
+        }
+        Some(String::from_utf8_lossy(&out).trim().to_string())
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(2), probe).await {
+        Ok(Some(shell)) => shell,
+        _ => String::new(),
+    }
+}
+
+/// The prompt hook needs PROMPT_COMMAND (bash) or add-zsh-hook (zsh).
+/// BusyBox ash (Alpine), dash and friends have neither — and no `history -d`
+/// either — so the injected line would just rot in their history and pop up
+/// on the Up arrow. fish is excluded too: it emits OSC 7 itself and the hook
+/// would only pollute its history.
+fn shell_supports_prompt_hook(shell_path: &str) -> bool {
+    let lower = shell_path.to_ascii_lowercase();
+    lower.contains("bash") || lower.contains("zsh")
 }
 
 async fn collect_system_info(handle: &Handle<ClientHandler>, lang_en: bool) -> Result<String> {
