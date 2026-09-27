@@ -178,6 +178,11 @@ export component SftpPanel inherits Rectangle {
     callback download-range(int, int);
     callback upload-clicked(string /* remote dir */, bool /* folder */);
     callback sudo-clicked();
+    // Freeze the selected rows' paths at right-click time. The menu later
+    // operates on these captured paths, NOT on row indices: an auto-refresh
+    // that replaces the model between right-click and menu-click would
+    // otherwise make range delete/download hit the WRONG files.
+    callback capture-selection-range(int /* start row */, int /* end row */);
     callback refresh(string);
     callback tree-expand(string);   // toggle expand/collapse + navigate
     callback delete(string);        // remove a remote file/dir
@@ -969,6 +974,7 @@ export component SftpPanel inherits Rectangle {
                                     root.menu-target = "";
                                     root.menu-selection-start = -1;
                                     root.menu-selection-end = -1;
+                                    root.capture-selection-range(-1, -1);
                                     root.menu-x = self.absolute-position.x + self.mouse-x - file-area.absolute-position.x;
                                     root.menu-y = self.absolute-position.y + self.mouse-y - file-area.absolute-position.y;
                                     file-menu.show();
@@ -1064,6 +1070,7 @@ export component SftpPanel inherits Rectangle {
                                         root.menu-target-mode = entry.mode;
                                         root.menu-selection-start = root.selection-start-row;
                                         root.menu-selection-end = root.selection-end-row;
+                                        root.capture-selection-range(root.menu-selection-start, root.menu-selection-end);
                                         root.menu-x = self.absolute-position.x + self.mouse-x - file-area.absolute-position.x;
                                         root.menu-y = self.absolute-position.y + self.mouse-y - file-area.absolute-position.y;
                                         file-menu.show();
@@ -1223,6 +1230,10 @@ export component SftpPanel inherits Rectangle {
                                     if (root.selection-start-row >= 0
                                             && root.selection-end-row >= 0
                                             && root.selection-start-row != root.selection-end-row) {
+                                        // Refresh the frozen-path capture so the
+                                        // range action targets the live keyboard
+                                        // selection, not a stale right-click one.
+                                        root.capture-selection-range(root.selection-start-row, root.selection-end-row);
                                         root.delete-range(root.selection-start-row, root.selection-end-row);
                                     } else {
                                         root.delete(root.entries[root.selected-row].full-path);

@@ -609,6 +609,7 @@ export component AppWindow inherits Window {
     // Trigger an upload: Rust opens a file-picker dialog then transfers.
     callback sftp-upload-clicked(string /* tab-id */, string /* remote-dir */, bool /* folder */);
     callback sftp-sudo-clicked(string /* tab-id */);
+    callback sftp-capture-selection-range(string /* tab-id */, int /* start row */, int /* end row */);
     // Refresh the current directory listing.
     callback sftp-refresh(string /* tab-id */, string /* path */);
     // Toggle expand/collapse of a tree node (also navigates to that directory).
@@ -1000,6 +1001,7 @@ export component AppWindow inherits Window {
                             sftp-download-range(start, end) => { root.sftp-download-range(term.id, start, end); }
                             sftp-upload-clicked(dir, folder) => { root.sftp-upload-clicked(term.id, dir, folder); }
                             sftp-sudo-clicked() => { root.sftp-sudo-clicked(term.id); }
+                            sftp-capture-selection-range(s, e) => { root.sftp-capture-selection-range(term.id, s, e); }
                             sftp-refresh(path) => { root.sftp-refresh(term.id, path); }
                             sftp-tree-expand(path) => { root.sftp-tree-expand(term.id, path); }
                             // Gate delete behind an in-app confirmation (#28): stash the

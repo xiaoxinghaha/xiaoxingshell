@@ -93,15 +93,17 @@ const ZMODEM_CANCEL: [u8; 16] = [
     0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08,
 ];
 
-/// Detect the start of a ZMODEM transfer (sz/rz) in a raw channel chunk.
+/// Detect the start of a ZMODEM transfer (sz) in a raw channel chunk.
 ///
-/// Every ZMODEM frame begins with ZDLE (0x18) followed by a type byte; the
-/// `sz` handshake leads with a ZRQINIT hex header (`**\x18B00...`). Matching
-/// ZDLE followed by `B` (hex frame) or `C` (binary frame) reliably catches the
-/// handshake without false-positiving on a lone 0x18 (Ctrl-X) in normal output.
+/// `sz` always opens with a ZRQINIT hex header: ZPAD ZPAD ZDLE 'B' — i.e. the
+/// literal bytes `**\x18B`. Matching that full 4-byte sequence avoids the
+/// catastrophic false positive of the old 2-byte check (`\x18` + `B`/`C`):
+/// plain binary output like `cat` of a firmware image routinely contains those
+/// pairs, which used to hijack the pump, swallow all output for 30 s and inject
+/// 8×Ctrl-X into the foreground program. (`rz` uploads are not supported; only
+/// `sz` downloads are detected, and every lrzsz-family `sz` leads with ZRQINIT.)
 fn contains_zmodem_init(data: &[u8]) -> bool {
-    data.windows(2)
-        .any(|w| w[0] == 0x18 && (w[1] == b'B' || w[1] == b'C'))
+    data.windows(4).any(|w| w == [0x2A, 0x2A, 0x18, b'B'])
 }
 
 /// Extract the remote path from an OSC 7 sequence embedded in `text`.
@@ -892,6 +894,11 @@ async fn run_session(
     // True from injecting PROMPT_SETUP until the echoed setup line has been
     // received and stripped; output is buffered (not shown) during that window.
     let mut suppress_echo = false;
+    // Watchdog for that window: a program that doesn't echo (passwd, su, a
+    // nested ssh into a non-bash shell) swallows the injected hook line, OSC 7
+    // never arrives, and queued keystrokes would be stuck forever. After the
+    // timeout the window is dropped and queued input is released.
+    let mut suppress_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
     // Keystrokes sent while the setup line is being echoed can appear before
     // the setup's OSC 7 marker and be swallowed with that echo. Queue them
     // until the hook is installed, then replay them in order.
@@ -945,6 +952,12 @@ async fn run_session(
     // wraps — we never substring-match it.
     const PROMPT_BODY: &str = "test -z \"$FISH_VERSION\" && eval '__msc(){ __c=\"$(fc -ln -1 2>/dev/null)\"; [ -n \"$__c\" ] && [ \"$__c\" != \"$__cl\" ] && { __cl=\"$__c\"; printf \"\\033]697;%s\\007\" \"$__c\"; }; }; __ms7(){ __msc; printf \"\\033]7;file://%s%s\\007\" \"$HOSTNAME\" \"$PWD\"; }; __h=\"$(history 1 2>/dev/null)\"; __h=\"${__h#\"${__h%%[! ]*}\"}\"; __h=\"${__h%%[!0-9]*}\"; [ -n \"$BASH_VERSION\" ] && [ -n \"$__h\" ] && history -d \"$__h\" 2>/dev/null; unset __h; __cl=\"$(fc -ln -1 2>/dev/null)\"; if [ -n \"$ZSH_VERSION\" ]; then autoload -Uz add-zsh-hook 2>/dev/null; add-zsh-hook precmd __ms7; else PROMPT_COMMAND=\"__ms7${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"; fi; __ms7'";
     let prompt_setup = format!(" {}\r", PROMPT_BODY);
+    // Hook-injection scheduling (see the pump loop): wait for output silence
+    // before sending, with a hard cap for servers that keep streaming.
+    const HOOK_SILENCE: std::time::Duration = std::time::Duration::from_millis(250);
+    const HOOK_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+    // Echo-suppress watchdog: release queued keystrokes if OSC 7 never comes.
+    const HOOK_SUPPRESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
     // --- Remote resource monitor (separate exec channel) ----------------
     // A tiny remote loop streams /proc/stat + /proc/meminfo every 2s; we parse
@@ -1063,10 +1076,26 @@ async fn run_session(
                         let handle = handle.clone();
                         let events = events.clone();
                         tokio::spawn(async move {
-                            let (content, error) = match collect_system_info(&handle, lang_en).await
-                            {
-                                Ok(text) => (text, String::new()),
-                                Err(err) => (String::new(), err.to_string()),
+                            // The info commands (`df -hT` et al.) can hang for
+                            // minutes on a stale NFS mount; without a timeout
+                            // the info tab spins forever. The channel is
+                            // dropped on timeout, so a retry starts clean.
+                            let outcome = tokio::time::timeout(
+                                std::time::Duration::from_secs(15),
+                                collect_system_info(&handle, lang_en),
+                            )
+                            .await;
+                            let (content, error) = match outcome {
+                                Ok(Ok(text)) => (text, String::new()),
+                                Ok(Err(err)) => (String::new(), err.to_string()),
+                                Err(_) => (
+                                    String::new(),
+                                    t(
+                                        "系统信息请求超时,请稍后重试",
+                                        "system info request timed out; try again",
+                                    )
+                                    .to_string(),
+                                ),
                             };
                             let _ = events.send(SessionEvent::SystemInfo {
                                 request_id,
@@ -1153,12 +1182,6 @@ async fn run_session(
                                 first_output_at = Some(now);
                             }
                             let since_first = now - first_output_at.unwrap();
-                            // Hard cap: a server that keeps streaming output
-                            // would otherwise postpone the hook forever.
-                            const HOOK_SILENCE: std::time::Duration =
-                                std::time::Duration::from_millis(250);
-                            const HOOK_MAX_WAIT: std::time::Duration =
-                                std::time::Duration::from_secs(3);
                             let remaining = if since_first >= HOOK_MAX_WAIT {
                                 std::time::Duration::ZERO
                             } else {
@@ -1183,6 +1206,7 @@ async fn run_session(
                             const ECHO_BUF_CAP: usize = 1 << 14; // 16 KiB
                             if let Some((cwd, seq_end)) = extract_osc7_end(&echo_buf) {
                                 suppress_echo = false;
+                                suppress_deadline = None;
                                 flush_pending_input = true;
                                 tracing::debug!("OSC7 cwd={:?}", cwd);
                                 let _ = events.send(SessionEvent::CwdChanged(cwd));
@@ -1191,6 +1215,7 @@ async fn run_session(
                                 rest
                             } else if echo_buf.len() >= ECHO_BUF_CAP {
                                 suppress_echo = false;
+                                suppress_deadline = None;
                                 flush_pending_input = true;
                                 std::mem::take(&mut echo_buf)
                             } else {
@@ -1332,7 +1357,35 @@ async fn run_session(
                 if shell_hook_ok {
                     prompt_injected = true;
                     suppress_echo = true;
+                    suppress_deadline =
+                        Some(Box::pin(tokio::time::sleep(HOOK_SUPPRESS_TIMEOUT)));
                     let _ = channel.data(prompt_setup.as_bytes()).await;
+                }
+            }
+            // Echo-suppress watchdog: the injected hook line was swallowed by a
+            // non-echoing program (passwd, su, nested ssh into a non-bash
+            // shell), so OSC 7 never arrived and keystrokes kept queueing. Drop
+            // the suppress window (its buffered echo fragments are useless) and
+            // release the queued input to the PTY.
+            _ = async {
+                match suppress_deadline.as_mut() {
+                    Some(sleep) => sleep.as_mut().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                suppress_deadline = None;
+                suppress_echo = false;
+                echo_buf.clear();
+                tracing::warn!("echo-suppress window timed out; queued input released");
+                if !pending_input_while_suppress.is_empty() {
+                    let queued = std::mem::take(&mut pending_input_while_suppress);
+                    if let Err(err) = channel.data(&queued[..]).await {
+                        let _ = events.send(SessionEvent::Closed(format!(
+                            "{}: {err}",
+                            t("写入失败", "write failed")
+                        )));
+                        break;
+                    }
                 }
             }
         }

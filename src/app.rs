@@ -136,13 +136,34 @@ fn parse_theme_override(input: &str, fallback: slint::Color) -> slint::Color {
         return fallback;
     }
     let hex = s.strip_prefix('#').unwrap_or(s);
-    if hex.len() == 6 {
-        if let (Ok(r), Ok(g), Ok(b)) = (
-            u8::from_str_radix(&hex[0..2], 16),
-            u8::from_str_radix(&hex[2..4], 16),
-            u8::from_str_radix(&hex[4..6], 16),
+    // Parse per-byte instead of slicing `&hex[0..2]`: `len() == 6` counts
+    // *bytes*, and a hand-edited config value with multi-byte characters
+    // (e.g. "深色红") would slice mid-character → panic in `run()` before the
+    // event loop starts, crashing on every launch. Non-ASCII simply falls
+    // through to the fallback.
+    let bytes = hex.as_bytes();
+    if bytes.len() == 6 {
+        let hex_digit = |b: u8| -> Option<u8> {
+            match b {
+                b'0'..=b'9' => Some(b - b'0'),
+                b'a'..=b'f' => Some(b - b'a' + 10),
+                b'A'..=b'F' => Some(b - b'A' + 10),
+                _ => None,
+            }
+        };
+        if let (Some(r_hi), Some(r_lo), Some(g_hi), Some(g_lo), Some(b_hi), Some(b_lo)) = (
+            hex_digit(bytes[0]),
+            hex_digit(bytes[1]),
+            hex_digit(bytes[2]),
+            hex_digit(bytes[3]),
+            hex_digit(bytes[4]),
+            hex_digit(bytes[5]),
         ) {
-            return slint::Color::from_rgb_u8(r, g, b);
+            return slint::Color::from_rgb_u8(
+                r_hi << 4 | r_lo,
+                g_hi << 4 | g_lo,
+                b_hi << 4 | b_lo,
+            );
         }
     }
     let lower = s.to_ascii_lowercase();
@@ -248,6 +269,11 @@ type TabStatuses = Arc<Mutex<HashMap<String, TabStatus>>>;
 type LocalSnap = Arc<Mutex<SystemSnapshot>>;
 type SftpEntryCache = Arc<Mutex<HashMap<String, Vec<RemoteEntry>>>>;
 type SudoStates = Rc<RefCell<HashMap<String, SudoUploadState>>>;
+/// Per-tab remote paths frozen at right-click time for the context-menu range
+/// actions (delete/download). Freezing paths — not row indices — keeps an
+/// auto-refresh that replaces the model between right-click and menu-click
+/// from re-targeting the action onto different files.
+type SftpMenuSelection = Arc<Mutex<HashMap<String, Vec<String>>>>;
 
 #[derive(Clone, Default)]
 struct SudoUploadState {
@@ -852,7 +878,7 @@ pub fn run() -> Result<()> {
                 saved
             };
             {
-                let mut map = bufs.lock().unwrap();
+                let mut map = bufs.lock().unwrap_or_else(|e| e.into_inner());
                 for buf in map.values_mut() {
                     buf.set_max_history_lines(saved as usize);
                 }
@@ -895,7 +921,7 @@ pub fn run() -> Result<()> {
                 saved
             };
             {
-                let mut map = bufs.lock().unwrap();
+                let mut map = bufs.lock().unwrap_or_else(|e| e.into_inner());
                 for buf in map.values_mut() {
                     buf.set_max_ingest_per_tick(saved as usize * 1024);
                 }
@@ -1153,14 +1179,14 @@ pub fn run() -> Result<()> {
             w.set_dark_mode(next_dark);
             // Propagate new palette to all open terminal buffers.
             {
-                let mut map = bufs_theme.lock().unwrap();
+                let mut map = bufs_theme.lock().unwrap_or_else(|e| e.into_inner());
                 for buf in map.values_mut() {
                     buf.is_dark = next_dark;
                 }
             }
             // Re-render every visible terminal so colours update immediately.
             let tab_ids: Vec<String> = {
-                let map = bufs_theme.lock().unwrap();
+                let map = bufs_theme.lock().unwrap_or_else(|e| e.into_inner());
                 map.keys().cloned().collect()
             };
             for tid in tab_ids {
@@ -1417,7 +1443,7 @@ pub fn run() -> Result<()> {
             }
 
             let queued = {
-                let mut map = bufs.lock().unwrap();
+                let mut map = bufs.lock().unwrap_or_else(|e| e.into_inner());
                 let Some(buf) = map.get_mut(active.as_str()) else {
                     return;
                 };
@@ -3159,7 +3185,7 @@ fn wire_session_callbacks(
             let is_dark_now = weak.upgrade().map(|w| w.get_dark_mode()).unwrap_or(true);
             let scrollback_lines = store.borrow().terminal_scrollback_lines() as usize;
             let max_ingest_bytes = store.borrow().terminal_max_ingest_kib() as usize * 1024;
-            bufs.lock().unwrap().insert(
+            bufs.lock().unwrap_or_else(|e| e.into_inner()).insert(
                 tab_id.clone(),
                 TermBuffer {
                     parser: vt100::Parser::new(24, 80, 0),
@@ -3933,7 +3959,7 @@ fn compute_find_matches(rows: &[String], query: &str) -> Vec<TermMatch> {
 /// Used by scroll + selection callbacks (Output has its own equivalent inline).
 fn rebuild_tab_display(win: &AppWindow, bufs: &TermBuffers, tab_id: &str) {
     let data = {
-        let mut map = bufs.lock().unwrap();
+        let mut map = bufs.lock().unwrap_or_else(|e| e.into_inner());
         let Some(buf) = map.get_mut(tab_id) else {
             return;
         };
@@ -4196,7 +4222,7 @@ fn apply_session_event_to_window(
             // flushes pending_text), so a flood of output can't pile up an
             // unbounded queue of per-event renders on the UI thread.
             {
-                let mut map = bufs.lock().unwrap();
+                let mut map = bufs.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(buf) = map.get_mut(tab_id) {
                     let chunk = buf.strip_suppressed_echo(chunk);
                     if chunk.is_empty() {
@@ -5093,7 +5119,7 @@ fn wire_tab_callbacks(
             sudo_states.borrow_mut().remove(&id);
             sftp_pending_follow.lock().unwrap().remove(&id);
             suppress_cwd_follow.lock().unwrap().remove(&id);
-            bufs.lock().unwrap().remove(&id);
+            bufs.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
 
             // Remove from tabs + terminals models.
             let mut idx = None;
@@ -5218,6 +5244,26 @@ fn wire_sftp_callbacks(
     sftp_entry_cache: SftpEntryCache,
     sftp_sort_states: SftpSortStates,
 ) {
+    let menu_selection: SftpMenuSelection = Arc::new(Mutex::new(HashMap::new()));
+    // Context menu: freeze the selected rows' paths at right-click time (see
+    // SftpMenuSelection). start < 0 = whitespace click → clear the capture.
+    {
+        let weak = window.as_weak();
+        let menu_selection = menu_selection.clone();
+        window.on_sftp_capture_selection_range(
+            move |tab_id: SharedString, start: i32, end: i32| {
+                let tab_id = tab_id.to_string();
+                let paths = weak
+                    .upgrade()
+                    .filter(|_| start >= 0 && end >= 0)
+                    .map(|w| sftp_entry_paths_in_range(&w, &tab_id, start, end))
+                    .unwrap_or_default();
+                if let Ok(mut map) = menu_selection.lock() {
+                    map.insert(tab_id, paths);
+                }
+            },
+        );
+    }
     // Navigate to a remote path (or ".." to go up one level).
     {
         let weak = window.as_weak();
@@ -5398,13 +5444,19 @@ fn wire_sftp_callbacks(
     }
     {
         let sftp_handles = sftp_handles.clone();
+        let menu_selection = menu_selection.clone();
         let weak = window.as_weak();
         window.on_sftp_download_range(move |tab_id: SharedString, start: i32, end: i32| {
             let tab_id = tab_id.to_string();
-            let remote_paths: Vec<String> = weak
-                .upgrade()
-                .map(|w| sftp_entry_paths_in_range(&w, &tab_id, start, end))
-                .unwrap_or_default();
+            // Prefer the paths frozen at right-click time (see delete-range).
+            let captured = menu_selection.lock().ok().and_then(|mut m| m.remove(&tab_id));
+            let remote_paths: Vec<String> = match captured {
+                Some(paths) if !paths.is_empty() => paths,
+                _ => weak
+                    .upgrade()
+                    .map(|w| sftp_entry_paths_in_range(&w, &tab_id, start, end))
+                    .unwrap_or_default(),
+            };
             if remote_paths.is_empty() {
                 return;
             }
@@ -5692,13 +5744,20 @@ fn wire_sftp_callbacks(
     {
         let sftp_handles = sftp_handles.clone();
         let sudo_states = sudo_states.clone();
+        let menu_selection = menu_selection.clone();
         let weak = window.as_weak();
         window.on_sftp_delete_range(move |tab_id: SharedString, start: i32, end: i32| {
             let tab_id = tab_id.to_string();
-            let remote_paths = weak
-                .upgrade()
-                .map(|w| sftp_entry_paths_in_range(&w, &tab_id, start, end))
-                .unwrap_or_default();
+            // Prefer the paths frozen at right-click time; fall back to the
+            // current model (keyboard-Delete path, where selection is live).
+            let captured = menu_selection.lock().ok().and_then(|mut m| m.remove(&tab_id));
+            let remote_paths = match captured {
+                Some(paths) if !paths.is_empty() => paths,
+                _ => weak
+                    .upgrade()
+                    .map(|w| sftp_entry_paths_in_range(&w, &tab_id, start, end))
+                    .unwrap_or_default(),
+            };
             if remote_paths.is_empty() {
                 return;
             }
@@ -6196,7 +6255,7 @@ fn wire_key_input(
                     // Parser scrollback stays 0 — scrollback lives only in our
                     // own `history` (see the init site for why).
                     {
-                        let mut map = ctx.bufs.lock().unwrap();
+                        let mut map = ctx.bufs.lock().unwrap_or_else(|e| e.into_inner());
                         if let Some(b) = map.get_mut(tab_id.as_str()) {
                             let (rows, cols) = b.parser.screen().size();
                             b.parser = vt100::Parser::new(rows, cols, 0);
@@ -6242,7 +6301,7 @@ fn wire_key_input(
             // must send \x1bOA/B/C/D instead of \x1b[A/B/C/D.
             let mut snapped_to_live = false;
             let app_cursor = {
-                let mut map = bufs.lock().unwrap();
+                let mut map = bufs.lock().unwrap_or_else(|e| e.into_inner());
                 match map.get_mut(tab_id.as_str()) {
                     Some(b) => {
                         // Typing snaps the view back to the live bottom so the
@@ -6437,7 +6496,7 @@ fn wire_key_input(
 
             let mut effective_key = key.to_string();
             {
-                let mut map = bufs.lock().unwrap();
+                let mut map = bufs.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(buf) = map.get_mut(tid.as_str()) {
                     let now = std::time::Instant::now();
                     if is_tmux_prefix_key(key.as_str(), ctrl, alt) {
@@ -6465,7 +6524,7 @@ fn wire_key_input(
             let mut locally_buffered_text: Option<String> = None;
             let mut tab_handoff_for_cd = false;
             {
-                let mut map = bufs.lock().unwrap();
+                let mut map = bufs.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(buf) = map.get_mut(tid.as_str()) {
                     local_mode_was_active = buf.can_local_buffer_input();
                     if buf.can_local_buffer_input() {
@@ -6562,7 +6621,7 @@ fn wire_key_input(
             // 程序命令,不是 shell 命令行;直通追踪器无法区分,必须在跟随
             // 前用备用屏幕状态拦截(否则编辑内容里的 "cd xxx" 会误跟随)。
             let in_alt_screen = {
-                let map = bufs.lock().unwrap();
+                let map = bufs.lock().unwrap_or_else(|e| e.into_inner());
                 map.get(tid.as_str())
                     .map(|buf| buf.parser.screen().alternate_screen())
                     .unwrap_or(false)
@@ -6610,7 +6669,7 @@ fn wire_key_input(
                     }
                     // Disable local buffering inside tmux — its echo behaviour
                     // breaks the type-ahead echo suppression and eats chars.
-                    if let Some(buf) = bufs.lock().unwrap().get_mut(tid.as_str()) {
+                    if let Some(buf) = bufs.lock().unwrap_or_else(|e| e.into_inner()).get_mut(tid.as_str()) {
                         buf.lock_local_input_until_prompt();
                     }
                 } else if in_tmux_already && is_tmux_exit_command(line.trim()) {
@@ -6619,7 +6678,7 @@ fn wire_key_input(
                         let mut ts = ctx.tmux_state.lock().unwrap();
                         ts.insert(tid.clone(), false);
                     }
-                    if let Some(buf) = bufs.lock().unwrap().get_mut(tid.as_str()) {
+                    if let Some(buf) = bufs.lock().unwrap_or_else(|e| e.into_inner()).get_mut(tid.as_str()) {
                         buf.unlock_local_input_at_prompt();
                     }
                 }
@@ -6659,7 +6718,7 @@ fn wire_key_input(
                 handles.borrow().contains_key(tab_id.as_str()),
             );
             if local_mode_was_active && (locally_queued_send.is_some() || !bytes.is_empty()) {
-                if let Some(buf) = bufs.lock().unwrap().get_mut(tid.as_str()) {
+                if let Some(buf) = bufs.lock().unwrap_or_else(|e| e.into_inner()).get_mut(tid.as_str()) {
                     buf.lock_local_input_until_prompt();
                 }
             }
@@ -6777,7 +6836,7 @@ fn wire_key_input(
             if let Some(handle) = handles.borrow().get(tab_id.as_str()) {
                 handle.resize(cols, rows);
             }
-            if let Some(buf) = bufs_resize.lock().unwrap().get_mut(tab_id.as_str()) {
+            if let Some(buf) = bufs_resize.lock().unwrap_or_else(|e| e.into_inner()).get_mut(tab_id.as_str()) {
                 let (old_rows, old_cols) = buf.parser.screen().size();
                 let new_rows = rows as u16;
                 // Shrinking the grid (e.g. dragging the SFTP panel up) makes
@@ -6792,29 +6851,41 @@ fn wire_key_input(
                 // blank grid with the cursor stranded at the top, and rapid
                 // up/down dragging would repeat that until the prompt was gone.
                 // Skipped on the alternate screen (vim/btop own their buffer).
-                if new_rows < old_rows && !buf.parser.screen().alternate_screen() {
-                    let (cursor_row, _) = buf.parser.screen().cursor_position();
-                    // Rows that must scroll off the top to keep the cursor in view.
-                    let scroll = (cursor_row + 1).saturating_sub(new_rows);
-                    if scroll > 0 {
-                        let saved: Vec<Line> = {
-                            let s = buf.parser.screen();
-                            (0..scroll).map(|r| build_row(s, r, old_cols)).collect()
-                        };
-                        for mut line in saved {
-                            let prev_full = buf
-                                .history
-                                .last()
-                                .map(|last| line_is_full(last, old_cols))
-                                .unwrap_or(false);
-                            line.wrapped = prev_full;
-                            buf.history.push(line);
+                //
+                // vt100 can panic inside process/set_size on remote-driven
+                // stale-cursor states (see the ingest guard); this runs on the
+                // UI thread, where a panic would unwind through the Slint event
+                // loop and kill the app. Same recovery as ingest: rebuild a
+                // clean parser and let the next output repaint it.
+                let resize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if new_rows < old_rows && !buf.parser.screen().alternate_screen() {
+                        let (cursor_row, _) = buf.parser.screen().cursor_position();
+                        // Rows that must scroll off the top to keep the cursor in view.
+                        let scroll = (cursor_row + 1).saturating_sub(new_rows);
+                        if scroll > 0 {
+                            let saved: Vec<Line> = {
+                                let s = buf.parser.screen();
+                                (0..scroll).map(|r| build_row(s, r, old_cols)).collect()
+                            };
+                            for mut line in saved {
+                                let prev_full = buf
+                                    .history
+                                    .last()
+                                    .map(|last| line_is_full(last, old_cols))
+                                    .unwrap_or(false);
+                                line.wrapped = prev_full;
+                                buf.history.push(line);
+                            }
+                            buf.trim_history_to_limit();
+                            buf.parser.process(format!("\x1b[{scroll}S").as_bytes());
                         }
-                        buf.trim_history_to_limit();
-                        buf.parser.process(format!("\x1b[{scroll}S").as_bytes());
                     }
+                    buf.parser.screen_mut().set_size(new_rows, cols as u16);
+                }));
+                if resize_result.is_err() {
+                    tracing::error!("vt100 resize panicked; parser rebuilt");
+                    buf.parser = vt100::Parser::new(new_rows, cols as u16, 0);
                 }
-                buf.parser.screen_mut().set_size(new_rows, cols as u16);
                 // The pre/post-resize screens differ in size+content; drop the
                 // scroll-detection snapshot so the next output isn't mis-read as
                 // a scroll (which would double-capture lines).
@@ -6858,7 +6929,7 @@ fn wire_key_input(
         let bufs = bufs.clone();
         window.on_copy_terminal_text(move |tab_id: SharedString| {
             let text = {
-                let map = bufs.lock().unwrap();
+                let map = bufs.lock().unwrap_or_else(|e| e.into_inner());
                 match map.get(tab_id.as_str()) {
                     Some(buf) => {
                         // Copy the drag-selection when there is one, else the
@@ -6890,7 +6961,7 @@ fn wire_key_input(
         window.on_copy_selection_or_ctrl_c(move |tab_id: SharedString| {
             let tid = tab_id.to_string();
             let selected = {
-                let mut map = bufs.lock().unwrap();
+                let mut map = bufs.lock().unwrap_or_else(|e| e.into_inner());
                 match map.get_mut(tid.as_str()) {
                     Some(buf) => {
                         let text = buf.extract_selection_text();
@@ -6964,7 +7035,7 @@ fn wire_key_input(
                 match arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
                     Ok(text) => {
                         let locally_buffered = {
-                            let mut map = bufs.lock().unwrap();
+                            let mut map = bufs.lock().unwrap_or_else(|e| e.into_inner());
                             if let Some(buf) = map.get_mut(tid.as_str()) {
                                 if buf.can_local_buffer_input() {
                                     if let Some(single) = locally_bufferable_paste(&text) {
@@ -7021,7 +7092,7 @@ fn wire_key_input(
         let weak = window.as_weak();
         window.on_clear_terminal(move |tab_id: SharedString| {
             let tid = tab_id.to_string();
-            if let Some(buf) = bufs_clear.lock().unwrap().get_mut(&tid) {
+            if let Some(buf) = bufs_clear.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&tid) {
                 let (rows, cols) = buf.parser.screen().size();
                 // Parser scrollback stays 0 — scrollback lives only in our own
                 // `history` (see the init site for why), so keep the memory
@@ -7067,7 +7138,7 @@ fn wire_key_input(
             let tid = tab_id.to_string();
             let q = query.to_string();
             let matches = {
-                let mut map = bufs_find.lock().unwrap();
+                let mut map = bufs_find.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(buf) = map.get_mut(&tid) {
                     buf.find_query = q.clone();
                     compute_find_matches(&buf.displayed_text, &q)
@@ -7091,7 +7162,7 @@ fn wire_key_input(
         window.on_terminal_scroll(move |tab_id: SharedString, delta: i32| {
             let tid = tab_id.to_string();
             {
-                let mut map = bufs_scroll.lock().unwrap();
+                let mut map = bufs_scroll.lock().unwrap_or_else(|e| e.into_inner());
                 let Some(buf) = map.get_mut(&tid) else { return };
                 // Scroll within our own session scrollback (history lines above
                 // the live screen).  Offset 0 = live bottom.
@@ -7116,7 +7187,7 @@ fn wire_key_input(
         window.on_term_select_start(move |tab_id: SharedString, row: i32, col: i32| {
             let tid = tab_id.to_string();
             {
-                let mut map = bufs_sel.lock().unwrap();
+                let mut map = bufs_sel.lock().unwrap_or_else(|e| e.into_inner());
                 let Some(buf) = map.get_mut(&tid) else { return };
                 let (rows, cols) = buf.parser.screen().size();
                 let r = row.clamp(0, rows.saturating_sub(1) as i32) as u16;
@@ -7137,7 +7208,7 @@ fn wire_key_input(
         window.on_term_select_update(move |tab_id: SharedString, row: i32, col: i32| {
             let tid = tab_id.to_string();
             {
-                let mut map = bufs_sel.lock().unwrap();
+                let mut map = bufs_sel.lock().unwrap_or_else(|e| e.into_inner());
                 let Some(buf) = map.get_mut(&tid) else { return };
                 let (rows, cols) = buf.parser.screen().size();
                 let r = row.clamp(0, rows.saturating_sub(1) as i32) as u16;
@@ -7160,7 +7231,7 @@ fn wire_key_input(
             // A zero-area selection is a plain click; otherwise keep the
             // selection highlighted and let Ctrl+C / Ctrl+Shift+C copy it.
             {
-                let mut map = bufs_sel.lock().unwrap();
+                let mut map = bufs_sel.lock().unwrap_or_else(|e| e.into_inner());
                 let Some(buf) = map.get_mut(&tid) else { return };
                 if buf.sel_anchor == buf.sel_focus {
                     buf.sel_anchor = None;
@@ -7178,7 +7249,7 @@ fn wire_key_input(
         window.on_term_select_word(move |tab_id: SharedString, row: i32, col: i32| {
             let tid = tab_id.to_string();
             {
-                let mut map = bufs_sel.lock().unwrap();
+                let mut map = bufs_sel.lock().unwrap_or_else(|e| e.into_inner());
                 let Some(buf) = map.get_mut(&tid) else { return };
                 let (rows, cols) = buf.parser.screen().size();
                 let r = row.clamp(0, rows.saturating_sub(1) as i32) as u16;
@@ -7196,7 +7267,7 @@ fn wire_key_input(
         window.on_term_select_line(move |tab_id: SharedString, row: i32, _col: i32| {
             let tid = tab_id.to_string();
             {
-                let mut map = bufs_sel.lock().unwrap();
+                let mut map = bufs_sel.lock().unwrap_or_else(|e| e.into_inner());
                 let Some(buf) = map.get_mut(&tid) else { return };
                 let (rows, _cols) = buf.parser.screen().size();
                 let r = row.clamp(0, rows.saturating_sub(1) as i32) as u16;
@@ -7217,7 +7288,7 @@ fn wire_key_input(
         window.on_term_select_autoscroll(move |tab_id: SharedString, dir: i32| {
             let tid = tab_id.to_string();
             {
-                let mut map = bufs_sel.lock().unwrap();
+                let mut map = bufs_sel.lock().unwrap_or_else(|e| e.into_inner());
                 let Some(buf) = map.get_mut(&tid) else { return };
                 // No scrollback on the alternate screen (vim/btop own the view).
                 if buf.parser.screen().alternate_screen() {
@@ -7686,6 +7757,31 @@ fn clipboard_set_text(text: String) {
     let result = arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text));
     if let Err(e) = result {
         tracing::warn!("clipboard set_text error: {}", e);
+    }
+}
+
+#[cfg(test)]
+mod theme_override_tests {
+    use super::parse_theme_override;
+
+    #[test]
+    fn multibyte_hex_values_fall_back_instead_of_panicking() {
+        let fallback = slint::Color::from_rgb_u8(0x11, 0x22, 0x33);
+        // These inputs are exactly 6 *bytes* but contain multi-byte UTF-8
+        // characters; the old `&hex[0..2]` slices cut mid-character and
+        // panicked — reachable from `run()` itself (crash on every launch).
+        for input in ["深色", "红abc", "#红红红", "默认"] {
+            assert_eq!(parse_theme_override(input, fallback), fallback);
+        }
+        // Valid forms keep working.
+        assert_eq!(
+            parse_theme_override("#FF8000", fallback),
+            slint::Color::from_rgb_u8(0xFF, 0x80, 0x00)
+        );
+        assert_eq!(
+            parse_theme_override("rgb(16, 128, 0)", fallback),
+            slint::Color::from_rgb_u8(16, 128, 0)
+        );
     }
 }
 

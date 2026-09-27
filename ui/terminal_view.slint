@@ -231,6 +231,8 @@ export component TerminalView inherits Rectangle {
     callback sftp-download-range(int, int);
     callback sftp-upload-clicked(string, bool);
     callback sftp-sudo-clicked();
+    // Right-click capture of the selected rows' paths (see SftpPanel).
+    callback sftp-capture-selection-range(int /* start row */, int /* end row */);
     callback sftp-refresh(string);
     callback sftp-tree-expand(string);
     callback sftp-delete(string);
@@ -1270,6 +1272,7 @@ export component TerminalView inherits Rectangle {
             download-range(start, end) => { root.sftp-download-range(start, end); }
             upload-clicked(dir, folder) => { root.sftp-upload-clicked(dir, folder); }
             sudo-clicked => { root.sftp-sudo-clicked(); }
+            capture-selection-range(s, e) => { root.sftp-capture-selection-range(s, e); }
             refresh(path)       => { root.sftp-refresh(path); }
             tree-expand(path)   => { root.sftp-tree-expand(path); }
             delete(path)        => { root.sftp-delete(path); }

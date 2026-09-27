@@ -2,6 +2,29 @@
 
 ## 2026-09-27
 
+### 崩溃点审计修复（第一优先级：启动崩溃循环、数据安全、假死）
+
+### 背景/现象/根因
+- 全面审计后按优先级修复以下问题：
+  1.【高】`parse_theme_override` 用字节长度判断后直接 `&hex[0..2]` 字节切片：手改 config.json 的主题色为恰好 6 字节但含多字节字符的值（如"深色"）时切在字符中间 panic，且该函数在 `run()` 启动路径被调用——每次启动必崩、循环崩溃。
+  2.【中】vt100 panic 两条穿透路径：`on_terminal_resize` 裸调 `parser.process`/`set_size`（UI 线程无 catch_unwind）；ingest 的 catch_unwind 虽接住 panic 但 unwind 会毒化 `bufs` Mutex，之后渲染 tick 的 `lock().unwrap()` 连环 panic（catch 只延迟了死亡）。
+  3.【中】右键菜单以行索引操作：右键与菜单点击之间若发生自动刷新整体替换文件列表，范围删除/下载会命中**错误的文件**（数据安全）。
+  4.【中】hook 注入的回显抑制无时间兜底：注入行被无回显程序（passwd/su/嵌套 ssh）吞掉时 OSC 7 永不到达，用户按键全部排队不下发（假死）。
+  5.【中】系统信息请求无超时：远端命令挂死（stale NFS 等）时信息面板永久转圈。
+  6.【中】ZMODEM 检测仅匹配 2 字节（`\x18`+B/C）：`cat` 二进制文件极易误触发，主泵停转吞输出 30 秒并向 PTY 注入 Ctrl-X 序列。
+
+### 改动/新增
+- `src/app.rs`：`parse_theme_override` 改为逐字节解析（仅接受 ASCII hex，非 ASCII 直接回退默认色）；`on_terminal_resize` 的 vt100 调用包 `catch_unwind`，panic 时按 ingest 同款策略重建干净 parser；`bufs` 系全部 30 处 `lock().unwrap()` 改为中毒恢复（`unwrap_or_else(|e| e.into_inner())`，与 errlog.rs 同款），单 tab 的 panic 不再级联成全局崩溃。
+- `ui/sftp_panel.slint` + `ui/terminal_view.slint` + `ui/app.slint`：新增 `capture-selection-range` 回调链，右键瞬间把选中行的路径冻结到 Rust 侧（键盘 Delete 同步刷新捕获）；范围删除/下载优先用冻结路径（取不到时回退旧行为），杜绝自动刷新导致的索引错位。
+- `src/ssh.rs`：回显抑制窗口加 5 秒看门狗（超时丢弃抑制缓冲并放行排队按键）；系统信息请求加 15 秒超时（超时后 channel 释放可重试）；ZMODEM 检测收紧为完整 ZRQINIT 帧头 `**\x18B`（4 字节，真 sz 必含，二进制误报概率大幅降低）。
+- 新增单测覆盖多字节主题色的回退路径。
+
+### 修复/效果
+- 配置损坏不再导致启动循环崩溃；窗口缩放命中 vt100 panic 时只丢一帧并自动重建，应用不再退出；右键菜单操作在自动刷新后仍指向用户实际选中的文件；无回显程序下键盘不再假死；信息面板有超时可重试；`cat` 二进制文件不再误触发 ZMODEM。cargo build 与全量 121 个单测通过。
+
+### 涉及文件
+- `src/app.rs`、`src/ssh.rs`、`ui/sftp_panel.slint`、`ui/terminal_view.slint`、`ui/app.slint`
+
 ### Alpine 等 ash/dash 系统按↑出现 hook 注入命令；所有系统 MOTD 欢迎语不再显示
 
 ### 背景/现象/根因
