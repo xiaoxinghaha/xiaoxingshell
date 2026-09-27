@@ -107,12 +107,6 @@ export component LabeledInput inherits VerticalLayout {
     property <bool> revealed: false;
     spacing: 4px;
 
-    changed value => {
-        if (root.password) {
-            root.revealed = false;
-        }
-    }
-
     Text {
         text: label;
         color: Theme.text-secondary;
@@ -126,9 +120,12 @@ export component LabeledInput inherits VerticalLayout {
         border-color: input.has-focus ? Theme.accent : Theme.border-subtle;
         background: Theme.bg-root;
 
+        // Reveal auto-hides after a while so a forgotten open password field
+        // doesn't stay in plaintext forever (but long enough to actually read
+        // what was typed — the old 3s hid it mid-check).
         Timer {
             running: root.password && root.revealed;
-            interval: 3s;
+            interval: 8s;
             triggered => { root.revealed = false; }
         }
 

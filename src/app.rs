@@ -1980,6 +1980,7 @@ pub fn run() -> Result<()> {
         use i_slint_backend_winit::EventResult;
         let weak = window.as_weak();
         let sh = sftp_handles.clone();
+        let drop_sudo_states = sudo_states.clone();
         let close_handles = handles.clone();
         let schedule_save = schedule_window_geometry_save.clone();
         let save_window_geometry = save_window_geometry.clone();
@@ -1994,7 +1995,12 @@ pub fn run() -> Result<()> {
                 }
                 WEvent::DroppedFile(path) => {
                     if let Some(win) = weak.upgrade() {
-                        handle_file_drop(&win, &sh, path.to_string_lossy().to_string());
+                        handle_file_drop(
+                            &win,
+                            &sh,
+                            &drop_sudo_states,
+                            path.to_string_lossy().to_string(),
+                        );
                     }
                     return EventResult::PreventDefault;
                 }
@@ -2260,7 +2266,12 @@ fn cursor_pos() -> Option<(i32, i32)> {
 /// Handle an OS file drop: if it landed over the active tab's SFTP panel,
 /// upload the file to that tab's current remote directory.
 #[cfg(windows)]
-fn handle_file_drop(win: &AppWindow, sftp_handles: &SftpHandles, path: String) {
+fn handle_file_drop(
+    win: &AppWindow,
+    sftp_handles: &SftpHandles,
+    sudo_states: &SudoStates,
+    path: String,
+) {
     let active = win.get_active_tab_id().to_string();
     if active == "welcome" {
         return;
@@ -2295,6 +2306,7 @@ fn handle_file_drop(win: &AppWindow, sftp_handles: &SftpHandles, path: String) {
     if dir.is_empty() {
         return;
     }
+    let sudo_state = active_sudo_state(sudo_states, &active);
     // Session-sync (#sync): when both toggles are on, also mirror the drop to
     // every other online session — each into *its own* current SFTP dir. This
     // matches the upload button's behaviour (drag-and-drop is a separate path).
@@ -2306,7 +2318,11 @@ fn handle_file_drop(win: &AppWindow, sftp_handles: &SftpHandles, path: String) {
     };
     if let Ok(handles) = sftp_handles.lock() {
         if let Some(h) = handles.get(&active) {
-            h.upload(path.clone(), dir);
+            if let Some(state) = sudo_state.as_ref() {
+                h.sudo_upload(path.clone(), dir, state.target_user.clone(), state.password.clone());
+            } else {
+                h.upload(path.clone(), dir);
+            }
         }
         if sync {
             for (id, h) in handles.iter() {
@@ -2322,7 +2338,13 @@ fn handle_file_drop(win: &AppWindow, sftp_handles: &SftpHandles, path: String) {
 }
 
 #[cfg(not(windows))]
-fn handle_file_drop(_win: &AppWindow, _sftp_handles: &SftpHandles, _path: String) {}
+fn handle_file_drop(
+    _win: &AppWindow,
+    _sftp_handles: &SftpHandles,
+    _sudo_states: &SudoStates,
+    _path: String,
+) {
+}
 
 // ---------------------------------------------------------------------------
 // Model helpers
@@ -5539,10 +5561,21 @@ fn wire_sftp_callbacks(
                 if login_user.trim().eq_ignore_ascii_case("root") {
                     return;
                 }
+                // Re-fill the previously saved sudo identity for this tab so
+                // the user doesn't retype the password every time they toggle
+                // the root view. (The state already keeps it for uploads.)
+                let saved = sudo_states.borrow().get(&tab_id).cloned();
+                let (saved_target, saved_password) = saved
+                    .map(|s| (s.target_user, s.password))
+                    .unwrap_or_else(|| ("root".to_string(), String::new()));
                 w.set_sudo_prompt_tab(tab_id.into());
                 w.set_sudo_login_user(login_user.into());
-                w.set_sudo_target_user("root".into());
-                w.set_sudo_password("".into());
+                if saved_target.trim().is_empty() {
+                    w.set_sudo_target_user("root".into());
+                } else {
+                    w.set_sudo_target_user(saved_target.into());
+                }
+                w.set_sudo_password(saved_password.into());
                 w.set_sudo_prompt_open(true);
             }
         });
@@ -5639,16 +5672,26 @@ fn wire_sftp_callbacks(
     // time this fires the user has already confirmed.
     {
         let sftp_handles = sftp_handles.clone();
+        let sudo_states = sudo_states.clone();
         window.on_sftp_delete(move |tab_id: SharedString, path: SharedString| {
             if let Ok(handles) = sftp_handles.lock() {
                 if let Some(h) = handles.get(tab_id.as_str()) {
-                    h.delete(path.to_string());
+                    if let Some(state) = active_sudo_state(&sudo_states, tab_id.as_str()) {
+                        h.sudo_delete(
+                            path.to_string(),
+                            state.target_user,
+                            state.password,
+                        );
+                    } else {
+                        h.delete(path.to_string());
+                    }
                 }
             }
         });
     }
     {
         let sftp_handles = sftp_handles.clone();
+        let sudo_states = sudo_states.clone();
         let weak = window.as_weak();
         window.on_sftp_delete_range(move |tab_id: SharedString, start: i32, end: i32| {
             let tab_id = tab_id.to_string();
@@ -5659,10 +5702,19 @@ fn wire_sftp_callbacks(
             if remote_paths.is_empty() {
                 return;
             }
+            let sudo_state = active_sudo_state(&sudo_states, &tab_id);
             if let Ok(handles) = sftp_handles.lock() {
                 if let Some(h) = handles.get(&tab_id) {
                     for remote_path in remote_paths {
-                        h.delete(remote_path);
+                        if let Some(state) = sudo_state.as_ref() {
+                            h.sudo_delete(
+                                remote_path,
+                                state.target_user.clone(),
+                                state.password.clone(),
+                            );
+                        } else {
+                            h.delete(remote_path);
+                        }
                     }
                 }
             }
@@ -5773,6 +5825,7 @@ fn wire_sftp_callbacks(
     // mkdir / touch; copy-path goes straight to the system clipboard.
     {
         let sftp_handles = sftp_handles.clone();
+        let sudo_states = sudo_states.clone();
         window.on_sftp_prompt_submit(
             move |tab_id: SharedString,
                   kind: SharedString,
@@ -5791,17 +5844,45 @@ fn wire_sftp_callbacks(
                 let Some(h) = handles.get(tab_id.as_str()) else {
                     return;
                 };
+                let sudo_state = active_sudo_state(&sudo_states, tab_id.as_str());
                 match kind.as_str() {
                     "rename" => {
                         let to =
                             format!("{}/{}", parent_path(&target).trim_end_matches('/'), value);
-                        h.rename(target, to);
+                        if let Some(state) = sudo_state.as_ref() {
+                            h.sudo_rename(
+                                target,
+                                to,
+                                state.target_user.clone(),
+                                state.password.clone(),
+                            );
+                        } else {
+                            h.rename(target, to);
+                        }
                     }
                     "mkdir" => {
-                        h.mkdir(format!("{}/{}", target.trim_end_matches('/'), value));
+                        let path = format!("{}/{}", target.trim_end_matches('/'), value);
+                        if let Some(state) = sudo_state.as_ref() {
+                            h.sudo_mkdir(
+                                path,
+                                state.target_user.clone(),
+                                state.password.clone(),
+                            );
+                        } else {
+                            h.mkdir(path);
+                        }
                     }
                     "touch" => {
-                        h.touch(format!("{}/{}", target.trim_end_matches('/'), value));
+                        let path = format!("{}/{}", target.trim_end_matches('/'), value);
+                        if let Some(state) = sudo_state.as_ref() {
+                            h.sudo_touch(
+                                path,
+                                state.target_user.clone(),
+                                state.password.clone(),
+                            );
+                        } else {
+                            h.touch(path);
+                        }
                     }
                     _ => {}
                 }
@@ -5872,6 +5953,7 @@ fn wire_sftp_callbacks(
     }
     {
         let sftp_handles = sftp_handles.clone();
+        let sudo_states = sudo_states.clone();
         let weak = window.as_weak();
         window.on_sftp_chmod_apply(move || {
             let Some(w) = weak.upgrade() else { return };
@@ -5888,7 +5970,11 @@ fn wire_sftp_callbacks(
             let tab = w.get_chmod_tab().to_string();
             if let Ok(handles) = sftp_handles.lock() {
                 if let Some(h) = handles.get(&tab) {
-                    h.chmod(path, mode);
+                    if let Some(state) = active_sudo_state(&sudo_states, &tab) {
+                        h.sudo_chmod(path, mode, state.target_user, state.password);
+                    } else {
+                        h.chmod(path, mode);
+                    }
                 }
             }
         });

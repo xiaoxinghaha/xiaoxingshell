@@ -2,6 +2,24 @@
 
 ## 2026-09-27
 
+### root 视角修复：密码框眼睛/记忆、新建/上传/删除等操作真正走 sudo
+
+### 背景/现象/根因
+- sudo 密码输入框点小眼睛无法显示明文：`LabeledInput` 的 `changed value` 处理器在每次输入时强制把明文切回掩码（"先点眼睛再输入"的第一个字符就会打断），且明文 3 秒自动收回太短。
+- sudo 对话框每次打开都清空密码，不回填已保存的密码/目标用户，每次都要重输。
+- 进入 root 视角后新建文件/文件夹失败、上传到 root 目录提示无权限："root 视角"的 sudo 路由只覆盖了浏览目录/按钮上传/查看/编辑；新建文件夹/新建文件/删除/重命名/改权限/拖拽上传共 6 处直接走普通 SFTP 通道，在 root 目录上必然权限不足。
+
+### 改动/新增
+- `src/sftp.rs`：新增 5 个 sudo 命令变体（SudoMkDir/SudoTouchFile/SudoDelete/SudoRename/SudoChmod）及 SftpHandle 便捷方法；实现复用 `run_sudo_capture`（`sudo -S -u <user> sh -c <script>`，密码走 stdin），操作后通过 `sudo_refresh_dir` 刷新父目录。touch 先检查存在性，对齐普通通道"已存在则提示不覆盖"的语义；delete 区分文件（rm）与目录（rm -rf）。
+- `src/app.rs`：新建/重命名提交对话框、删除、批量删除、chmod 应用、拖拽上传共 6 处回调按 sudo 状态路由到对应 sudo 命令；sudo 对话框打开时回填该标签页已保存的目标用户与密码；`handle_file_drop` 增加 sudo 状态参数。
+- `ui/widgets.slint`：`LabeledInput` 移除输入即收回明文的逻辑，明文自动收回由 3 秒延长到 8 秒（保留防窥兜底）。
+
+### 修复/效果
+- root 视角下新建文件夹/新建文件/删除/重命名/改权限/拖拽上传全部真正以 sudo 执行；眼睛点击后可正常查看明文（输入不再打断，8 秒后自动收回）；重新打开 sudo 对话框自动带出上次的目标用户与密码。cargo build 与全量 120 个单测通过。
+
+### 涉及文件
+- `src/sftp.rs`、`src/app.rs`、`ui/widgets.slint`
+
 ### SFTP 首次连接加载慢（启动链路并行化）
 
 ### 背景/现象/根因

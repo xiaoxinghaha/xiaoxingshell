@@ -101,6 +101,35 @@ pub enum SftpCommand {
     MkDir(String),
     /// Create an empty remote file (#69).
     TouchFile(String),
+    /// Root-view variants of the operations above: run through the sudo exec
+    /// channel so they work on paths the login user cannot write (#root-view).
+    SudoMkDir {
+        path: String,
+        target_user: String,
+        password: String,
+    },
+    SudoTouchFile {
+        path: String,
+        target_user: String,
+        password: String,
+    },
+    SudoDelete {
+        path: String,
+        target_user: String,
+        password: String,
+    },
+    SudoRename {
+        from: String,
+        to: String,
+        target_user: String,
+        password: String,
+    },
+    SudoChmod {
+        path: String,
+        mode: u32,
+        target_user: String,
+        password: String,
+    },
     /// Read a remote file's text for the built-in viewer/editor (#70).
     ReadText { remote: String, edit: bool },
     SudoReadText {
@@ -215,6 +244,43 @@ impl SftpHandle {
     }
     pub fn mkdir(&self, path: String) {
         let _ = self.commands.send(SftpCommand::MkDir(path));
+    }
+    pub fn sudo_mkdir(&self, path: String, target_user: String, password: String) {
+        let _ = self.commands.send(SftpCommand::SudoMkDir {
+            path,
+            target_user,
+            password,
+        });
+    }
+    pub fn sudo_touch(&self, path: String, target_user: String, password: String) {
+        let _ = self.commands.send(SftpCommand::SudoTouchFile {
+            path,
+            target_user,
+            password,
+        });
+    }
+    pub fn sudo_delete(&self, path: String, target_user: String, password: String) {
+        let _ = self.commands.send(SftpCommand::SudoDelete {
+            path,
+            target_user,
+            password,
+        });
+    }
+    pub fn sudo_rename(&self, from: String, to: String, target_user: String, password: String) {
+        let _ = self.commands.send(SftpCommand::SudoRename {
+            from,
+            to,
+            target_user,
+            password,
+        });
+    }
+    pub fn sudo_chmod(&self, path: String, mode: u32, target_user: String, password: String) {
+        let _ = self.commands.send(SftpCommand::SudoChmod {
+            path,
+            mode,
+            target_user,
+            password,
+        });
     }
     pub fn touch(&self, path: String) {
         let _ = self.commands.send(SftpCommand::TouchFile(path));
@@ -1416,6 +1482,154 @@ async fn run_sftp(
                         entries,
                     });
                 }
+            }
+
+            SftpCommand::SudoMkDir {
+                path,
+                target_user,
+                password,
+            } => {
+                let refresh = parent_dir(&path);
+                let script = format!("mkdir -- {}", shell_quote(&path));
+                match run_sudo_capture(&handle, &target_user, &password, &script).await {
+                    Ok(_) => {
+                        let _ = events.send(SessionEvent::SftpStatus(format!(
+                            "{}: {}",
+                            t("已新建文件夹", "Folder created"),
+                            base_name(&path)
+                        )));
+                    }
+                    Err(e) => {
+                        let _ = events.send(SessionEvent::SftpStatus(format!(
+                            "{}: {e}",
+                            t("新建文件夹失败", "Create folder failed")
+                        )));
+                    }
+                }
+                sudo_refresh_dir(&handle, &events, &refresh, &target_user, &password).await;
+            }
+
+            SftpCommand::SudoTouchFile {
+                path,
+                target_user,
+                password,
+            } => {
+                let refresh = parent_dir(&path);
+                // touch(1) would silently update an existing file's timestamp;
+                // the plain-SFTP path refuses to clobber, so check first.
+                let quoted = shell_quote(&path);
+                let script = format!("if [ -e {quoted} ]; then echo __MEATSHELL_EXISTS__; else touch -- {quoted}; fi");
+                match run_sudo_capture(&handle, &target_user, &password, &script).await {
+                    Ok(out) if out.contains("__MEATSHELL_EXISTS__") => {
+                        let _ = events.send(SessionEvent::SftpStatus(format!(
+                            "{}: {}",
+                            t("文件已存在", "File already exists"),
+                            base_name(&path)
+                        )));
+                    }
+                    Ok(_) => {
+                        let _ = events.send(SessionEvent::SftpStatus(format!(
+                            "{}: {}",
+                            t("已新建文件", "File created"),
+                            base_name(&path)
+                        )));
+                    }
+                    Err(e) => {
+                        let _ = events.send(SessionEvent::SftpStatus(format!(
+                            "{}: {e}",
+                            t("新建文件失败", "Create file failed")
+                        )));
+                    }
+                }
+                sudo_refresh_dir(&handle, &events, &refresh, &target_user, &password).await;
+            }
+
+            SftpCommand::SudoDelete {
+                path,
+                target_user,
+                password,
+            } => {
+                let filename = base_name(&path);
+                let _ = events.send(SessionEvent::SftpStatus(format!(
+                    "{} {}...",
+                    t("删除", "Deleting"),
+                    filename
+                )));
+                let refresh = parent_dir(&path);
+                let quoted = shell_quote(&path);
+                // Mirrors the plain-SFTP path: files via rm, directories
+                // recursively (a plain rmdir only works on an empty dir).
+                let script =
+                    format!("if [ -d {quoted} ]; then rm -rf -- {quoted}; else rm -f -- {quoted}; fi");
+                match run_sudo_capture(&handle, &target_user, &password, &script).await {
+                    Ok(_) => {
+                        let _ = events.send(SessionEvent::SftpStatus(format!(
+                            "{}: {}",
+                            t("已删除", "Deleted"),
+                            filename
+                        )));
+                    }
+                    Err(e) => {
+                        let _ = events.send(SessionEvent::SftpStatus(format!(
+                            "{}: {e}",
+                            t("删除失败", "Delete failed")
+                        )));
+                    }
+                }
+                sudo_refresh_dir(&handle, &events, &refresh, &target_user, &password).await;
+            }
+
+            SftpCommand::SudoRename {
+                from,
+                to,
+                target_user,
+                password,
+            } => {
+                let refresh = parent_dir(&from);
+                let script = format!("mv -- {} {}", shell_quote(&from), shell_quote(&to));
+                match run_sudo_capture(&handle, &target_user, &password, &script).await {
+                    Ok(_) => {
+                        let _ = events.send(SessionEvent::SftpStatus(format!(
+                            "{}: {}",
+                            t("已重命名", "Renamed"),
+                            base_name(&to)
+                        )));
+                    }
+                    Err(e) => {
+                        let _ = events.send(SessionEvent::SftpStatus(format!(
+                            "{}: {e}",
+                            t("重命名失败", "Rename failed")
+                        )));
+                    }
+                }
+                sudo_refresh_dir(&handle, &events, &refresh, &target_user, &password).await;
+            }
+
+            SftpCommand::SudoChmod {
+                path,
+                mode,
+                target_user,
+                password,
+            } => {
+                let refresh = parent_dir(&path);
+                let script = format!("chmod {:o} -- {}", mode, shell_quote(&path));
+                match run_sudo_capture(&handle, &target_user, &password, &script).await {
+                    Ok(_) => {
+                        let _ = events.send(SessionEvent::SftpStatus(format!(
+                            "{}: {} → {:o}",
+                            t("已修改权限", "Permissions changed"),
+                            base_name(&path),
+                            mode
+                        )));
+                    }
+                    Err(e) => {
+                        let _ = events.send(SessionEvent::SftpStatus(format!(
+                            "{}: {e}",
+                            t("修改权限失败", "chmod failed")
+                        )));
+                    }
+                }
+                sudo_refresh_dir(&handle, &events, &refresh, &target_user, &password).await;
             }
 
             SftpCommand::OpenTemp {
@@ -2970,6 +3184,24 @@ async fn sudo_list_dir_impl(
     );
     let output = run_sudo_capture(handle, target_user, password, &script).await?;
     parse_sudo_find_listing(&output)
+}
+
+/// Refresh a directory listing through the sudo exec channel. Used after the
+/// root-view mutating commands so the panel shows the new state; a failed
+/// refresh is silent (the status line already carries the command result).
+async fn sudo_refresh_dir(
+    handle: &client::Handle<SftpClientHandler>,
+    events: &UnboundedSender<SessionEvent>,
+    path: &str,
+    target_user: &str,
+    password: &str,
+) {
+    if let Ok(entries) = sudo_list_dir_impl(handle, path, target_user, password).await {
+        let _ = events.send(SessionEvent::SftpEntries {
+            path: path.to_string(),
+            entries,
+        });
+    }
 }
 
 async fn sudo_read_text_guarded(
