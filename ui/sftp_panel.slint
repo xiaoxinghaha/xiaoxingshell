@@ -50,6 +50,72 @@ component SftpMenuItem inherits Rectangle {
     }
 }
 
+// --- SftpVScroll -----------------------------------------------------------
+// 16px vertical scrollbar for the SFTP lists, styled after the terminal's
+// VScrollBar (terminal_view.slint): a 12px rounded thumb in Theme.text-muted
+// that stays visible on the dark panel. The thumb drags 1:1 and clicking the
+// track pages a screen; both write straight to the paired ListView's
+// viewport-y (two-way bound), while wheel scrolling stays on the ListView.
+component SftpVScroll inherits Rectangle {
+    in property <length> content-height;   // paired ListView viewport-height
+    in property <length> visible-height;   // paired ListView visible-height
+    in-out property <length> viewport-y;   // two-way bound to the ListView
+
+    // Thumb size: visible/total of the track, min 24px so it stays grabbable.
+    property <length> max-scroll: max(0px, root.content-height - root.visible-height);
+    property <float> ratio: root.content-height > 0px
+        ? min(1.0, root.visible-height / root.content-height)
+        : 0.0;
+    property <length> thumb-h: max(24px, root.height * root.ratio);
+    property <length> inner-h: max(0px, root.height - root.thumb-h);
+    // Thumb position: viewport-y is the negated scroll offset (0 = top).
+    property <length> thumb-y: root.max-scroll > 0px
+        ? (0px - root.viewport-y) / root.max-scroll * root.inner-h
+        : 0px;
+
+    property <bool> dragging: false;
+    property <length> drag-grab-offset: 0px;  // press: mouse-y − thumb-y
+
+    width: 16px;
+    background: transparent;
+    visible: root.max-scroll > 0px;
+
+    track-ta := TouchArea {
+        pointer-event(ev) => {
+            if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
+                if (self.mouse-y >= root.thumb-y && self.mouse-y <= root.thumb-y + root.thumb-h) {
+                    // Pressed on the thumb → start dragging, following 1:1.
+                    root.dragging = true;
+                    root.drag-grab-offset = self.mouse-y - root.thumb-y;
+                } else if (self.mouse-y < root.thumb-y) {
+                    // Click above the thumb → page towards the top.
+                    root.viewport-y = min(0px, root.viewport-y + root.visible-height);
+                } else {
+                    // Click below the thumb → page towards the bottom.
+                    root.viewport-y = max(0px - root.max-scroll, root.viewport-y - root.visible-height);
+                }
+            } else if (ev.kind == PointerEventKind.up && ev.button == PointerEventButton.left) {
+                root.dragging = false;
+            }
+        }
+        moved => {
+            if (root.dragging && root.inner-h > 0px) {
+                let thumbTop = clamp(self.mouse-y - root.drag-grab-offset, 0px, root.inner-h);
+                root.viewport-y = 0px - thumbTop / root.inner-h * root.max-scroll;
+            }
+        }
+    }
+
+    thumb := Rectangle {
+        y: root.thumb-y;
+        x: 2px;
+        width: parent.width - 4px;
+        height: root.thumb-h;
+        border-radius: 3px;
+        background: root.dragging ? Theme.text-secondary : Theme.text-muted;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SftpPanel — left directory tree + right file listing
 // ---------------------------------------------------------------------------
@@ -385,55 +451,71 @@ export component SftpPanel inherits Rectangle {
                 Rectangle { height: 1px; background: Theme.border-subtle; }
 
                 // Tree list with scrollbar. Virtualized the same way as the
-                // file list: only the visible nodes are instantiated.
-                tree-list := ListView {
+                // file list: only the visible nodes are instantiated. The
+                // built-in scrollbar is replaced by the terminal-styled
+                // SftpVScroll (see the file list comment).
+                tree-area := Rectangle {
                     vertical-stretch: 1;
 
-                    for node[i] in root.tree-nodes : Rectangle {
-                        width: tree-list.visible-width;
-                        height: 22px;
-                        background: node-ta.has-hover
-                            ? Theme.bg-hover
-                            : (node.path == root.current-path
-                                ? #4a90e230
-                                : (mod(i, 2) == 0 ? transparent : #ffffff08));
+                    tree-list := ListView {
+                        width: 100%;
+                        height: 100%;
+                        vertical-scrollbar-policy: ScrollBarPolicy.always-off;
 
-                        node-ta := TouchArea {
-                            mouse-cursor: pointer;
-                            clicked => { root.tree-expand(node.path); }
-                        }
+                        for node[i] in root.tree-nodes : Rectangle {
+                            width: tree-list.visible-width;
+                            height: 22px;
+                            background: node-ta.has-hover
+                                ? Theme.bg-hover
+                                : (node.path == root.current-path
+                                    ? #4a90e230
+                                    : (mod(i, 2) == 0 ? transparent : #ffffff08));
 
-                        HorizontalLayout {
-                            spacing: 0;
-                            padding-top: 1px;
-
-                            // Depth indent spacer
-                            Rectangle { width: node.depth * 12px; }
-
-                            // Expand/collapse arrow
-                            Text {
-                                width: 14px;
-                                text: node.has-children
-                                    ? (node.expanded ? "▼" : "▶")
-                                    : " ";
-                                color: Theme.text-muted;
-                                font-size: 9px;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
+                            node-ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.tree-expand(node.path); }
                             }
 
-                            // Folder name
-                            Text {
-                                text: node.depth == 0 ? "/" : node.name;
-                                color: node.path == root.current-path
-                                    ? Theme.accent
-                                    : Theme.text-primary;
-                                font-size: Theme.fs-sm;
-                                horizontal-stretch: 1;
-                                overflow: elide;
-                                vertical-alignment: center;
+                            HorizontalLayout {
+                                spacing: 0;
+                                padding-top: 1px;
+
+                                // Depth indent spacer
+                                Rectangle { width: node.depth * 12px; }
+
+                                // Expand/collapse arrow
+                                Text {
+                                    width: 14px;
+                                    text: node.has-children
+                                        ? (node.expanded ? "▼" : "▶")
+                                        : " ";
+                                    color: Theme.text-muted;
+                                    font-size: 9px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+
+                                // Folder name
+                                Text {
+                                    text: node.depth == 0 ? "/" : node.name;
+                                    color: node.path == root.current-path
+                                        ? Theme.accent
+                                        : Theme.text-primary;
+                                    font-size: Theme.fs-sm;
+                                    horizontal-stretch: 1;
+                                    overflow: elide;
+                                    vertical-alignment: center;
+                                }
                             }
                         }
+                    }
+
+                    tree-vscroll := SftpVScroll {
+                        x: parent.width - self.width;
+                        height: 100%;
+                        content-height: tree-list.viewport-height;
+                        visible-height: tree-list.visible-height;
+                        viewport-y <=> tree-list.viewport-y;
                     }
                 }
             }
@@ -912,9 +994,14 @@ export component SftpPanel inherits Rectangle {
                     // Virtualized list: a ListView only instantiates the rows
                     // in the viewport, so directories with thousands of
                     // entries stay responsive instead of freezing the UI.
+                    // The style's built-in scrollbar thumb (2px, hard-coded
+                    // color) is unreadable on the dark panel, so it is
+                    // switched off and the terminal-styled SftpVScroll sits
+                    // on top instead.
                     file-list := ListView {
                         width: 100%;
                         height: 100%;
+                        vertical-scrollbar-policy: ScrollBarPolicy.always-off;
 
                         for entry[i] in root.entries : row := Rectangle {
                             width: file-list.visible-width;
@@ -1034,6 +1121,14 @@ export component SftpPanel inherits Rectangle {
                                 }
                             }
                         }
+                    }
+
+                    file-vscroll := SftpVScroll {
+                        x: parent.width - self.width;
+                        height: 100%;
+                        content-height: file-list.viewport-height;
+                        visible-height: file-list.visible-height;
+                        viewport-y <=> file-list.viewport-y;
                     }
 
                     Timer {

@@ -2,6 +2,22 @@
 
 ## 2026-09-27
 
+### SFTP 面板滚动条滑块深色皮肤下看不清（对齐终端样式）
+
+### 背景/现象/根因
+- SFTP 虚拟化改造后使用 fluent 风格内置滚动条：滑块仅 2px 宽、颜色硬编码为 FluentPalette.border（不跟随项目 Theme），深色皮肤下几乎看不见。
+- 用户要求参照终端区域滚动条：加粗滑块、使用终端同款颜色。
+
+### 改动/新增
+- `ui/sftp_panel.slint`：新增 `SftpVScroll` 组件，视觉复刻终端 `VScrollBar`（terminal_view.slint）：16px 轨道、12px 圆角滑块，颜色 `Theme.text-muted`、拖动时 `Theme.text-secondary`。
+- 文件列表与目录树的 ListView 通过 `vertical-scrollbar-policy: always-off` 关闭内置滚动条，右侧叠加 `SftpVScroll`；滑块位置与 ListView 的 `viewport-y` 双向绑定，滚轮滚动仍由 ListView 处理，拖拽滑块 1:1 跟手、点击轨道翻页一屏。内容不足一屏时自动隐藏。
+
+### 修复/效果
+- 深色皮肤下 SFTP 列表滚动条滑块清晰可见，样式与终端区域一致；滚轮/拖拽/轨道点击均可正常滚动。
+
+### 涉及文件
+- `ui/sftp_panel.slint`
+
 ### SFTP 进入文件数巨大的目录时 UI 卡死（虚拟化修复）
 
 ### 背景/现象/根因
