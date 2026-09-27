@@ -1,5 +1,5 @@
 import { Theme } from "theme.slint";
-import { ScrollView } from "std-widgets.slint";
+import { ListView } from "std-widgets.slint";
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -384,56 +384,54 @@ export component SftpPanel inherits Rectangle {
                 }
                 Rectangle { height: 1px; background: Theme.border-subtle; }
 
-                // Tree list with scrollbar
-                ScrollView {
+                // Tree list with scrollbar. Virtualized the same way as the
+                // file list: only the visible nodes are instantiated.
+                tree-list := ListView {
                     vertical-stretch: 1;
 
-                    tree-list := VerticalLayout {
-                        spacing: 0;
+                    for node[i] in root.tree-nodes : Rectangle {
+                        width: tree-list.visible-width;
+                        height: 22px;
+                        background: node-ta.has-hover
+                            ? Theme.bg-hover
+                            : (node.path == root.current-path
+                                ? #4a90e230
+                                : (mod(i, 2) == 0 ? transparent : #ffffff08));
 
-                        for node[i] in root.tree-nodes : Rectangle {
-                            height: 22px;
-                            background: node-ta.has-hover
-                                ? Theme.bg-hover
-                                : (node.path == root.current-path
-                                    ? #4a90e230
-                                    : (mod(i, 2) == 0 ? transparent : #ffffff08));
+                        node-ta := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.tree-expand(node.path); }
+                        }
 
-                            node-ta := TouchArea {
-                                mouse-cursor: pointer;
-                                clicked => { root.tree-expand(node.path); }
+                        HorizontalLayout {
+                            spacing: 0;
+                            padding-top: 1px;
+
+                            // Depth indent spacer
+                            Rectangle { width: node.depth * 12px; }
+
+                            // Expand/collapse arrow
+                            Text {
+                                width: 14px;
+                                text: node.has-children
+                                    ? (node.expanded ? "▼" : "▶")
+                                    : " ";
+                                color: Theme.text-muted;
+                                font-size: 9px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
                             }
 
-                            HorizontalLayout {
-                                spacing: 0;
-                                padding-top: 1px;
-
-                                // Depth indent spacer
-                                Rectangle { width: node.depth * 12px; }
-
-                                // Expand/collapse arrow
-                                Text {
-                                    width: 14px;
-                                    text: node.has-children
-                                        ? (node.expanded ? "▼" : "▶")
-                                        : " ";
-                                    color: Theme.text-muted;
-                                    font-size: 9px;
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
-                                }
-
-                                // Folder name
-                                Text {
-                                    text: node.depth == 0 ? "/" : node.name;
-                                    color: node.path == root.current-path
-                                        ? Theme.accent
-                                        : Theme.text-primary;
-                                    font-size: Theme.fs-sm;
-                                    horizontal-stretch: 1;
-                                    overflow: elide;
-                                    vertical-alignment: center;
-                                }
+                            // Folder name
+                            Text {
+                                text: node.depth == 0 ? "/" : node.name;
+                                color: node.path == root.current-path
+                                    ? Theme.accent
+                                    : Theme.text-primary;
+                                font-size: Theme.fs-sm;
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                                vertical-alignment: center;
                             }
                         }
                     }
@@ -867,168 +865,172 @@ export component SftpPanel inherits Rectangle {
                 file-area := Rectangle {
                     vertical-stretch: 1;
                     clip: true;
-                    file-scroll := ScrollView {
-                        width: parent.width;
-                        height: parent.height;
-                        viewport-width: self.visible-width;
-                        viewport-height: max(self.visible-height, file-list.preferred-height);
 
-                        file-list := VerticalLayout {
-                            spacing: 0;
-
-                            if root.loading : Rectangle {
-                                height: 40px;
-                                Text { text: @tr("Loading..."); color: Theme.text-muted; font-size: Theme.fs-sm;
-                                       horizontal-alignment: center; vertical-alignment: center; }
+                    // Whitespace *behind* the rows: right-clicking the blank
+                    // area opens the menu with no target (item actions greyed
+                    // out) (#84). It sits underneath the ListView: rows and the
+                    // loading/empty covers handle their own events, while the
+                    // list's blank area lets events fall through to here.
+                    ws := Rectangle {
+                        width: 100%;
+                        height: 100%;
+                        ws-ta := TouchArea {
+                            clicked => { file-list-focus.focus(); }
+                            pointer-event(ev) => {
+                                if (ev.kind == PointerEventKind.down
+                                        && ev.button == PointerEventButton.right) {
+                                    file-list-focus.focus();
+                                    root.selected-row = -1;
+                                    root.selection-anchor-row = -1;
+                                    root.selection-start-row = -1;
+                                    root.selection-end-row = -1;
+                                    root.menu-target = "";
+                                    root.menu-selection-start = -1;
+                                    root.menu-selection-end = -1;
+                                    root.menu-x = self.absolute-position.x + self.mouse-x - file-area.absolute-position.x;
+                                    root.menu-y = self.absolute-position.y + self.mouse-y - file-area.absolute-position.y;
+                                    file-menu.show();
+                                }
                             }
+                        }
+                    }
 
-                            if !root.loading && root.entries.length == 0 : Rectangle {
-                                height: 40px;
-                                Text { text: @tr("Empty directory"); color: Theme.text-muted; font-size: Theme.fs-sm;
-                                       horizontal-alignment: center; vertical-alignment: center; }
-                            }
+                    if root.loading : Rectangle {
+                        width: 100%;
+                        height: 40px;
+                        Text { text: @tr("Loading..."); color: Theme.text-muted; font-size: Theme.fs-sm;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                    }
 
-                            for entry[i] in root.entries : row := Rectangle {
-                                property <bool> row-selected:
-                                    root.selection-start-row >= 0
-                                    && i >= min(root.selection-start-row, root.selection-end-row)
-                                    && i <= max(root.selection-start-row, root.selection-end-row);
-                                height: 24px;
-                                background: row-selected
-                                    ? #4a90e240
-                                    : (row-ta.has-hover
-                                        ? #4a90e225
-                                        : (mod(i, 2) == 0 ? transparent : #ffffff08));
+                    if !root.loading && root.entries.length == 0 : Rectangle {
+                        width: 100%;
+                        height: 40px;
+                        Text { text: @tr("Empty directory"); color: Theme.text-muted; font-size: Theme.fs-sm;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                    }
 
-                                row-ta := TouchArea {
-                                    mouse-cursor: default;
-                                    clicked => { }
-                                pointer-event(ev) => {
-                                    if (ev.kind == PointerEventKind.down
-                                            && ev.button == PointerEventButton.left) {
-                                        // Only arm rename when the click lands on the
-                                        // name column (first column, x in [8px, 8px +
-                                        // col-name-width]); clicking other columns merely
-                                        // selects the row, like Windows Explorer (#70).
-                                        if (!ev.modifiers.shift
-                                                && root.selected-row == i
-                                                && root.selection-start-row == i
-                                                && root.selection-end-row == i
-                                                && self.mouse-x >= 8px
-                                                && self.mouse-x <= 8px + root.col-name-width) {
-                                            root.pending-rename-row = i;
-                                        } else {
-                                            root.pending-rename-row = -1;
-                                        }
-                                            if (ev.modifiers.shift && root.selection-anchor-row >= 0) {
-                                                root.selected-row = i;
-                                                root.selection-start-row = root.selection-anchor-row;
-                                                root.selection-end-row = i;
-                                            } else {
-                                                root.selected-row = i;
-                                                root.selection-anchor-row = i;
-                                                root.selection-start-row = i;
-                                                root.selection-end-row = i;
-                                            }
-                                            file-list-focus.focus();
-                                        } else if (ev.kind == PointerEventKind.down
-                                                && ev.button == PointerEventButton.right) {
-                                            if (!(root.selection-start-row >= 0
-                                                    && i >= min(root.selection-start-row, root.selection-end-row)
-                                                    && i <= max(root.selection-start-row, root.selection-end-row))) {
-                                                root.selected-row = i;
-                                                root.selection-anchor-row = i;
-                                                root.selection-start-row = i;
-                                                root.selection-end-row = i;
-                                            }
-                                            file-list-focus.focus();
-                                            root.menu-target = entry.full-path;
-                                            root.menu-target-name = entry.name;
-                                            root.menu-target-is-dir = entry.is-dir;
-                                            root.menu-target-mode = entry.mode;
-                                            root.menu-selection-start = root.selection-start-row;
-                                            root.menu-selection-end = root.selection-end-row;
-                                            root.menu-x = self.absolute-position.x + self.mouse-x - file-area.absolute-position.x;
-                                            root.menu-y = self.absolute-position.y + self.mouse-y - file-area.absolute-position.y;
-                                            file-menu.show();
-                                        }
-                                    }
-                                    double-clicked => {
+                    // Virtualized list: a ListView only instantiates the rows
+                    // in the viewport, so directories with thousands of
+                    // entries stay responsive instead of freezing the UI.
+                    file-list := ListView {
+                        width: 100%;
+                        height: 100%;
+
+                        for entry[i] in root.entries : row := Rectangle {
+                            width: file-list.visible-width;
+                            property <bool> row-selected:
+                                root.selection-start-row >= 0
+                                && i >= min(root.selection-start-row, root.selection-end-row)
+                                && i <= max(root.selection-start-row, root.selection-end-row);
+                            height: 24px;
+                            background: row-selected
+                                ? #4a90e240
+                                : (row-ta.has-hover
+                                    ? #4a90e225
+                                    : (mod(i, 2) == 0 ? transparent : #ffffff08));
+
+                            row-ta := TouchArea {
+                                mouse-cursor: default;
+                                clicked => { }
+                            pointer-event(ev) => {
+                                if (ev.kind == PointerEventKind.down
+                                        && ev.button == PointerEventButton.left) {
+                                    // Only arm rename when the click lands on the
+                                    // name column (first column, x in [8px, 8px +
+                                    // col-name-width]); clicking other columns merely
+                                    // selects the row, like Windows Explorer (#70).
+                                    if (!ev.modifiers.shift
+                                            && root.selected-row == i
+                                            && root.selection-start-row == i
+                                            && root.selection-end-row == i
+                                            && self.mouse-x >= 8px
+                                            && self.mouse-x <= 8px + root.col-name-width) {
+                                        root.pending-rename-row = i;
+                                    } else {
                                         root.pending-rename-row = -1;
-                                        if (entry.is-dir) {
-                                            root.navigate(entry.full-path);
+                                    }
+                                        if (ev.modifiers.shift && root.selection-anchor-row >= 0) {
+                                            root.selected-row = i;
+                                            root.selection-start-row = root.selection-anchor-row;
+                                            root.selection-end-row = i;
                                         } else {
-                                            root.edit-external(entry.full-path);
+                                            root.selected-row = i;
+                                            root.selection-anchor-row = i;
+                                            root.selection-start-row = i;
+                                            root.selection-end-row = i;
                                         }
+                                        file-list-focus.focus();
+                                    } else if (ev.kind == PointerEventKind.down
+                                            && ev.button == PointerEventButton.right) {
+                                        if (!(root.selection-start-row >= 0
+                                                && i >= min(root.selection-start-row, root.selection-end-row)
+                                                && i <= max(root.selection-start-row, root.selection-end-row))) {
+                                            root.selected-row = i;
+                                            root.selection-anchor-row = i;
+                                            root.selection-start-row = i;
+                                            root.selection-end-row = i;
+                                        }
+                                        file-list-focus.focus();
+                                        root.menu-target = entry.full-path;
+                                        root.menu-target-name = entry.name;
+                                        root.menu-target-is-dir = entry.is-dir;
+                                        root.menu-target-mode = entry.mode;
+                                        root.menu-selection-start = root.selection-start-row;
+                                        root.menu-selection-end = root.selection-end-row;
+                                        root.menu-x = self.absolute-position.x + self.mouse-x - file-area.absolute-position.x;
+                                        root.menu-y = self.absolute-position.y + self.mouse-y - file-area.absolute-position.y;
+                                        file-menu.show();
                                     }
                                 }
-
-                                HorizontalLayout {
-                                    padding-left: 8px; padding-right: 8px; spacing: 4px;
-                                    Text {
-                                        text: entry.is-dir ? "📁 " + entry.name : "📄 " + entry.name;
-                                        color: entry.is-dir ? Theme.accent : Theme.text-primary;
-                                        font-size: Theme.fs-sm;
-                                        width: root.col-name-width;
-                                        overflow: elide;
-                                        vertical-alignment: center;
-                                    }
-                                    Text {
-                                        text: entry.is-dir ? "" : entry.size;
-                                        color: Theme.text-secondary; font-size: Theme.fs-xs;
-                                        width: root.col-size-width; horizontal-alignment: left; vertical-alignment: center;
-                                    }
-                                    Text {
-                                        text: entry.file-type;
-                                        color: Theme.text-secondary; font-size: Theme.fs-xs;
-                                        width: root.col-type-width; overflow: elide;
-                                        horizontal-alignment: center; vertical-alignment: center;
-                                    }
-                                    Text {
-                                        text: entry.modified;
-                                        color: Theme.text-muted; font-size: Theme.fs-xs;
-                                        width: root.col-modified-width; overflow: elide; vertical-alignment: center;
-                                    }
-                                    Text {
-                                        text: entry.mode-text;
-                                        color: Theme.text-secondary; font-size: Theme.fs-xs;
-                                        width: root.col-mode-width; vertical-alignment: center;
-                                    }
-                                    Text {
-                                        text: entry.owner-group;
-                                        color: Theme.text-secondary; font-size: Theme.fs-xs;
-                                        width: root.col-owner-width; overflow: elide; vertical-alignment: center;
-                                    }
-                                    Text {
-                                        text: "";
-                                        horizontal-stretch: 1;
+                                double-clicked => {
+                                    root.pending-rename-row = -1;
+                                    if (entry.is-dir) {
+                                        root.navigate(entry.full-path);
+                                    } else {
+                                        root.edit-external(entry.full-path);
                                     }
                                 }
                             }
 
-                            // Whitespace below the rows: right-click here opens the
-                            // menu with no target (item actions greyed out) (#84).
-                            ws := Rectangle {
-                                vertical-stretch: 1;
-                                min-height: 24px;
-                                ws-ta := TouchArea {
-                                    clicked => { file-list-focus.focus(); }
-                                    pointer-event(ev) => {
-                                        if (ev.kind == PointerEventKind.down
-                                                && ev.button == PointerEventButton.right) {
-                                            file-list-focus.focus();
-                                            root.selected-row = -1;
-                                            root.selection-anchor-row = -1;
-                                            root.selection-start-row = -1;
-                                            root.selection-end-row = -1;
-                                            root.menu-target = "";
-                                            root.menu-selection-start = -1;
-                                            root.menu-selection-end = -1;
-                                            root.menu-x = self.absolute-position.x + self.mouse-x - file-area.absolute-position.x;
-                                            root.menu-y = self.absolute-position.y + self.mouse-y - file-area.absolute-position.y;
-                                            file-menu.show();
-                                        }
-                                    }
+                            HorizontalLayout {
+                                padding-left: 8px; padding-right: 8px; spacing: 4px;
+                                Text {
+                                    text: entry.is-dir ? "📁 " + entry.name : "📄 " + entry.name;
+                                    color: entry.is-dir ? Theme.accent : Theme.text-primary;
+                                    font-size: Theme.fs-sm;
+                                    width: root.col-name-width;
+                                    overflow: elide;
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    text: entry.is-dir ? "" : entry.size;
+                                    color: Theme.text-secondary; font-size: Theme.fs-xs;
+                                    width: root.col-size-width; horizontal-alignment: left; vertical-alignment: center;
+                                }
+                                Text {
+                                    text: entry.file-type;
+                                    color: Theme.text-secondary; font-size: Theme.fs-xs;
+                                    width: root.col-type-width; overflow: elide;
+                                    horizontal-alignment: center; vertical-alignment: center;
+                                }
+                                Text {
+                                    text: entry.modified;
+                                    color: Theme.text-muted; font-size: Theme.fs-xs;
+                                    width: root.col-modified-width; overflow: elide; vertical-alignment: center;
+                                }
+                                Text {
+                                    text: entry.mode-text;
+                                    color: Theme.text-secondary; font-size: Theme.fs-xs;
+                                    width: root.col-mode-width; vertical-alignment: center;
+                                }
+                                Text {
+                                    text: entry.owner-group;
+                                    color: Theme.text-secondary; font-size: Theme.fs-xs;
+                                    width: root.col-owner-width; overflow: elide; vertical-alignment: center;
+                                }
+                                Text {
+                                    text: "";
+                                    horizontal-stretch: 1;
                                 }
                             }
                         }
@@ -1152,12 +1154,12 @@ export component SftpPanel inherits Rectangle {
                                     // viewport-y is the negated scroll offset).
                                     let row-top = target * 24px;
                                     let row-bottom = row-top + 24px;
-                                    let cur-top = 0px - file-scroll.viewport-y;
-                                    let vis-h = file-scroll.visible-height;
+                                    let cur-top = 0px - file-list.viewport-y;
+                                    let vis-h = file-list.visible-height;
                                     if (row-top < cur-top) {
-                                        file-scroll.viewport-y = 0px - row-top;
+                                        file-list.viewport-y = 0px - row-top;
                                     } else if (row-bottom > cur-top + vis-h) {
-                                        file-scroll.viewport-y = vis-h - row-bottom;
+                                        file-list.viewport-y = vis-h - row-bottom;
                                     }
                                     return accept;
                                 }

@@ -1,5 +1,25 @@
 # ChangeLog
 
+## 2026-09-27
+
+### SFTP 进入文件数巨大的目录时 UI 卡死（虚拟化修复）
+
+### 背景/现象/根因
+- SFTP 面板进入包含成千上万个文件的目录（如 /usr/lib、大数据目录）时，软件直接卡死无响应。
+- 根因：文件列表与目录树均用 `ScrollView + VerticalLayout + for` 渲染。Slint 的 `for` 会为模型中每一项实例化完整组件（每行约 9 个元素：行容器、触摸区、6 个文本等），上万行即数十万元素在 UI 线程一次性创建，事件循环被阻塞。
+
+### 改动/新增
+- `ui/sftp_panel.slint`：文件列表与目录树由 `ScrollView + VerticalLayout` 改为 `ListView`。Slint 编译器对 ListView 内的 `for` 做虚拟化（is_listview delegate），只实例化视口内可见的行，滚动时按需创建/回收。
+- 行 delegate 显式绑定 `visible-width`（ListView 运行时只摆放行的 y/height，不自动拉伸行宽）。
+- ListView 只允许一个 `for` 子元素：加载中/空目录提示改为覆盖层显示；"空白区右键菜单"的 `ws` 层垫到 ListView 底下，借助 ListView 空白处事件穿透保持原交互。
+- 键盘 type-ahead 跳转的滚动逻辑由 `file-scroll.viewport-y/visible-height` 改为 ListView 的同名属性（继承自 ScrollView，语义不变）。
+
+### 修复/效果
+- 进入大目录不再卡死：UI 只创建可见行（约几十个），万级条目目录秒开、滚动流畅。列表右键、多选、双击导航、type-ahead 跳转、重命名计时器等交互保持原有行为。cargo build 通过，全量 120 个单测通过。
+
+### 涉及文件
+- `ui/sftp_panel.slint`
+
 ## 2026-09-11
 
 ### 升级 vt100 0.15.2 → 0.16.2，根治 tmux/窗口缩行后的解析 panic
