@@ -2,6 +2,23 @@
 
 ## 2026-09-27
 
+### SFTP 首次连接加载慢（启动链路并行化）
+
+### 背景/现象/根因
+- 连接服务器时感觉 SFTP 要等终端连上才开始；高延迟服务器上 SFTP 首次连接特别慢；左侧目录树总在右侧文件列表之后才出现。
+- 排查结论：SFTP 连接本身已与终端并行发起（`start_session_in_tab` 中 `spawn_sftp` 与终端 `spawn_session` 同帧调用，SFTP 有独立 worker 与事件泵）。真正原因是 `run_sftp` 启动后为纯串行链：`id -gn` 查 owner(2~3 RTT) → channel/subsystem(2~3) → canonicalize(1) → 首列表(1~N) → 清理遗留 hook(1~2) → 根目录树(1~N，左树在此才出现) → 读 /etc/passwd+/etc/group(4~6) → 重拉列表 → 重拉根树（树不含 owner 信息，纯浪费）。高延迟下十几次串行往返被急剧放大。
+
+### 改动/新增
+- `run_sftp` 启动序列用 `tokio::join!` 三路并发（同一 SFTP 会话多路复用，russh-sftp 2.x 方法全部 `&self`，`upload_pipelined` 已有并发先例）：首页列表、根目录树、owner 映射同时开始；树事件在自己完成时立即发出，不再排在右列表之后。
+- owner spec（仅 root 上传时使用）改为首次使用时惰性解析 + `OnceCell` 缓存，砍掉启动路径 2~3 个 RTT；`login_owner_spec` 的 `&mut Handle` 改为 `&Handle`（内部本就只需共享引用）。
+- 删除 owner maps 到达后对根目录树的第二次完整重拉；遗留 hook 清理（`remove_legacy_cwd_hook`）移到首屏渲染之后执行。
+
+### 修复/效果
+- SFTP 首屏（右列表 + 左树）在高延迟链路下从约 10+N 个串行往返降到约 4+N；左树与右列表同时出现；root 上传的 owner 解析行为不变（失败仍回退用户名）。cargo build 与全量 120 个单测通过。
+
+### 涉及文件
+- `src/sftp.rs`
+
 ### SFTP 面板滚动条滑块深色皮肤下看不清（对齐终端样式）
 
 ### 背景/现象/根因

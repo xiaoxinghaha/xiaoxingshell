@@ -453,10 +453,11 @@ async fn run_sftp(
     let _ = events.send(SessionEvent::SftpUser {
         user: effective_user.clone(),
     });
-    let effective_owner_spec = match login_owner_spec(&mut handle, &effective_user).await {
-        Ok(spec) if !spec.trim().is_empty() => spec,
-        _ => effective_user.clone(),
-    };
+    let handle = Arc::new(handle);
+    // Sudo-upload owner spec ("user:group") is only needed the first time a
+    // root upload runs — resolve it lazily (cached) so the startup path doesn't
+    // wait for an extra exec round-trip on high-latency links.
+    let owner_spec_cache: Arc<tokio::sync::OnceCell<String>> = Arc::default();
 
     // --- Open the sftp subsystem channel -----------------------------------
     let channel = handle
@@ -472,76 +473,77 @@ async fn run_sftp(
         .context("sftp handshake")?;
     let mut owner_maps = OwnerMaps::default();
 
-    // Resolve the home directory and do an initial listing.
-    let home = sftp
-        .canonicalize(".")
-        .await
-        .unwrap_or_else(|_| "/".to_string());
-    let _ = events.send(SessionEvent::SftpStatus(format!(
-        "{} {}...",
-        t("SFTP 加载", "SFTP loading"),
-        home
-    )));
-    match list_dir_impl(&sftp, &home, &owner_maps).await {
-        Ok(entries) => {
-            let _ = events.send(SessionEvent::SftpEntries {
-                path: home.clone(),
-                entries,
-            });
-            let _ = events.send(SessionEvent::SftpStatus(home.clone()));
-        }
-        Err(e) => {
-            let _ = events.send(SessionEvent::SftpError(list_error_msg(&home, &e)));
-        }
-    }
-
-    // Older versions appended this hook to shell rc files. Remove only the
-    // marker block and generated file so existing fish sessions stop echoing
-    // the obsolete setup command; unrelated rc content is left untouched.
-    remove_legacy_cwd_hook(&sftp, &home).await;
-
-    // --- Directory tree initialization -------------------------------------
+    // --- Directory tree state -----------------------------------------------
     // tree_dirs: path -> [(child_name, child_full_path)] for directories only
     // tree_expanded: set of paths currently shown as expanded
     let mut tree_dirs: std::collections::HashMap<String, Vec<(String, String)>> =
         std::collections::HashMap::new();
     let mut tree_expanded: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // Fetch only root "/" subdirs on startup. Deeper levels are loaded lazily
-    // when the user expands a node, which makes the first SFTP open much
-    // faster on high-latency servers.
-    let root_dirs = list_dirs_only_impl(&sftp, "/", &owner_maps)
-        .await
-        .unwrap_or_default();
-    tree_dirs.insert("/".to_string(), root_dirs);
-    tree_expanded.insert("/".to_string());
-    {
-        let mut nodes = Vec::new();
-        build_tree_nodes("/", 0, &tree_expanded, &tree_dirs, &mut nodes);
-        let _ = events.send(SessionEvent::SftpTreeUpdate(nodes));
-    }
+    // --- Startup listings ----------------------------------------------------
+    // The home listing, the "/" tree and the uid/gid maps run CONCURRENTLY on
+    // the same multiplexed SFTP session. The tree needs no owner maps and used
+    // to wait behind the home listing (plus a full "/" re-listing later), which
+    // made the left pane appear long after the file list on slow links.
+    let (home, (), maps_res) = tokio::join!(
+        async {
+            let home = sftp
+                .canonicalize(".")
+                .await
+                .unwrap_or_else(|_| "/".to_string());
+            let _ = events.send(SessionEvent::SftpStatus(format!(
+                "{} {}...",
+                t("SFTP 加载", "SFTP loading"),
+                home
+            )));
+            match list_dir_impl(&sftp, &home, &owner_maps).await {
+                Ok(entries) => {
+                    let _ = events.send(SessionEvent::SftpEntries {
+                        path: home.clone(),
+                        entries,
+                    });
+                    let _ = events.send(SessionEvent::SftpStatus(home.clone()));
+                }
+                Err(e) => {
+                    let _ = events.send(SessionEvent::SftpError(list_error_msg(&home, &e)));
+                }
+            }
+            home
+        },
+        async {
+            // Root "/" subdirs only, shown expanded; deeper levels load lazily
+            // when the user expands a node, which keeps the first SFTP open
+            // fast on high-latency servers.
+            let dirs = list_dirs_only_impl(&sftp, "/", &owner_maps)
+                .await
+                .unwrap_or_default();
+            tree_dirs.insert("/".to_string(), dirs);
+            tree_expanded.insert("/".to_string());
+            let mut nodes = Vec::new();
+            build_tree_nodes("/", 0, &tree_expanded, &tree_dirs, &mut nodes);
+            let _ = events.send(SessionEvent::SftpTreeUpdate(nodes));
+        },
+        load_owner_maps(&sftp),
+    );
 
-    // Load uid/gid -> user/group names AFTER the first listing/tree render so
-    // the SFTP panel opens immediately on slow servers. Once the maps arrive we
-    // refresh the current directory and tree display in-place.
-    if let Ok(loaded_maps) = load_owner_maps(&sftp).await {
+    // uid/gid -> user/group names: refresh the listing in place once the maps
+    // arrive (the first render shows numeric ids, same as before). The tree
+    // carries no owner info, so the old second "/" re-listing is gone.
+    if let Ok(loaded_maps) = maps_res {
         owner_maps = loaded_maps;
-
         if let Ok(entries) = list_dir_impl(&sftp, &home, &owner_maps).await {
             let _ = events.send(SessionEvent::SftpEntries {
                 path: home.clone(),
                 entries,
             });
         }
-
-        let root_dirs = list_dirs_only_impl(&sftp, "/", &owner_maps)
-            .await
-            .unwrap_or_default();
-        tree_dirs.insert("/".to_string(), root_dirs);
-        let mut nodes = Vec::new();
-        build_tree_nodes("/", 0, &tree_expanded, &tree_dirs, &mut nodes);
-        let _ = events.send(SessionEvent::SftpTreeUpdate(nodes));
     }
+
+    // Older versions appended this hook to shell rc files. Remove only the
+    // marker block and generated file so existing fish sessions stop echoing
+    // the obsolete setup command; unrelated rc content is left untouched.
+    // Kept off the first-render path: the panel is already visible by now.
+    remove_legacy_cwd_hook(&sftp, &home).await;
 
     let mut current_dir = home.clone();
     let mut current_sudo_dir: Option<(String, String, String)> = None;
@@ -568,7 +570,6 @@ async fn run_sftp(
 
     // --- Command loop -------------------------------------------------------
     // Shared by command handlers that open auxiliary exec channels.
-    let handle = Arc::new(handle);
     while let Some(cmd) = commands.recv().await {
         match cmd {
             SftpCommand::Close => break,
@@ -1000,6 +1001,22 @@ async fn run_sftp(
                 .await;
                 let result = match stage_result {
                     Ok(_) => {
+                        // Resolved on first use (then cached); falls back to the
+                        // plain username when the remote `id -gn` fails, same
+                        // as the old eager startup path did.
+                        let effective_owner_spec = owner_spec_cache
+                            .get_or_init(|| {
+                                let handle = handle.clone();
+                                let user = effective_user.clone();
+                                async move {
+                                    match login_owner_spec(&handle, &user).await {
+                                        Ok(spec) if !spec.trim().is_empty() => spec,
+                                        _ => user,
+                                    }
+                                }
+                            })
+                            .await
+                            .clone();
                         sudo_install_temp_file(
                             &handle,
                             &tmp_path,
@@ -2922,7 +2939,7 @@ async fn sudo_install_temp_file(
 }
 
 async fn login_owner_spec(
-    handle: &mut client::Handle<SftpClientHandler>,
+    handle: &client::Handle<SftpClientHandler>,
     user: &str,
 ) -> Result<String> {
     let user = user.trim();
