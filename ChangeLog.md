@@ -2,6 +2,20 @@
 
 ## 2026-09-30
 
+### 打包脚本产物落点改为三处
+
+#### 背景/现象/根因
+- `build.ps1` 只把 exe 复制到 `dist\`，桌面副本要靠可选的 `-Desktop` 开关，且 `release\`（发布归档目录）需要手动复制。
+
+#### 改动/新增
+- `build.ps1`：构建完成后固定同步到 `release\xiaoxingshell.exe`、`dist\xiaoxingshell.exe` 和桌面三处；桌面路径改用 `[Environment]::GetFolderPath('Desktop')` 解析（兼容 OneDrive/重定向桌面，原实现固定用 `$env:USERPROFILE\Desktop`）；取消 `-Desktop` 开关，改为可选 `-SkipDesktop`（桌面不可写或不想污染桌面时使用）。逐个落点 try/catch 并打印 `[OK]/[FAIL]`，仅当仓库内两处（release/dist）都失败才判定打包失败，构建本身成功时落点失败只告警。
+
+#### 修复/效果
+- 一条命令同时得到归档、运行与桌面快捷副本。实测 `pwsh build.ps1`：release 构建 8m34s 成功，三处产物均为 33859072 字节、时间戳一致，中文输出无乱码；临时校验日志已删除。
+
+#### 涉及文件
+- `build.ps1`、`ChangeLog.md`
+
 ### 连接后提示符打印两遍（同一行出现两个 `root@host:~#`）
 
 ### 背景/现象/根因
