@@ -1,5 +1,25 @@
 # ChangeLog
 
+## 2026-11-19
+
+### tmux 内每次提示符都打印 `__ms7: command not found`（非 root 用户）
+
+#### 背景/现象/根因
+- 普通用户 `ubuntu` 连上 110.42.209.103 后进入 tmux，每出现一次提示符就多一行 `__ms7: command not found`，敲 `ls` 前后都在刷；同一台机器用 root 登录不复现。
+- 根因：注入的 `PROMPT_COMMAND="__ms7…"` 与 `__ms7` 函数定义是两件事。部分发行版/用户 profile 里 `PROMPT_COMMAND` 是 **exported** 变量，`tmux` 新建 pane 时会把导出的环境整份复制过去，而 `__ms7` / `__msc` 只是当前 shell 内的函数，不随环境传递。于是 pane 里每次提示符都去执行一个不存在的命令。root 的 profile 没有导出该变量，所以看不到这个现象。
+
+#### 改动/新增
+- `src/ssh.rs`：`PROMPT_BODY` 的 bash 分支由 `PROMPT_COMMAND="__ms7${PROMPT_COMMAND:+;$PROMPT_COMMAND}"` 改为 `PROMPT_COMMAND="type __ms7 >/dev/null 2>&1 && __ms7${PROMPT_COMMAND:+;$PROMPT_COMMAND}"`。函数不存在时 `type` 探测静默短路，不再向终端打印错误；被继承的原有 `PROMPT_COMMAND` 仍排在后面照常执行（不改变用户原有语义，也不改 `PROMPT_COMMAND` 的导出属性）。
+
+#### 修复/效果
+- tmux、`su`、嵌套 shell 等「继承了变量但没有 hook 函数」的场景不再刷错误行；主 shell 内 OSC 7（cd 跟随）与 OSC 697（命令捕获）行为不变。
+- 本地 bash 三场景实测：pane 继承但无函数 → 静默 `rc=1` 无输出；函数存在 → 正常执行 `HOOK_RAN`；原值 `echo ORIG_KEPT` 在 pane 内仍执行。
+- 从源码提取注入脚本做 `bash -n` 语法校验通过；端到端模拟「主 shell 注入 + 子 shell 继承」，`PROMPT_COMMAND` 值正确且 pane 无报错。`cargo check` 通过，全量 124 个单测通过。
+- 注意：**已经运行中的 tmux server** 里保存的是旧的环境变量，需要 `tmux kill-server`（或在 tmux 内 `unset PROMPT_COMMAND`）后重新进入才会生效。
+
+#### 涉及文件
+- `src/ssh.rs`、`ChangeLog.md`
+
 ## 2026-11-18
 
 ### 登录后仍出现两个提示符（9-30 的修复未覆盖空负载分支）+ 复制后视图跳回光标
