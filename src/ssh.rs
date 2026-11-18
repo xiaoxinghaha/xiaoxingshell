@@ -220,17 +220,24 @@ pub fn extract_osc_command(text: &str) -> Option<(String, std::ops::Range<usize>
 }
 
 /// The echo-suppress window discards the injected setup line together with the
-/// `\r\n` it was echoed with. When that pre-injection prompt had already been
-/// rendered (the usual case on a low-latency server), the fresh prompt released
-/// after the window lands on the same line and the user sees
-/// `root@host:~# root@host:~#`. Rewind and erase that now-stale prompt line so
-/// the fresh prompt takes its place — one prompt on screen, nothing else
-/// disturbed.
-fn restore_prompt_line(payload: &str, stale_prompt_on_screen: bool) -> String {
-    if !stale_prompt_on_screen
-        || payload.trim_start().is_empty()
-        || payload.starts_with(['\r', '\n'])
-    {
+/// `\r\n` it was echoed with. The remote shell therefore believes the cursor
+/// sits at column 0 of a fresh line, while the local screen still shows the
+/// pre-injection prompt there — so the fresh prompt released after the window
+/// would be appended to it (`root@host:~# root@host:~#`). Rewind and erase that
+/// stale line before releasing whatever followed the OSC 7.
+///
+/// The erase must NOT be gated on the payload being non-empty: the hook's
+/// `printf` and the prompt that follows it are separate writes, so the OSC 7
+/// that closes the window regularly lands at the very end of a read with the
+/// prompt arriving in the next one. The previous version skipped the erase for
+/// exactly that case and the double prompt survived (the window resize "fix"
+/// was just SIGWINCH making bash repaint the line).
+///
+/// Payloads that already start with a line break are left alone — there the
+/// shell moved off the stale line by itself, so erasing would only add a blank
+/// line.
+fn restore_prompt_line(payload: &str) -> String {
+    if payload.starts_with(['\r', '\n']) {
         return payload.to_string();
     }
     format!("\r\x1b[K{payload}")
@@ -911,11 +918,6 @@ async fn run_session(
     // True from injecting PROMPT_SETUP until the echoed setup line has been
     // received and stripped; output is buffered (not shown) during that window.
     let mut suppress_echo = false;
-    // Whether the screen sat at the start of a line when the hook went out —
-    // i.e. whether the shell's pre-injection prompt is still visible there. See
-    // `restore_prompt_line` for why that decides the line break on close.
-    let mut rendered_at_line_start = true;
-    let mut stale_prompt_on_screen = false;
     // Watchdog for that window: a program that doesn't echo (passwd, su, a
     // nested ssh into a non-bash shell) swallows the injected hook line, OSC 7
     // never arrives, and queued keystrokes would be stuck forever. After the
@@ -1235,21 +1237,15 @@ async fn run_session(
                                 let _ = events.send(SessionEvent::CwdChanged(cwd));
                                 let rest = echo_buf[seq_end..].to_string();
                                 echo_buf.clear();
-                                Some(restore_prompt_line(&rest, stale_prompt_on_screen))
+                                Some(restore_prompt_line(&rest))
                             } else if echo_buf.len() >= ECHO_BUF_CAP {
                                 suppress_echo = false;
                                 suppress_deadline = None;
                                 flush_pending_input = true;
-                                Some(restore_prompt_line(
-                                    &std::mem::take(&mut echo_buf),
-                                    stale_prompt_on_screen,
-                                ))
+                                Some(restore_prompt_line(&std::mem::take(&mut echo_buf)))
                             } else {
                                 None
                             };
-                            if flushed.is_some() {
-                                stale_prompt_on_screen = false;
-                            }
                             match flushed {
                                 Some(text) => text,
                                 None => continue, // keep buffering; show nothing yet
@@ -1297,7 +1293,6 @@ async fn run_session(
                         }
 
                         // High-volume terminal output → bounded channel with backpressure.
-                        rendered_at_line_start = text.ends_with('\n');
                         let _ = out_tx.send(SessionEvent::Output(text)).await;
                         if flush_pending_input && !pending_input_while_suppress.is_empty() {
                             let queued = std::mem::take(&mut pending_input_while_suppress);
@@ -1318,7 +1313,6 @@ async fn run_session(
                         utf8_carry_stderr = raw[valid_len..].to_vec();
                         let text = String::from_utf8_lossy(&raw[..valid_len]).into_owned();
                         // High-volume stderr output → bounded channel with backpressure.
-                        rendered_at_line_start = text.ends_with('\n');
                         let _ = out_tx.send(SessionEvent::Output(text)).await;
                     }
                     Some(ChannelMsg::ExitStatus { exit_status }) => {
@@ -1392,10 +1386,6 @@ async fn run_session(
                 if shell_hook_ok {
                     prompt_injected = true;
                     suppress_echo = true;
-                    // Remember whether the shell's prompt is sitting visibly on
-                    // the last line: the echo we are about to swallow carried the
-                    // line break that separated it from the fresh prompt.
-                    stale_prompt_on_screen = !rendered_at_line_start;
                     suppress_deadline =
                         Some(Box::pin(tokio::time::sleep(HOOK_SUPPRESS_TIMEOUT)));
                     let _ = channel.data(prompt_setup.as_bytes()).await;
@@ -1415,6 +1405,16 @@ async fn run_session(
                 suppress_deadline = None;
                 suppress_echo = false;
                 echo_buf.clear();
+                // The window died before any OSC 7 arrived, so the pre-injection
+                // prompt is still on screen with the cursor parked after it and
+                // whatever comes next (the released keystroke echo, a fresh
+                // prompt) would be glued onto that same line. Clear the line
+                // once: the buffered echo was dropped anyway, so nothing real is
+                // lost. Payloads that start with a line break are untouched by
+                // `restore_prompt_line` for the same reason.
+                let _ = out_tx
+                    .send(SessionEvent::Output(restore_prompt_line("")))
+                    .await;
                 tracing::warn!("echo-suppress window timed out; queued input released");
                 if !pending_input_while_suppress.is_empty() {
                     let queued = std::mem::take(&mut pending_input_while_suppress);
@@ -2232,35 +2232,41 @@ mod prompt_line_tests {
     use super::restore_prompt_line;
 
     const PROMPT: &str = "root@host:~# ";
+    const CLEAR: &str = "\r\x1b[K";
 
-    /// Low-latency server: the pre-injection prompt is already on screen, so the
-    /// released fresh prompt must not be appended to it on the same line.
+    /// The pre-injection prompt is already on screen, so the released fresh
+    /// prompt must not be appended to it on the same line.
     #[test]
     fn stale_prompt_line_is_cleared_before_the_fresh_one() {
-        let out = restore_prompt_line(PROMPT, true);
-        assert_eq!(out, format!("\r\x1b[K{PROMPT}"));
+        let out = restore_prompt_line(PROMPT);
+        assert_eq!(out, format!("{CLEAR}{PROMPT}"));
         // The fresh prompt is the only prompt text in the payload.
         assert_eq!(out.matches("root@host:~#").count(), 1);
     }
 
-    /// High-latency server: the pre-injection prompt itself was swallowed by the
-    /// suppress window, so the cursor already sits at column 0 — no rewrite.
+    /// The real-world regression: the hook's `printf` and the prompt it precedes
+    /// are separate writes, so the OSC 7 closing the suppress window often ends
+    /// up as the last bytes of a read and the payload is EMPTY. The stale prompt
+    /// still has to be erased — otherwise the prompt that arrives in the next
+    /// read lands right behind it (`ubuntu@host:~$ ubuntu@host:~$`).
     #[test]
-    fn nothing_is_cleared_when_no_prompt_is_visible() {
-        assert_eq!(restore_prompt_line(PROMPT, false), PROMPT);
+    fn empty_payload_still_clears_the_stale_prompt() {
+        assert_eq!(restore_prompt_line(""), CLEAR);
+        // Same for a payload that is only the second OSC 7 of the hook.
+        let osc_only = "\x1b]7;file://host/home/user\x07";
+        assert_eq!(restore_prompt_line(osc_only), format!("{CLEAR}{osc_only}"));
     }
 
     /// The clear must never eat output the shell really did print: payloads that
-    /// already start with a line break, or carry no text, pass through untouched.
+    /// already start with a line break mean the shell left the stale line by
+    /// itself, so they pass through untouched (erasing would add a blank line).
     #[test]
     fn payloads_that_already_break_the_line_are_left_alone() {
         assert_eq!(
-            restore_prompt_line("\r\nls: no such file\r\n", true),
+            restore_prompt_line("\r\nls: no such file\r\n"),
             "\r\nls: no such file\r\n"
         );
-        assert_eq!(restore_prompt_line("\n", true), "\n");
-        assert_eq!(restore_prompt_line("", true), "");
-        assert_eq!(restore_prompt_line("   ", true), "   ");
+        assert_eq!(restore_prompt_line("\n"), "\n");
     }
 }
 

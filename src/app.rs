@@ -6977,7 +6977,15 @@ fn wire_key_input(
             if !selected.is_empty() {
                 std::thread::spawn(move || clipboard_set_text(selected));
                 if let Some(win) = weak.upgrade() {
-                    rebuild_tab_display(&win, &bufs, &tid);
+                    // Only drop the highlight. A full `rebuild_tab_display` also
+                    // re-publishes the cursor / scrollbar models and flushes the
+                    // pending output, which made the viewport snap back to the
+                    // live cursor right after copying from the scrollback — the
+                    // user lost the text they were reading. Clearing just the
+                    // selection model leaves scroll position and cursor alone.
+                    set_terminal_row(&win, &tid, |row| {
+                        row.selection = ModelRc::from(Rc::new(VecModel::<TermMatch>::default()));
+                    });
                 }
                 return;
             }

@@ -1,5 +1,28 @@
 # ChangeLog
 
+## 2026-11-18
+
+### 登录后仍出现两个提示符（9-30 的修复未覆盖空负载分支）+ 复制后视图跳回光标
+
+#### 背景/现象/根因
+- 连上 Ubuntu（`ubuntu@VM-16-5-ubuntu`）后首行显示 `ubuntu@VM-16-5-ubuntu:~$ ubuntu@VM-16-5-ubuntu:~$`，改变窗口大小（SIGWINCH 让 bash 重绘当前行）后恢复正常；9-30 的 `restore_prompt_line` 修复没有彻底解决。
+- 根因：`restore_prompt_line` 把「抹掉旧提示符行」门控在 `!payload.trim_start().is_empty()` 上。而 hook 的 `printf` 与紧随其后的提示符是两次独立 write，收尾用的 OSC 7 经常正好是某次 read 的最后一个字节 —— 此时 `rest = echo_buf[seq_end..]` 为空串，函数原样返回空、`\r\x1b[K` 根本没发出去；下一包到达的新提示符于是粘在旧提示符同一行。这也解释了为什么两个提示符在同一行、且重绘后消失。
+- 复制问题：Ctrl+C 复制后调用整屏 `rebuild_tab_display`，它顺带重新下发了 cursor/滚动条模型并 flush 了挂起输出，用户从回滚区复制时视图被拉回底部光标处，正在看的内容丢失。
+
+#### 改动/新增
+- `src/ssh.rs`：`restore_prompt_line(payload)` 去掉 `stale_prompt_on_screen` 参数与空负载短路，改为「只要负载不是以 `\r`/`\n` 开头，就先输出 `\r\x1b[K`」；因此空负载也会发出清行序列，把光标留在行首等新提示符覆盖。删除不再需要的 `rendered_at_line_start` / `stale_prompt_on_screen` 两个状态及其在 stdout/stderr 分支的快照赋值。
+- `src/ssh.rs`：回显抑制看门狗（5s 超时、无 OSC 7）收尾时同样发一次 `\r\x1b[K`，避免释放的按键回显/新提示符接在残留提示符后面。
+- `src/app.rs`：`on_copy_selection_or_ctrl_c` 复制成功后只清空 `row.selection` 模型，不再整屏重建，滚动位置与光标保持不动。
+- `prompt_line_tests` 重写为 3 个用例：旧提示符行被清除且只留一个提示符、空负载/仅 OSC 7 负载仍清行（本次回归）、以换行开头的负载原样透传。
+
+#### 修复/效果
+- 登录后屏幕只保留一个提示符；OSC 7 cd 跟随、OSC 697 命令捕获、hook 注入行隐藏逻辑均未改动。Ctrl+C 复制后高亮消失但视图停在原处。
+- `cargo check` 通过；`cargo test --bin xiaoxingshell` 全量 124 个单测通过。
+- 未做真机验证（本机无该服务器凭据）：建议连一次 Ubuntu 确认首屏只有一个提示符，并验证从回滚区选中复制后视图不跳。
+
+#### 涉及文件
+- `src/ssh.rs`、`src/app.rs`、`ChangeLog.md`
+
 ## 2026-09-30
 
 ### 打包脚本产物落点改为三处
