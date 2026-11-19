@@ -2,6 +2,33 @@
 
 ## 2026-11-19
 
+### 按 Alt 回滚位置被拉回底部 + 单行大响应（curl 322 KB）被截断
+
+#### 背景/现象/根因
+- 现象一：在回滚区查看输出时按一下 Alt（截图热键 Alt+A 的前半段），视图立刻跳回底部，要截的内容跑出屏幕；改变选择/复制路径后仍然存在。
+  - 根因：`on_send_key` 在判断按键内容**之前**就无条件执行 `view_offset = 0`（"打字回到底部"）。而 Slint 对单独按下的 Shift/Ctrl/Alt 发送的是空字符串 `key=""`（代码里 lone-Shift 注释已写明），所以纯修饰键也被当成输入，滚动位置被清掉。
+- 现象二：`curl` 拉接口返回的 JSON 只显示一部分，达不到预期的 9999 条。实测 `curl … | wc -lc` = `0  330280`，即整份响应是**一行 322 KiB、零换行**。
+  - 根因有三个，全部命中：
+    1. `PENDING_OUTPUT_CAP` 硬编码 256 KiB，小于这份响应 → `drain` 丢掉最旧的约 66 KB；
+    2. `flush_pending_output` 的 `MAX_CATCHUP_PER_TICK` 也是 256 KiB，纯文本超过后再次丢最旧；
+    3. `ingest` 的分批只按 `\n` 计数，零换行时整行一次性交给 `ingest_chunk`，vt100 滚动约 2500 个物理行，而 `detect_scroll` 只能从前后屏幕 diff 中恢复 rows-1 行 → 其余行进不了 history。
+
+#### 改动/新增
+- `src/app.rs`：`on_send_key` 增加 `real_key = !key.is_empty()`，只有真实按键才把 `view_offset` 归零；纯修饰键不再改变滚动位置，也不影响后面的 lone-Shift 记录与 IME C0 过滤。
+- `src/app.rs`：`PENDING_OUTPUT_CAP` 256 KiB → 2 MiB（单份 322 KB 响应留有余量，且该缓冲每渲染帧都会排空，属于瞬时内存）。
+- `src/app.rs`：`flush_pending_output` 中纯文本不再受 per-tick 预算限制（其上限由 `PENDING_OUTPUT_CAP` 约束），只有含 ESC 的彩色/全屏洪流继续沿用 skip-frames 丢弃策略，避免逐行 vt100 成本拖垮 UI。
+- `src/app.rs`：`ingest` 分批在换行计数之外增加字节预算 `(rows/2) × cols`，保证**无换行**的长行也会被切成滚动不超过半屏的小批；切点向后对齐到 UTF-8 字符边界，不会把多字节字符劈开。
+- 新增两个单测：`newline_free_giant_line_reaches_history_intact`（4000 字符零换行文本，history+屏幕合计不丢字符且 history ≥ 80 行）、`oversized_plain_backlog_is_not_dropped`（300 KiB 纯文本 backlog 全程不丢字节）。
+
+#### 修复/效果
+- 回滚区查看输出时按 Alt 不再跳动，截图热键不会再把内容顶走。
+- 单行大响应完整进入 scrollback。按 130 列估算，322 KB 单行约占 2500 个物理行，远低于默认 9999 行上限。
+- `cargo check` 通过；全量 **126** 个单测通过。
+- 未做真机验证：需连一次实际接口确认 curl 输出首尾完整（滚到最顶应看到 JSON 的起始 `{`），并确认按 Alt/Alt+A 时视图不再滚动。
+
+#### 涉及文件
+- `src/app.rs`、`ChangeLog.md`
+
 ### tmux 内彻底不继承 hook：注入后取消 PROMPT_COMMAND 的导出
 
 #### 背景/现象/根因

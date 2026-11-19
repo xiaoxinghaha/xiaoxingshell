@@ -6300,13 +6300,19 @@ fn wire_key_input(
             // (DECCKM, set by nano/vim via \x1b[?1h). In that mode the terminal
             // must send \x1bOA/B/C/D instead of \x1b[A/B/C/D.
             let mut snapped_to_live = false;
+            // Slint sends key="" for a bare modifier key (Shift / Ctrl / Alt —
+            // see the lone-Shift note below). Those never reach the PTY, so
+            // they must not drag the viewport back to the live bottom either:
+            // pressing Alt on the way to a screenshot hotkey used to scroll the
+            // user out of the output they were about to capture.
+            let real_key = !key.as_str().is_empty();
             let app_cursor = {
                 let mut map = bufs.lock().unwrap_or_else(|e| e.into_inner());
                 match map.get_mut(tab_id.as_str()) {
                     Some(b) => {
                         // Typing snaps the view back to the live bottom so the
                         // user always sees what they're entering.
-                        if b.view_offset != 0 {
+                        if real_key && b.view_offset != 0 {
                             b.view_offset = 0;
                             snapped_to_live = true;
                         }
@@ -9341,12 +9347,14 @@ impl TermBuffer {
     /// "skip frames" behaviour.
     fn push_pending_output(&mut self, text: &str) {
         self.pending_text.push_str(text);
-        // 256 KiB ceiling: small enough that the catch-up flush below can
-        // drain the whole backlog in a single render tick (a Ctrl+C during a
-        // `yes` flood must stop the screen almost immediately, not play out
-        // seconds of already-buffered output at tick speed), yet generous for
-        // any legitimate burst.
-        const PENDING_OUTPUT_CAP: usize = 256 * 1024;
+        // 2 MiB ceiling. It used to be 256 KiB, which is *smaller than a single
+        // API reply* — a 330 KB one-line JSON response (curl | wc -c = 330280)
+        // overflowed it, and the oldest bytes were dropped before the parser
+        // ever saw them, so the reply looked truncated from the front. The
+        // backlog is drained every render tick, so 2 MiB is transient memory
+        // rather than a leak; it is also the largest burst a 50 ms tick can
+        // realistically be handed.
+        const PENDING_OUTPUT_CAP: usize = 2 * 1024 * 1024;
         if self.pending_text.len() > PENDING_OUTPUT_CAP {
             let mut drop = self.pending_text.len() - PENDING_OUTPUT_CAP;
             while drop < self.pending_text.len() && !self.pending_text.is_char_boundary(drop) {
@@ -9376,17 +9384,21 @@ impl TermBuffer {
             return;
         }
         let mut text = std::mem::take(&mut self.pending_text);
-        const MAX_CATCHUP_PER_TICK: usize = 256 * 1024;
-        let cap = if text.len() > self.max_ingest_per_tick {
-            if text.contains('\x1b') {
-                self.max_ingest_per_tick
-            } else {
-                MAX_CATCHUP_PER_TICK.min(text.len())
-            }
+        // The per-tick budget exists to bound the *per-line* vt100 cost of
+        // escape-heavy output (colour logs, full-screen repaints). Plain text
+        // is bounded by `PENDING_OUTPUT_CAP` instead and must not be dropped
+        // here: a 330 KB single-line JSON reply used to lose everything above
+        // the 256 KiB mark at this exact `drain`, which is one of the reasons
+        // the curl response looked cut off.
+        let has_esc = text.contains('\x1b');
+        let cap = if has_esc && text.len() > self.max_ingest_per_tick {
+            self.max_ingest_per_tick
         } else {
             text.len()
         };
         if text.len() > cap {
+            // Skip the oldest frames: for a flood of coloured lines, showing
+            // the newest output matters more than replaying every byte.
             let mut drop = text.len() - cap;
             while drop < text.len() && !text.is_char_boundary(drop) {
                 drop += 1;
@@ -9424,22 +9436,41 @@ impl TermBuffer {
         // NOT a performance knob: `detect_scroll` can only recover a shift of
         // up to rows-1 lines from a before/after screen diff, so a batch that
         // scrolls a full screen (or more) leaves prev/curr with no common
-        // rows and returns 0 — the whole batch's scrolled-off lines are lost
-        // (history stalls at a few hundred lines and the user's scrollback
-        // cap never comes into play). rows/2 keeps every batch well inside
-        // what the diff can see.
+        // rows and returns 0 — the whole batch's scrolled-off lines are lost.
+        // rows/2 keeps every batch well inside what the diff can see.
+        //
+        // The cut must ALSO be driven by bytes, not just by `\n`: a single
+        // 330 KB JSON reply (curl | wc -lc → 0 lines, 330280 bytes) contains
+        // no newline at all, so the old newline-only loop handed the whole
+        // line to one `ingest_chunk`. It wrapped across ~2500 screen rows,
+        // the diff could only recover a screenful, and the rest of the reply
+        // never reached history — the second half of the truncation bug.
+        // Half a screen worth of columns is the byte budget that keeps a
+        // newline-free batch scrolling less than rows/2 rows.
+        let cols = self.parser.screen().size().1 as usize;
         let batch_lines = (rows / 2).max(1);
+        let max_batch_bytes = batch_lines.saturating_mul(cols.max(1)).max(1);
         let mut start = 0usize;
         let mut nl = 0usize;
-        for i in 0..bytes.len() {
+        let mut i = 0usize;
+        while i < bytes.len() {
             if bytes[i] == b'\n' {
                 nl += 1;
-                if nl >= batch_lines {
-                    self.ingest_chunk(&bytes[start..=i]);
-                    start = i + 1;
-                    nl = 0;
-                }
             }
+            if nl >= batch_lines || i + 1 - start >= max_batch_bytes {
+                // Never cut a multi-byte UTF-8 character in half; the batch may
+                // overshoot the budget by the width of one character.
+                let mut end = i + 1;
+                while end < bytes.len() && (bytes[end] & 0xC0) == 0x80 {
+                    end += 1;
+                }
+                self.ingest_chunk(&bytes[start..end]);
+                start = end;
+                nl = 0;
+                i = end;
+                continue;
+            }
+            i += 1;
         }
         if start < bytes.len() {
             self.ingest_chunk(&bytes[start..]);
@@ -11088,12 +11119,12 @@ mod selection_tests {
         let first = buf.parser.screen().rows(0, 20).next().unwrap_or_default();
         assert!(first.trim_end().starts_with("prompthello"));
 
-        // Oversized burst: the buffer caps at PENDING_OUTPUT_CAP (256 KiB) and
-        // the flush drains the whole backlog in ONE tick (catch-up), so a
-        // Ctrl+C during a flood stops the screen almost immediately.
-        let big = "x".repeat(1 << 20);
+        // Oversized burst: the buffer caps at PENDING_OUTPUT_CAP (2 MiB) and
+        // the whole plain-text backlog is drained in ONE tick, so a Ctrl+C
+        // during a flood stops the screen almost immediately.
+        let big = "x".repeat(4 << 20);
         buf.push_pending_output(&big);
-        assert!(buf.pending_text.len() <= 256 * 1024);
+        assert!(buf.pending_text.len() <= 2 * 1024 * 1024);
         buf.flush_pending_output();
         assert!(buf.pending_text.is_empty());
     }
@@ -11122,11 +11153,58 @@ mod selection_tests {
         // 你 (3 bytes) repeated: the cap must not split a char.
         let s = "你".repeat(1 << 19); // 3 MiB
         buf.push_pending_output(&s);
-        assert!(buf.pending_text.len() <= 256 * 1024);
+        assert!(buf.pending_text.len() <= 2 * 1024 * 1024);
         assert!(buf.pending_text.is_char_boundary(0));
         assert!(buf.pending_text.is_char_boundary(buf.pending_text.len()));
         // All chars intact after any truncation.
         assert!(buf.pending_text.chars().all(|c| c == '你'));
+    }
+
+    /// Real case: `curl -X POST … | wc -lc` → `0  330280`, i.e. one 322 KiB
+    /// JSON object with no newline at all. Batching used to count only `\n`,
+    /// so the whole reply went through a single `ingest_chunk`, scrolled ~2500
+    /// rows, and `detect_scroll` (which can see at most rows-1 of shift) threw
+    /// away everything but the last screenful.
+    #[test]
+    fn newline_free_giant_line_reaches_history_intact() {
+        let (rows, cols) = (10u16, 40u16);
+        let mut buf = make_buf(rows, cols, &[], &[], 0);
+        buf.max_history_lines = 50_000;
+        // A repeating 26-char alphabet: rows must differ from each other, or
+        // `detect_scroll` correctly reports "no scroll" (identical-screen rule
+        // used by `yes`) and nothing reaches history by design.
+        let text: String = (0..4000).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+        buf.ingest(text.as_bytes());
+        let count = |s: &str| s.chars().filter(|c| c.is_ascii_lowercase()).count();
+        let in_history: usize = buf.history.iter().map(|l| count(&l.text)).sum();
+        let on_screen: usize = buf.parser.screen().rows(0, cols).map(|r| count(&r)).sum();
+        assert_eq!(in_history + on_screen, text.len(), "bytes lost");
+        assert!(
+            buf.history.len() >= 80,
+            "only {} rows reached history",
+            buf.history.len()
+        );
+    }
+
+    /// Nothing may be dropped on the way in either: 300 KiB of plain text is
+    /// more than the old 256 KiB pending cap and more than the old per-tick
+    /// catch-up budget, both of which used to `drain` the oldest bytes.
+    #[test]
+    fn oversized_plain_backlog_is_not_dropped() {
+        let (rows, cols) = (10u16, 80u16);
+        let mut buf = make_buf(rows, cols, &[], &[], 0);
+        buf.max_history_lines = 100_000;
+        let text: String = (0..300 * 1024)
+            .map(|i| (b'a' + (i % 26) as u8) as char)
+            .collect();
+        buf.push_pending_output(&text);
+        while !buf.pending_text.is_empty() {
+            buf.flush_pending_output();
+        }
+        let count = |s: &str| s.chars().filter(|c| c.is_ascii_lowercase()).count();
+        let in_history: usize = buf.history.iter().map(|l| count(&l.text)).sum();
+        let on_screen: usize = buf.parser.screen().rows(0, cols).map(|r| count(&r)).sum();
+        assert_eq!(in_history + on_screen, text.len());
     }
 
     #[test]
