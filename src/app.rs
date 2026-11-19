@@ -6300,12 +6300,27 @@ fn wire_key_input(
             // (DECCKM, set by nano/vim via \x1b[?1h). In that mode the terminal
             // must send \x1bOA/B/C/D instead of \x1b[A/B/C/D.
             let mut snapped_to_live = false;
-            // Slint sends key="" for a bare modifier key (Shift / Ctrl / Alt —
-            // see the lone-Shift note below). Those never reach the PTY, so
-            // they must not drag the viewport back to the live bottom either:
-            // pressing Alt on the way to a screenshot hotkey used to scroll the
-            // user out of the output they were about to capture.
-            let real_key = !key.as_str().is_empty();
+            // A bare modifier key arrives as key="" (see the lone-Shift note
+            // below), and the Baidu Pinyin IME adds a stray C0 byte on modifier
+            // presses. Neither is user input, and neither may drag the viewport
+            // back to the live bottom: pressing Alt on the way to a screenshot
+            // hotkey used to scroll the user out of the output they were about
+            // to capture. Alt combinations are treated as shortcuts for the
+            // same reason (screenshot tools bind Alt+letter).
+            let real_key = !key.as_str().is_empty()
+                && !alt
+                && !is_ime_marker_key(key.as_str(), ctrl, alt);
+            if alt {
+                // Diagnostic for "Alt moves the viewport" reports: records what
+                // Slint actually delivered and whether it counted as input.
+                tracing::warn!(
+                    "[ALT_DIAG] key={} ctrl={} shift={} real_key={}",
+                    redact_key(key.as_str()),
+                    ctrl,
+                    shift,
+                    real_key
+                );
+            }
             let app_cursor = {
                 let mut map = bufs.lock().unwrap_or_else(|e| e.into_inner());
                 match map.get_mut(tab_id.as_str()) {
@@ -6376,22 +6391,14 @@ fn wire_key_input(
             //
             // 检测到 IME Shift 标记后，记录时间戳，让 Layer 2 在 1500ms 内
             // 拦截随后可能到来的 Backspace（右Shift场景，日志显示间隔约 914ms）。
-            if !ctrl && !alt {
-                if let Some(c) = key.as_str().chars().next() {
-                    let cp = c as u32;
-                    let is_standalone = matches!(cp, 0x08 | 0x09 | 0x0A | 0x0D | 0x1B);
-                    if key.as_str().chars().count() == 1
-                        && (0x01..=0x1f).contains(&cp)
-                        && !is_standalone
-                    {
-                        *last_shift_time.lock().unwrap() = Some(std::time::Instant::now());
-                        tracing::info!(
-                            "[KEY_DIAG] DROPPED IME C0 marker U+{:04X} (shift={}) → timestamp saved",
-                            cp, shift
-                        );
-                        return;
-                    }
-                }
+            if is_ime_marker_key(key.as_str(), ctrl, alt) {
+                let cp = key.as_str().chars().next().map(|c| c as u32).unwrap_or(0);
+                *last_shift_time.lock().unwrap() = Some(std::time::Instant::now());
+                tracing::info!(
+                    "[KEY_DIAG] DROPPED IME C0 marker U+{:04X} (shift={}) → timestamp saved",
+                    cp, shift
+                );
+                return;
             }
 
             // ── Windows: filter synthetic Ctrl+char injections ──────────────
@@ -7714,6 +7721,25 @@ fn save_editor_content(
 /// markers, …) are revealed — those are exactly what the Shift/Backspace IME
 /// diagnostics need and are never password material. Printable characters are
 /// collapsed to a count, so the logs stay useful without exposing keystrokes.
+/// True when `key` is one of the stray C0 bytes the Baidu Pinyin IME injects
+/// when a modifier is pressed. Those are not user input: they must never reach
+/// the PTY (see the Shift filter) and must never drag the viewport back to the
+/// live bottom either. Legitimate standalone control keys (Backspace, Tab, LF,
+/// CR, ESC) are excluded — they really are keystrokes.
+fn is_ime_marker_key(key: &str, ctrl: bool, alt: bool) -> bool {
+    if ctrl || alt {
+        return false;
+    }
+    let mut it = key.chars();
+    match (it.next(), it.next()) {
+        (Some(c), None) => {
+            let cp = c as u32;
+            (0x01..=0x1f).contains(&cp) && !matches!(cp, 0x08 | 0x09 | 0x0A | 0x0D | 0x1B)
+        }
+        _ => false,
+    }
+}
+
 fn redact_key(key: &str) -> String {
     if key.is_empty() {
         return "(empty)".to_string();
@@ -7771,6 +7797,26 @@ fn clipboard_set_text(text: String) {
     let result = arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text));
     if let Err(e) = result {
         tracing::warn!("clipboard set_text error: {}", e);
+    }
+}
+
+#[cfg(test)]
+mod key_marker_tests {
+    use super::is_ime_marker_key;
+
+    /// The IME's injected C0 bytes must not count as user input (no viewport
+    /// snap, no PTY write), while real standalone control keys still do.
+    #[test]
+    fn ime_c0_markers_are_not_user_input() {
+        assert!(is_ime_marker_key("\u{15}", false, false)); // left Shift marker
+        assert!(is_ime_marker_key("\u{10}", false, false)); // right Shift marker
+        assert!(!is_ime_marker_key("\u{8}", false, false)); // Backspace
+        assert!(!is_ime_marker_key("\u{1b}", false, false)); // ESC
+        assert!(!is_ime_marker_key("\r", false, false)); // Enter
+        assert!(!is_ime_marker_key("a", false, false)); // printable
+        assert!(!is_ime_marker_key("ab", false, false)); // multi-char block
+        assert!(!is_ime_marker_key("\u{15}", true, false)); // Ctrl combo
+        assert!(!is_ime_marker_key("", false, false)); // bare modifier
     }
 }
 
