@@ -9240,12 +9240,27 @@ impl TermBuffer {
     /// Extract the selected text from the combined buffer (whole selection,
     /// even the parts currently scrolled out of view).
     ///
-    /// Soft-wrap aware: when every row before the last is "full" (its content
-    /// reaches the right edge of the terminal grid), the rows are treated as
-    /// soft wraps of a single long line and joined WITHOUT newlines.  The last
-    /// row is exempt — it's the tail of the wrapped content and rarely full.
-    /// If any preceding row is not full, all rows are joined with newlines
-    /// (original behavior).
+    /// Soft-wrap aware extraction.
+    ///
+    /// A row counts as soft-wrapped when its content runs to (at least) the
+    /// second-to-last column — the terminal only ever pads the final column
+    /// when a two-cell glyph didn't fit there, so `cols - 1` covers every real
+    /// wrap. The decision is made **per row**, not for the selection as a
+    /// whole: the previous all-or-nothing rule ("unless every row is full, join
+    /// everything with newlines") meant a single short row — a prompt line, a
+    /// CJK glyph that got padded — put a newline back into every wrapped row of
+    /// a long response.
+    ///
+    /// Width is measured on the per-cell `chars` vector (one char per cell, CJK
+    /// glyphs carry a continuation placeholder), so a char index equals a grid
+    /// column; filtering the placeholders out first would halve the width of
+    /// every row containing Chinese and break the test.
+    ///
+    /// Known trade-off: a row that exactly fills the width and is then ended by
+    /// a REAL newline is indistinguishable from a soft wrap here, so it is
+    /// joined with the next row. vt100's `Screen::row_wrapped` could tell them
+    /// apart, but that would require threading the flag through `build_row` and
+    /// the history roll-off path for a rare cosmetic case.
     fn extract_selection_text(&self) -> String {
         let (Some((ar, ac)), Some((fr, fc))) = (self.sel_anchor, self.sel_focus) else {
             return String::new();
@@ -9257,22 +9272,25 @@ impl TermBuffer {
         };
         let (live, live_used) = self.live_rows();
         let hist_len = self.history.len();
+        let cols = self.parser.screen().size().1 as usize;
         let combined_len = hist_len + live_used;
         // Clamp into real content so a focus parked on a blank row below the
         // prompt doesn't emit trailing empty lines.
         let hi_r = hi_r.min(combined_len.saturating_sub(1));
+        if hi_r < lo_r {
+            return String::new();
+        }
 
-        // First pass: extract segments and determine if every row is "full"
-        // (content touches the right edge → soft wrap, no real newline).
-        let mut segs: Vec<String> = Vec::with_capacity(hi_r.saturating_sub(lo_r) + 1);
-        let mut all_full = true;
+        let row_count = hi_r - lo_r + 1;
+        let mut segs: Vec<String> = Vec::with_capacity(row_count);
+        // soft[i] = row i runs to the right edge and wraps onto row i+1.
+        // The last row's value is never read (nothing follows it).
+        let mut soft: Vec<bool> = Vec::with_capacity(row_count);
         for r in lo_r..=hi_r {
             let line: &str = if r < hist_len {
                 &self.history[r].text
-            } else if r - hist_len < live.len() {
-                &live[r - hist_len].text
             } else {
-                ""
+                live.get(r - hist_len).map(|l| l.text.as_str()).unwrap_or("")
             };
             let chars: Vec<char> = line.chars().collect();
             let (c0, c1) = if r == lo_r && r == hi_r {
@@ -9294,41 +9312,23 @@ impl TermBuffer {
             } else {
                 String::new()
             };
-
-            // A row is "full" when its trimmed plain text length equals the
-            // effective character count of the entire row (total cells minus
-            // wide-continuation placeholders).  This means content occupied
-            // the last cell → the terminal soft-wrapped, no real newline.
-            // Only check rows before the last one — the last row is the tail
-            // of the wrapped content and is almost certainly not full.
-            if r != hi_r {
-                let full_chars: Vec<char> = chars
-                    .iter()
-                    .copied()
-                    .filter(|&ch| ch != WIDE_CONT_PLACEHOLDER)
-                    .collect();
-                let effective_width = full_chars.len();
-                let trimmed_len = full_chars
-                    .iter()
-                    .collect::<String>()
-                    .trim_end()
-                    .chars()
-                    .count();
-                if effective_width == 0 || trimmed_len < effective_width {
-                    all_full = false;
-                }
-            }
-
+            let width = chars
+                .iter()
+                .rposition(|&c| c != ' ' && c != '\t')
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            soft.push(width + 1 >= cols);
             segs.push(seg.trim_end().to_string());
         }
 
-        // Second pass: join.  All rows full → single long line (no newlines).
-        // Otherwise → original behavior with newlines between rows.
-        if all_full && segs.len() > 1 {
-            segs.join("")
-        } else {
-            segs.join("\n")
+        let mut out = String::with_capacity(segs.iter().map(|s| s.len() + 1).sum());
+        for (i, seg) in segs.iter().enumerate() {
+            if i > 0 && !soft[i - 1] {
+                out.push('\n');
+            }
+            out.push_str(seg);
         }
+        out
     }
 
     /// Feed bytes to vt100 and capture scrolled-off lines into history.
@@ -10825,26 +10825,58 @@ mod selection_tests {
         // simulate rows whose content touched the right edge (soft wrap).
         let full0 = "ABCDEFGHIJ"; // 10 chars = full
         let full1 = "KLMNOPQRST"; // 10 chars = full
-        let tail = "UVW"; // last row, short — exempt from check
+        let tail = "UVW"; // last row, short
         let mut buf = make_buf(5, 10, &[full0, full1, tail], &["prompt"], 3);
         buf.sel_anchor = Some((0, 0));
         buf.sel_focus = Some((2, 2));
-        // All rows before the last are full → no newlines.
         assert_eq!(buf.extract_selection_text(), "ABCDEFGHIJKLMNOPQRSTUVW");
     }
 
+    /// Real-world regression: a CJK glyph that doesn't fit in the last column
+    /// makes the terminal pad that row with a space and wrap. Under the old
+    /// rules that row counted as a real newline, so copying a long
+    /// Chinese-containing response inserted a newline into every wrapped row.
+    /// The width rule allows one padded column (`cols - 1`), which covers it.
     #[test]
-    fn soft_wrap_mixed_rows_copy_with_newlines() {
-        // Terminal is 10 columns wide.  First row is full, second is NOT
-        // full (only 5 chars + 5 trailing spaces) → real newline between.
-        let full0 = "ABCDEFGHIJ"; // 10 chars = full
-        let short1 = "HELLO     "; // 5 content + 5 spaces = NOT full
+    fn cjk_at_right_edge_does_not_add_newlines() {
+        // 9 columns: "ABCDEFGH" fills 8, the 2-cell 你 cannot fit in the last
+        // column, so vt100 pads column 8 with a space and wraps.
+        let mut buf = make_buf(4, 9, &[], &[], 0);
+        buf.ingest("ABCDEFGH你X".as_bytes());
+        assert!(buf.render().rows_used >= 2);
+        buf.sel_anchor = Some((0, 0));
+        buf.sel_focus = Some((1, 2)); // 你 occupies cols 0-1, X is at col 2
+        assert_eq!(buf.extract_selection_text(), "ABCDEFGH你X");
+    }
+
+    /// Documented trade-off of the width rule: a row that exactly fills the
+    /// width and is then ended by a REAL newline looks identical to a soft
+    /// wrap, so it is joined with the next row. Acceptable here — in terminal
+    /// output a full-width line is nearly always a wrapped continuation.
+    #[test]
+    fn full_row_with_real_newline_is_joined_as_known_tradeoff() {
+        let mut buf = make_buf(4, 10, &[], &[], 0);
+        buf.ingest("ABCDEFGHIJ\r\nKLMNOPQRST".as_bytes());
+        assert!(buf.render().rows_used >= 2);
+        buf.sel_anchor = Some((0, 0));
+        buf.sel_focus = Some((1, 9));
+        assert_eq!(buf.extract_selection_text(), "ABCDEFGHIJKLMNOPQRST");
+    }
+
+    #[test]
+    fn mixed_full_row_then_short_row_is_joined_by_design() {
+        // Per-row rule: a full-width row is treated as wrapping into the next
+        // one, even when that next row is short. A real newline after an
+        // exactly full-width line cannot be told apart from a wrap — the
+        // documented trade-off of the width heuristic. The short row still
+        // terminates its own line for the row after it.
+        let full0 = "ABCDEFGHIJ"; // 10 chars = full width
+        let short1 = "HELLO     "; // 5 content + 5 spaces
         let tail = "WORLD";
         let mut buf = make_buf(5, 10, &[full0, short1, tail], &["prompt"], 3);
         buf.sel_anchor = Some((0, 0));
         buf.sel_focus = Some((2, 4));
-        // A preceding row is not full → keep newlines.
-        assert_eq!(buf.extract_selection_text(), "ABCDEFGHIJ\nHELLO\nWORLD");
+        assert_eq!(buf.extract_selection_text(), "ABCDEFGHIJHELLO\nWORLD");
     }
 
     #[test]
