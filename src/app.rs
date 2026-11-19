@@ -531,6 +531,27 @@ pub fn init_panic_hook() {
     }));
 }
 
+/// Pin Slint's logical-to-physical scale factor for this process.
+///
+/// `percent == 0` leaves the OS DPI scaling untouched (the historical
+/// behaviour). Any other value forces the UI to that scale: 100 renders exactly
+/// at the design size even on a 125% / 150% Windows desktop — the window ends
+/// up physically smaller, but stays pixel-crisp instead of being stretched by
+/// the compositor. Works on every platform because it goes through Slint's own
+/// winit backend hook, not through a Win32 DPI-awareness call.
+///
+/// The backend reads the variable exactly once, while creating the first
+/// window, so this must run before `AppWindow::new()`; a change made in the
+/// settings dialog therefore needs a restart.
+fn apply_ui_scale_override(percent: u32) {
+    if percent == 0 {
+        return;
+    }
+    let factor = percent as f32 / 100.0;
+    std::env::set_var("SLINT_SCALE_FACTOR", format!("{factor}"));
+    tracing::info!("UI scale pinned to {percent}% (SLINT_SCALE_FACTOR={factor})");
+}
+
 pub fn run() -> Result<()> {
     // --- Runtime + store -------------------------------------------------
     let runtime = Arc::new(Runtime::new().context("failed to start tokio runtime")?);
@@ -540,6 +561,10 @@ pub fn run() -> Result<()> {
     // Reachable from the Slint-thread event handler for recording terminal
     // commands into history (#113).
     HISTORY_STORE.with(|s| *s.borrow_mut() = Some(store.clone()));
+
+    // Pin the UI scale before the window exists: Slint's winit backend reads
+    // `SLINT_SCALE_FACTOR` exactly once, while creating the first window.
+    apply_ui_scale_override(store.borrow().ui_scale_percent());
 
     // Per-tab SSH handles (shell only; lives on Slint thread via Rc).
     let handles: Rc<RefCell<HashMap<String, SessionHandle>>> =
@@ -581,6 +606,10 @@ pub fn run() -> Result<()> {
     // Show the crate version (from Cargo.toml at compile time) in the sidebar,
     // so the footer never drifts out of sync with the actual build.
     window.set_app_version(env!("CARGO_PKG_VERSION").into());
+
+    // Settings dialog value. The scale itself was already applied above, before
+    // the window existed; this is only what the spinner displays.
+    window.set_ui_scale_percent(store.borrow().ui_scale_percent() as i32);
 
     // Set the window icon from the PNG embedded in the binary so the dock
     // shows the correct icon even without a system-installed .desktop entry
@@ -928,6 +957,25 @@ pub fn run() -> Result<()> {
             }
             if let Some(w) = weak.upgrade() {
                 w.set_terminal_max_ingest_kib(saved as i32);
+            }
+        });
+    }
+    // Interface setting: forced UI scale (0 = follow the OS). Only applied while
+    // the window is being created, so persist + round-trip the value here; the
+    // dialog text tells the user a restart is required.
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        window.on_set_ui_scale_percent(move |percent: i32| {
+            let saved = {
+                let mut s = store.borrow_mut();
+                s.set_ui_scale_percent(percent.max(0) as u32);
+                let saved = s.ui_scale_percent();
+                let _ = s.save();
+                saved
+            };
+            if let Some(w) = weak.upgrade() {
+                w.set_ui_scale_percent(saved as i32);
             }
         });
     }

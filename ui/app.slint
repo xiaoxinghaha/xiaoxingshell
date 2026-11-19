@@ -364,6 +364,10 @@ export component AppWindow inherits Window {
     callback set-terminal-render-tick-ms(int);     // apply + persist render cadence
     in-out property <int> terminal-max-ingest-kib: 32;
     callback set-terminal-max-ingest-kib(int);     // apply + persist per-tick ingest cap
+    // Forced UI scale in percent: 0 = follow the OS DPI scaling, 100 = render at
+    // the design size even on a 125%/150% desktop. Applied at startup only.
+    in-out property <int> ui-scale-percent: 0;
+    callback set-ui-scale-percent(int);            // persist; needs a restart
     in-out property <int> session-flash-ms: 1000;
     callback set-session-flash-ms(int);             // apply + persist session-row flash duration
     in-out property <string> nav-rail-color-text: "";
@@ -3003,6 +3007,41 @@ export component AppWindow inherits Window {
                                         text: root.lang-en
                                             ? "How much output is parsed per render tick. Lower = smoother on slow machines (drops more intermediate frames)."
                                             : "每个渲染节拍解析多少输出。数值越小，低配机器越流畅（丢弃更多中间帧）。";
+                                        color: Theme.text-muted;
+                                        font-size: Theme.fs-sm;
+                                        wrap: word-wrap;
+                                    }
+
+                                    // UI scale override: 0 keeps the OS DPI scaling,
+                                    // 100 pins the design size on a scaled desktop.
+                                    VerticalLayout {
+                                        spacing: 6px;
+                                        Text { text: root.lang-en ? "UI scale (%)" : "界面缩放 (%)";
+                                               color: Theme.text-secondary; font-size: Theme.fs-sm; }
+                                        HorizontalLayout {
+                                            spacing: 10px;
+                                            SpinBox {
+                                                width: 120px;
+                                                value: root.ui-scale-percent;
+                                                minimum: 0;
+                                                maximum: 400;
+                                                edited => { root.set-ui-scale-percent(self.value); }
+                                            }
+                                            Text {
+                                                text: root.ui-scale-percent == 0
+                                                    ? (root.lang-en ? "follow system" : "跟随系统")
+                                                    : root.ui-scale-percent + "%";
+                                                color: Theme.text-muted;
+                                                font-size: Theme.fs-sm;
+                                                vertical-alignment: center;
+                                            }
+                                            Rectangle { horizontal-stretch: 1; }
+                                        }
+                                    }
+                                    Text {
+                                        text: root.lang-en
+                                            ? "0 = follow the system DPI scaling. 100 = always render at the design size, ignoring Windows 125%/150% zoom (the window becomes physically smaller but stays sharp). Takes effect after a restart."
+                                            : "0 = 跟随系统缩放；100 = 固定按设计尺寸显示，忽略 Windows 的 125%/150% 缩放（窗口物理尺寸会变小，但显示更清晰）。修改后需重启生效。";
                                         color: Theme.text-muted;
                                         font-size: Theme.fs-sm;
                                         wrap: word-wrap;

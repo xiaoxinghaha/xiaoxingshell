@@ -2,6 +2,27 @@
 
 ## 2026-11-19
 
+### 新增「界面缩放 (%)」设置：可强制按 100% 渲染，忽略系统 DPI 缩放
+
+#### 背景/现象/根因
+- Windows 在 125% / 150% 缩放下，整个界面随之放大，希望终端按原始 100% 尺寸显示。
+- Slint 的 winit 后端本身支持用 `SLINT_SCALE_FACTOR` 覆盖逻辑缩放因子，并且在**创建第一个窗口时读取一次**；这是后端级钩子，Windows / Linux / macOS 通用，不需要调用 Win32 的 DPI awareness API。
+
+#### 改动/新增
+- `src/config.rs`：新增 `ui_scale_percent`（0 = 跟随系统，100 = 固定 100%，上限 400），带 getter/setter 与默认值/裁剪单测。
+- `src/app.rs`：新增 `apply_ui_scale_override()`，在 `AppWindow::new()` **之前**设置 `SLINT_SCALE_FACTOR`（后端只读一次，晚设无效）；设置回调只负责持久化并回填 UI，界面文案提示需重启。
+- `ui/app.slint`：Interface 设置页新增「界面缩放 (%)」SpinBox（0~400，0 时显示"跟随系统"）与中英文说明。
+
+#### 修复/效果
+- 设为 100 后重启：界面按设计尺寸渲染，不再被系统的 125%/150% 放大；窗口物理尺寸相应变小，但保持清晰（不是位图拉伸那种模糊放大）。
+- 设为其它数值（如 125）可手动指定比例；0 保持历史行为。
+- 三平台通用：走 Slint 后端的 `SLINT_SCALE_FACTOR`，不依赖 Windows 专有 API。
+- 全量 **130** 个单测通过。
+- 未做真机验证（本机无法观察界面缩放）：需在 Windows 缩放 125%/150% 的机器上设为 100 重启，确认窗口与字体按 100% 渲染且清晰。
+
+#### 涉及文件
+- `src/config.rs`、`src/app.rs`、`ui/app.slint`、`ChangeLog.md`
+
 ### 按 Alt 仍会跳回底部（第二次修复：IME 注入与 Alt 组合）
 
 #### 背景/现象/根因

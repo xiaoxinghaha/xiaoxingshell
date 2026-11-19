@@ -376,6 +376,12 @@ pub struct ConfigFile {
     /// more intermediate frames); higher = more output kept (more memory).
     #[serde(default)]
     pub terminal_max_ingest_kib: u32,
+    /// Forced UI scale in percent. 0 = follow the OS DPI scaling (default),
+    /// 100 = always render at the design size, ignoring Windows 125%/150%
+    /// zoom. Applied once at startup through `SLINT_SCALE_FACTOR`, so a change
+    /// only takes effect after a restart.
+    #[serde(default)]
+    pub ui_scale_percent: u32,
     /// Duration for the short session-row flash after create/edit/connect. 0 =
     /// built-in default.
     #[serde(default)]
@@ -891,6 +897,15 @@ impl ConfigStore {
 
     pub fn set_terminal_max_ingest_kib(&mut self, kib: u32) {
         self.cache.terminal_max_ingest_kib = kib.clamp(8, 256);
+    }
+
+    /// Forced UI scale in percent (0 = follow the OS DPI, up to 400 = 4x).
+    pub fn ui_scale_percent(&self) -> u32 {
+        self.cache.ui_scale_percent.min(400)
+    }
+
+    pub fn set_ui_scale_percent(&mut self, percent: u32) {
+        self.cache.ui_scale_percent = percent.min(400);
     }
 
     /// Session row flash duration in milliseconds (default 1000).
@@ -1483,6 +1498,17 @@ mod tests {
 
         store.set_terminal_max_ingest_kib(1_000);
         assert_eq!(store.terminal_max_ingest_kib(), 256);
+    }
+
+    #[test]
+    fn ui_scale_percent_defaults_and_clamps() {
+        let mut store = temp_store();
+        // 0 = follow the OS DPI scaling, the historical behaviour.
+        assert_eq!(store.ui_scale_percent(), 0);
+        store.set_ui_scale_percent(150);
+        assert_eq!(store.ui_scale_percent(), 150);
+        store.set_ui_scale_percent(9_999);
+        assert_eq!(store.ui_scale_percent(), 400);
     }
 
     #[test]
