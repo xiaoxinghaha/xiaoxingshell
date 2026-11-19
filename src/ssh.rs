@@ -975,15 +975,21 @@ async fn run_session(
     // (see the suppress block below), so it doesn't matter that the long line
     // wraps — we never substring-match it.
     //
-    // `PROMPT_COMMAND` can be an exported variable (a few distro/profile setups
-    // export it), and tmux copies the exported environment into every new pane
-    // while the hook functions themselves are per-shell and do NOT travel. A
-    // bare `__ms7` then fails on every prompt inside tmux — the
-    // `__ms7: command not found` flood seen with a non-root login. Guard the
-    // call with a silent `type` probe so the inherited string is inert where the
-    // function doesn't exist, while any pre-existing PROMPT_COMMAND appended
-    // after it keeps running.
-    const PROMPT_BODY: &str = "test -z \"$FISH_VERSION\" && eval '__msc(){ __c=\"$(fc -ln -1 2>/dev/null)\"; [ -n \"$__c\" ] && [ \"$__c\" != \"$__cl\" ] && { __cl=\"$__c\"; printf \"\\033]697;%s\\007\" \"$__c\"; }; }; __ms7(){ __msc; printf \"\\033]7;file://%s%s\\007\" \"$HOSTNAME\" \"$PWD\"; }; __h=\"$(history 1 2>/dev/null)\"; __h=\"${__h#\"${__h%%[! ]*}\"}\"; __h=\"${__h%%[!0-9]*}\"; [ -n \"$BASH_VERSION\" ] && [ -n \"$__h\" ] && history -d \"$__h\" 2>/dev/null; unset __h; __cl=\"$(fc -ln -1 2>/dev/null)\"; if [ -n \"$ZSH_VERSION\" ]; then autoload -Uz add-zsh-hook 2>/dev/null; add-zsh-hook precmd __ms7; else PROMPT_COMMAND=\"type __ms7 >/dev/null 2>&1 && __ms7${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"; fi; __ms7'";
+    // The hook is only meant to run in the login shell this session owns: the
+    // SFTP panel follows that shell's `cd`, and nothing inside tmux needs it.
+    // `PROMPT_COMMAND` can already be an exported variable (a few distro/profile
+    // setups export it), and tmux copies the exported environment into every new
+    // pane while the hook functions themselves are per-shell and do NOT travel.
+    // A bare `__ms7` then failed on every prompt inside tmux — the
+    // `__ms7: command not found` flood seen with a non-root login. Two measures,
+    // both needed:
+    //   • `export -n PROMPT_COMMAND` drops the export flag so tmux panes (and
+    //     any other child shell) start without the hook at all — the root fix;
+    //   • the `type` probe keeps a value that was inherited some other way
+    //     (an already-running tmux server, a profile that re-exports it) inert
+    //     instead of noisy, and any pre-existing PROMPT_COMMAND appended after
+    //     it still runs.
+    const PROMPT_BODY: &str = "test -z \"$FISH_VERSION\" && eval '__msc(){ __c=\"$(fc -ln -1 2>/dev/null)\"; [ -n \"$__c\" ] && [ \"$__c\" != \"$__cl\" ] && { __cl=\"$__c\"; printf \"\\033]697;%s\\007\" \"$__c\"; }; }; __ms7(){ __msc; printf \"\\033]7;file://%s%s\\007\" \"$HOSTNAME\" \"$PWD\"; }; __h=\"$(history 1 2>/dev/null)\"; __h=\"${__h#\"${__h%%[! ]*}\"}\"; __h=\"${__h%%[!0-9]*}\"; [ -n \"$BASH_VERSION\" ] && [ -n \"$__h\" ] && history -d \"$__h\" 2>/dev/null; unset __h; __cl=\"$(fc -ln -1 2>/dev/null)\"; if [ -n \"$ZSH_VERSION\" ]; then autoload -Uz add-zsh-hook 2>/dev/null; add-zsh-hook precmd __ms7; else PROMPT_COMMAND=\"type __ms7 >/dev/null 2>&1 && __ms7${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"; export -n PROMPT_COMMAND 2>/dev/null; fi; __ms7'";
     let prompt_setup = format!(" {}\r", PROMPT_BODY);
     // Hook-injection scheduling (see the pump loop): wait for output silence
     // before sending, with a hard cap for servers that keep streaming.

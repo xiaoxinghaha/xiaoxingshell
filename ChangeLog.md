@@ -2,6 +2,26 @@
 
 ## 2026-11-19
 
+### tmux 内彻底不继承 hook：注入后取消 PROMPT_COMMAND 的导出
+
+#### 背景/现象/根因
+- 上一版给 `__ms7` 调用加了 `type` 守卫，只让"函数缺失"时静默，但值仍随环境进入 tmux pane：已运行的 tmux server 里存的是旧值，照样刷 `__ms7: command not found`。
+- 需求明确：tmux 里不需要 cd 跟随与命令捕获，这些能力只应在会话所属的登录 shell 里工作。既然不需要，就不该把 `PROMPT_COMMAND` 传下去，而不是传下去再让它静默失败。
+- 根因仍是「变量可导出、函数不随环境走」这对错配：只要 `PROMPT_COMMAND` 带 export 标志，tmux 新建 pane 就会复制它。
+
+#### 改动/新增
+- `src/ssh.rs`：bash 分支在设置 `PROMPT_COMMAND` 后追加 `export -n PROMPT_COMMAND 2>/dev/null`，去掉导出标志。新建的 tmux pane / 任意子 shell 启动时 `PROMPT_COMMAND` 为空，不再执行 hook，也不会报错。
+- 保留 `type __ms7 >/dev/null 2>&1 &&` 守卫作为兜底：对已经被旧 tmux server 继承、或 profile 里重新 export 的情形，仍静默而不刷错误；原有 `PROMPT_COMMAND` 链照常保留在其后。
+
+#### 修复/效果
+- 登录 shell 自身不受影响：OSC 7（cd 跟随）、OSC 697（命令捕获）仍由 `__ms7` 正常输出。
+- 本地 bash 实测（提取真实注入串执行）：`main_pc=[type __ms7 >/dev/null 2>&1 && __ms7]`、`EXPORTED=no`、子 shell `child_pc=[]`、`__ms7` 输出 `^[]7;file://ipason/tmp^G`（OSC 7 正常）；预设 `export PROMPT_COMMAND='echo ORIG'` 时得到 `…&& __ms7;echo ORIG`，子 shell 仍为空，主 shell 执行时同时输出 OSC 7 与 `ORIG`。
+- 注入串 `bash -n` 语法校验通过；`cargo check` 通过，全量 124 个单测通过。
+- 注意：**已经运行的 tmux server** 里保存的仍是旧环境，代码改不了已存在的进程。需 `tmux kill-server`，或 `tmux setenv -g -u PROMPT_COMMAND` 后新开 pane；已开着的 pane 各自 `unset PROMPT_COMMAND`。
+
+#### 涉及文件
+- `src/ssh.rs`、`ChangeLog.md`
+
 ### tmux 内每次提示符都打印 `__ms7: command not found`（非 root 用户）
 
 #### 背景/现象/根因
