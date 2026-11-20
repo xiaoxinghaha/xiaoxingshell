@@ -981,15 +981,6 @@ impl ConfigStore {
         self.cache.sftp_auto_refresh_secs = secs.clamp(10, 3600);
     }
 
-    /// Saved quick commands (#55).
-    pub fn quick_commands(&self) -> &[QuickCommand] {
-        &self.cache.quick_commands
-    }
-
-    pub fn set_quick_commands(&mut self, cmds: Vec<QuickCommand>) {
-        self.cache.quick_commands = cmds;
-    }
-
     /// Quick commands bound to one saved session. Unknown ids return an empty
     /// slice (welcome page, info tabs, sessions not saved yet).
     pub fn quick_commands_for(&self, session_id: &str) -> &[QuickCommand] {
