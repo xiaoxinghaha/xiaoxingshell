@@ -1810,6 +1810,7 @@ pub fn run() -> Result<()> {
     wire_sftp_callbacks(
         &window,
         store.clone(),
+        tab_statuses.clone(),
         sftp_handles.clone(),
         sudo_states.clone(),
         sftp_entry_cache.clone(),
@@ -5317,6 +5318,7 @@ fn sftp_typeahead_match(entries: &[RemoteEntry], needle: &str, after: i32) -> i3
 fn wire_sftp_callbacks(
     window: &AppWindow,
     store: Rc<RefCell<ConfigStore>>,
+    tab_statuses: TabStatuses,
     sftp_handles: SftpHandles,
     sudo_states: SudoStates,
     sftp_entry_cache: SftpEntryCache,
@@ -5665,6 +5667,8 @@ fn wire_sftp_callbacks(
     {
         let sudo_states = sudo_states.clone();
         let weak = window.as_weak();
+        let store_sudo = store.clone();
+        let statuses_sudo = tab_statuses.clone();
         window.on_sftp_sudo_clicked(move |tab_id: SharedString| {
             let tab_id = tab_id.to_string();
             if sudo_states
@@ -5698,6 +5702,25 @@ fn wire_sftp_callbacks(
                 let (saved_target, saved_password) = saved
                     .map(|s| (s.target_user, s.password))
                     .unwrap_or_else(|| ("root".to_string(), String::new()));
+                // First time for this tab: prefill the SSH login password. sudo
+                // authenticates the user who runs it (ubuntu), never the target
+                // user, so the session password is the one that works — and
+                // retyping it on every toggle was pure friction.
+                let prefill_password = if saved_password.is_empty() {
+                    statuses_sudo
+                        .lock()
+                        .ok()
+                        .and_then(|m| m.get(&tab_id).map(|st| st.session_id.clone()))
+                        .and_then(|sid| {
+                            store_sudo
+                                .borrow()
+                                .get(&sid)
+                                .map(|s| s.password.as_str().to_string())
+                        })
+                        .unwrap_or_default()
+                } else {
+                    saved_password
+                };
                 w.set_sudo_prompt_tab(tab_id.into());
                 w.set_sudo_login_user(login_user.into());
                 if saved_target.trim().is_empty() {
@@ -5705,7 +5728,7 @@ fn wire_sftp_callbacks(
                 } else {
                     w.set_sudo_target_user(saved_target.into());
                 }
-                w.set_sudo_password(saved_password.into());
+                w.set_sudo_password(prefill_password.into());
                 w.set_sudo_prompt_open(true);
             }
         });

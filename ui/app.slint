@@ -4263,6 +4263,14 @@ export component AppWindow inherits Window {
                     placeholder: "root";
                     value <=> root.sudo-target-user;
                 }
+                Text {
+                    text: root.lang-en
+                        ? "Keep root for full access. Any other user requires an explicit `sudo -u <user>` rule in sudoers."
+                        : "一般保持 root（完整权限）。改成其他用户时，sudoers 需显式允许 `sudo -u <用户>`。";
+                    color: Theme.text-muted;
+                    font-size: Theme.fs-xs;
+                    wrap: word-wrap;
+                }
                 LabeledInput {
                     label: root.lang-en ? "sudo password" : "sudo 密码";
                     placeholder: "••••••••";
@@ -4279,8 +4287,8 @@ export component AppWindow inherits Window {
                         x: 12px; y: 10px;
                         width: parent.width - 24px;
                         text: root.lang-en
-                            ? "Password can be empty if sudo is passwordless. Root upload writes a temporary file first, then installs it with sudo."
-                            : "已配置免密 sudo 可留空；否则直接输入密码。root 上传会先写入临时文件，再通过 sudo 覆盖目标路径。";
+                            ? "The login user's password (sudo never asks for root's). Already prefilled from the session — edit it if sudo uses another one. Empty works when sudo is passwordless. Root uploads write a temp file first, then install it with sudo."
+                            : "填登录用户的密码（sudo 校验的是它，不是 root 的）；已按会话自动填入，sudo 密码不同时直接改。已配置免密 sudo 可留空。root 上传会先写临时文件，再通过 sudo 覆盖目标路径。";
                         color: Theme.text-secondary;
                         font-size: Theme.fs-xs;
                         wrap: word-wrap;
