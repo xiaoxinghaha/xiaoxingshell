@@ -2,6 +2,29 @@
 
 ## 2026-11-20
 
+### 快捷命令管理弹窗改版 + 快捷命令按账号隔离 + 移除命令历史
+
+#### 背景/现象/根因
+- 管理弹窗 460×420 偏小；列表虽然可滚但**没有滚动条**（内容少时看不出可滚），且滚轮事件会穿透到背后的终端/会话列表。
+- 快捷命令是**全局**的：所有账号共用一份列表。
+- 终端命令栏右侧的历史箭头与弹窗（记录 + 召回命令）用不上，要求彻底去掉。
+
+#### 改动/新增
+- `ui/app.slint`：管理弹窗改为 **500×550**；列表由 `Flickable` + 布局子元素承载（布局才会把内容高度传给 viewport），右侧加 6px `ThinScrollBar`，仅在溢出时显示；遮罩与卡片的 `TouchArea` 增加 `scroll-event => accept`，滚轮不再穿透。弹窗标题下方显示当前所属会话名（`quick-cmd-scope`）。
+- `src/config.rs`：快捷命令改为**按会话存储**（`Session.quick_commands`），新增 `quick_commands_for` / `set_quick_commands_for`；旧版全局列表在加载时一次性迁移到每个尚无列表的会话，随后清空全局字段并立即保存（避免下次启动重复迁移）。
+- `src/app.rs`：`quick_cmd_model` 接收 `session_id`；新增 `refresh_quick_commands`，通过 `changed active-tab-id` 在每次切换标签时刷新列表与标题；增删回调改为作用于当前活动标签对应的会话。
+- 移除命令历史：删除终端命令栏的历史按钮、历史弹窗、↑/↓ 召回逻辑、`CommandHistoryEntry` 类型、`copy-text`/`delete-history` 相关接线；Rust 侧删除 `history_model`、`push_command_history`、`remove_command_history`、`on_delete_history` 与配置字段写入（`command_history` 保留为只读遗留字段，加载时清空且不再序列化）。OSC 697 的命令捕获仍保留 —— tmux 进入/退出检测依赖它。
+
+#### 修复/效果
+- 管理弹窗尺寸合适、列表溢出时有细滚动条、滚动不再带动背景。
+- 每个快速连接拥有独立的快捷命令列表；切换标签即时生效。
+- 命令栏不再记录任何历史，右侧箭头与弹窗消失。
+- `cargo check` 无警告；全量 **129** 个单测通过（移除了 `history_preview` 的用例）。
+- 未做真机验证：需确认旧配置迁移后各账号列表、弹窗滚动条与滚轮隔离、以及命令栏右侧按钮已消失。
+
+#### 涉及文件
+- `src/app.rs`、`src/config.rs`、`ui/app.slint`、`ui/terminal_view.slint`、`ChangeLog.md`
+
 ### 「启用 root 视角」自动填入登录密码 + 目标用户说明
 
 #### 背景/现象/根因

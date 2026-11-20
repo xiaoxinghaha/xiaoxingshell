@@ -178,6 +178,10 @@ pub struct Session {
     /// Empty = ungrouped. Sessions are grouped by this in Quick Connect.
     #[serde(default)]
     pub group: String,
+    /// Quick commands bound to this connection. Different accounts keep
+    /// different lists; the legacy global list is migrated here on first load.
+    #[serde(default)]
+    pub quick_commands: Vec<QuickCommand>,
 
     // --- Transport ----------------------------------------------------------
     /// SSH (default), Serial, or Telnet. Absent in old config files → Ssh.
@@ -268,6 +272,7 @@ impl Session {
             proxy: String::new(),
             last_used: None,
             group: String::new(),
+            quick_commands: Vec::new(),
             kind: SessionKind::Ssh,
             serial_port: String::new(),
             baud_rate: default_baud(),
@@ -417,8 +422,9 @@ pub struct ConfigFile {
     /// Saved quick commands (#55).
     #[serde(default)]
     pub quick_commands: Vec<QuickCommand>,
-    /// Recent commands sent from the command box, oldest first, capped (#55).
-    #[serde(default)]
+    /// Legacy command-box history. The feature was removed; the field is still
+    /// read so old config files load, cleared on load, and never written back.
+    #[serde(default, skip_serializing)]
     pub command_history: Vec<String>,
     /// Collapse the left resource sidebar on startup (#78).
     #[serde(default)]
@@ -465,20 +471,6 @@ pub struct ConfigStore {
     /// ChaCha20-Poly1305 key loaded from (or freshly generated into)
     /// `secret.key` in the same directory as `sessions.json`.
     key: [u8; 32],
-}
-
-/// Remove duplicate entries in place, keeping the *last* (most recent)
-/// occurrence of each and preserving relative order (#113). The list is capped
-/// at 200, so the quadratic scan is trivial.
-fn dedup_keep_last(items: &mut Vec<String>) {
-    let mut i = 0;
-    while i < items.len() {
-        if items[i + 1..].contains(&items[i]) {
-            items.remove(i);
-        } else {
-            i += 1;
-        }
-    }
 }
 
 fn normalize_editor_suffix(input: &str) -> Option<String> {
@@ -627,9 +619,9 @@ impl ConfigStore {
                             session.password = Secret::default();
                         }
                     }
-                    // Clean up any duplicate history accumulated before #113,
-                    // keeping the last (most recent) occurrence of each command.
-                    dedup_keep_last(&mut cfg.command_history);
+                    // The command-history feature was removed; drop the legacy
+                    // list so old config files stop carrying it.
+                    cfg.command_history.clear();
                     cfg
                 }
                 Err(err) => {
@@ -646,7 +638,21 @@ impl ConfigStore {
             ConfigFile::default()
         };
 
-        Ok(Self { path, cache, key })
+        let mut store = Self { path, cache, key };
+        // One-time migration: quick commands were global before they became
+        // per-account. Hand the old list to every session that has none yet,
+        // then clear the global list and persist so this never runs twice
+        // (otherwise clearing one account's list would be undone on restart).
+        if !store.cache.quick_commands.is_empty() {
+            let legacy = std::mem::take(&mut store.cache.quick_commands);
+            for session in &mut store.cache.sessions {
+                if session.quick_commands.is_empty() {
+                    session.quick_commands = legacy.clone();
+                }
+            }
+            let _ = store.save();
+        }
+        Ok(store)
     }
 
     fn config_path() -> Result<PathBuf> {
@@ -984,33 +990,17 @@ impl ConfigStore {
         self.cache.quick_commands = cmds;
     }
 
-    /// Recent command-box history, oldest first (#55).
-    pub fn command_history(&self) -> &[String] {
-        &self.cache.command_history
+    /// Quick commands bound to one saved session. Unknown ids return an empty
+    /// slice (welcome page, info tabs, sessions not saved yet).
+    pub fn quick_commands_for(&self, session_id: &str) -> &[QuickCommand] {
+        self.get(session_id)
+            .map(|s| s.quick_commands.as_slice())
+            .unwrap_or(&[])
     }
 
-    /// Append a command to the history: skips blanks, de-duplicates globally so
-    /// each command appears once, and re-appends at the end so the most-recently
-    /// used command is always last. Capped so it can't grow without bound (#113).
-    pub fn push_command_history(&mut self, cmd: String) {
-        if cmd.trim().is_empty() {
-            return;
-        }
-        // Drop any earlier occurrence, then push → no duplicates and "last used"
-        // moves to the end (bash `HISTCONTROL=erasedups` semantics).
-        self.cache.command_history.retain(|c| c != &cmd);
-        const CAP: usize = 200;
-        self.cache.command_history.push(cmd);
-        let len = self.cache.command_history.len();
-        if len > CAP {
-            self.cache.command_history.drain(0..len - CAP);
-        }
-    }
-
-    /// Remove a single command-history entry by storage index (#96).
-    pub fn remove_command_history(&mut self, index: usize) {
-        if index < self.cache.command_history.len() {
-            self.cache.command_history.remove(index);
+    pub fn set_quick_commands_for(&mut self, session_id: &str, cmds: Vec<QuickCommand>) {
+        if let Some(session) = self.cache.sessions.iter_mut().find(|s| s.id == session_id) {
+            session.quick_commands = cmds;
         }
     }
 

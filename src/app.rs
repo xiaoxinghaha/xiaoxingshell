@@ -723,9 +723,10 @@ pub fn run() -> Result<()> {
         }
     }
 
-    // Command bar (#55): seed quick commands + history from the config.
-    window.set_quick_commands(quick_cmd_model(&store.borrow()));
-    window.set_command_history(history_model(&store.borrow()));
+    // Command bar (#55): quick commands are per-account now. The active tab is
+    // still "welcome" here, so seed an empty list; `changed active-tab-id`
+    // refreshes it as soon as a session tab is selected.
+    window.set_quick_commands(quick_cmd_model(&store.borrow(), ""));
     window.set_default_external_editor(store.borrow().external_editor().into());
     window.set_external_editor_rules(editor_rule_model(&store.borrow()));
 
@@ -1177,6 +1178,18 @@ pub fn run() -> Result<()> {
         let local = local_snap.clone();
         let net = local_net_hist.clone();
         let bufs = bufs.clone();
+        // Per-session quick commands: refreshed on every active-tab change,
+        // alongside the sidebar.
+        {
+            let weak_q = weak.clone();
+            let store_q = store.clone();
+            let statuses_q = statuses.clone();
+            window.on_refresh_quick_commands(move || {
+                if let Some(w) = weak_q.upgrade() {
+                    refresh_quick_commands(&w, &store_q, &statuses_q);
+                }
+            });
+        }
         window.on_refresh_sidebar(move || {
             if let Some(w) = weak.upgrade() {
                 if let Some(session_id) = session_id_for_active_tab(&w, &statuses) {
@@ -2987,6 +3000,13 @@ fn wire_session_callbacks(
                 proxy: draft.proxy.to_string(),
                 last_used: None,
                 group: draft.group.to_string(),
+                // Editing a saved session keeps its quick commands: carry the
+                // existing list over instead of wiping it.
+                quick_commands: store
+                    .borrow()
+                    .get(&id)
+                    .map(|s| s.quick_commands.clone())
+                    .unwrap_or_default(),
                 kind,
                 serial_port: draft.serial_port.to_string(),
                 baud_rate: if draft.baud_rate <= 0 {
@@ -3887,10 +3907,11 @@ fn disk_model(disks: &[(String, u64, u64)]) -> ModelRc<DiskInfo> {
     ModelRc::from(Rc::new(VecModel::from(rows)))
 }
 
-/// Build the quick-command model for the command bar + manage dialog (#55).
-fn quick_cmd_model(store: &ConfigStore) -> ModelRc<QuickCmd> {
+/// Build the quick-command model for one session's command bar + manage dialog
+/// (#55). Lists are per-account: an empty/unknown id yields an empty model.
+fn quick_cmd_model(store: &ConfigStore, session_id: &str) -> ModelRc<QuickCmd> {
     let rows: Vec<QuickCmd> = store
-        .quick_commands()
+        .quick_commands_for(session_id)
         .iter()
         .map(|q| QuickCmd {
             name: q.name.clone().into(),
@@ -3898,6 +3919,37 @@ fn quick_cmd_model(store: &ConfigStore) -> ModelRc<QuickCmd> {
         })
         .collect();
     ModelRc::from(Rc::new(VecModel::from(rows)))
+}
+
+/// Push the active session's quick commands + its display name (used as the
+/// manage-dialog subtitle) to the UI. Runs on every active-tab change.
+fn refresh_quick_commands(
+    window: &AppWindow,
+    store: &Rc<RefCell<ConfigStore>>,
+    statuses: &TabStatuses,
+) {
+    let session_id = session_id_for_active_tab(window, statuses);
+    let (model, scope) = {
+        let s = store.borrow();
+        match session_id.as_deref() {
+            Some(id) => (
+                quick_cmd_model(&s, id),
+                s.get(id)
+                    .map(|x| {
+                        let name = x.name.trim();
+                        if name.is_empty() {
+                            x.host.clone()
+                        } else {
+                            name.to_string()
+                        }
+                    })
+                    .unwrap_or_default(),
+            ),
+            None => (quick_cmd_model(&s, ""), String::new()),
+        }
+    };
+    window.set_quick_commands(model);
+    window.set_quick_cmd_scope(scope.into());
 }
 
 fn editor_rule_model(store: &ConfigStore) -> ModelRc<EditorRuleItem> {
@@ -3956,25 +4008,6 @@ fn forward_model(forwards: &[crate::config::PortForward]) -> ModelRc<PortFwd> {
                 kind: f.kind.clone().into(),
                 summary: summary.into(),
             }
-        })
-        .collect();
-    ModelRc::from(Rc::new(VecModel::from(rows)))
-}
-
-fn history_preview(command: &str) -> String {
-    command.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// Build the command-history model in storage order (oldest first, newest
-/// last). The dropdown shows the most-recently-used command at the bottom
-/// (nearest the input) and ↑ recalls it first (#55, #113).
-fn history_model(store: &ConfigStore) -> ModelRc<CommandHistoryEntry> {
-    let rows: Vec<CommandHistoryEntry> = store
-        .command_history()
-        .iter()
-        .map(|s| CommandHistoryEntry {
-            command: s.clone().into(),
-            preview: history_preview(s).into(),
         })
         .collect();
     ModelRc::from(Rc::new(VecModel::from(rows)))
@@ -4629,18 +4662,9 @@ fn apply_session_event_to_window(
                 }
             }
             // A command typed directly in the terminal, captured via the shell
-            // hook (#113). Record it in the same command-box history, reusing the
-            // de-dup/move-to-end logic, and refresh the model.
-            HISTORY_STORE.with(|s| {
-                if let Some(store) = s.borrow().as_ref() {
-                    {
-                        let mut st = store.borrow_mut();
-                        st.push_command_history(cmd);
-                        let _ = st.save();
-                    }
-                    win.set_command_history(history_model(&store.borrow()));
-                }
-            });
+            // hook (#113). The command-history feature was removed on request,
+            // so nothing is recorded here anymore — the event is still used for
+            // tmux enter/exit detection above.
         }
     }
 }
@@ -6205,8 +6229,6 @@ fn wire_key_input(
     // --- Command bar (#55): run command + quick-command management ---------
     {
         let handles_rc = handles.clone();
-        let store_rc = store.clone();
-        let weak = window.as_weak();
         window.on_run_command(
             move |tab_id: SharedString, cmd: SharedString, to_all: bool| {
                 let line = cmd.trim_end().to_string();
@@ -6225,45 +6247,19 @@ fn wire_key_input(
                         handle.send_raw(bytes);
                     }
                 }
-                {
-                    let mut s = store_rc.borrow_mut();
-                    s.push_command_history(line);
-                    let _ = s.save();
-                }
-                if let Some(w) = weak.upgrade() {
-                    w.set_command_history(history_model(&store_rc.borrow()));
-                }
             },
         );
     }
-    // Copy a history command to the clipboard (#96).
+    // Copy text to the clipboard (system-info tab).
     {
         window.on_copy_text(move |text: SharedString| {
             let t = text.to_string();
             std::thread::spawn(move || clipboard_set_text(t));
         });
     }
-    // Delete a history entry (#96). The model is in storage order now (#113),
-    // so the row index maps straight through.
     {
         let store_rc = store.clone();
-        let weak = window.as_weak();
-        window.on_delete_history(move |i: i32| {
-            {
-                let mut s = store_rc.borrow_mut();
-                let idx = i as usize;
-                if idx < s.command_history().len() {
-                    s.remove_command_history(idx);
-                    let _ = s.save();
-                }
-            }
-            if let Some(w) = weak.upgrade() {
-                w.set_command_history(history_model(&store_rc.borrow()));
-            }
-        });
-    }
-    {
-        let store_rc = store.clone();
+        let statuses_qc = ctx.tab_statuses.clone();
         let weak = window.as_weak();
         window.on_add_quick_command(move |name: SharedString, command: SharedString| {
             let name = name.trim().to_string();
@@ -6271,35 +6267,41 @@ fn wire_key_input(
             if name.is_empty() || command.trim().is_empty() {
                 return;
             }
+            let Some(w) = weak.upgrade() else { return };
+            // Quick commands belong to the session behind the active tab.
+            let Some(session_id) = session_id_for_active_tab(&w, &statuses_qc) else {
+                return;
+            };
             {
                 let mut s = store_rc.borrow_mut();
-                let mut v = s.quick_commands().to_vec();
+                let mut v = s.quick_commands_for(&session_id).to_vec();
                 v.push(crate::config::QuickCommand { name, command });
-                s.set_quick_commands(v);
+                s.set_quick_commands_for(&session_id, v);
                 let _ = s.save();
             }
-            if let Some(w) = weak.upgrade() {
-                w.set_quick_commands(quick_cmd_model(&store_rc.borrow()));
-            }
+            refresh_quick_commands(&w, &store_rc, &statuses_qc);
         });
     }
     {
         let store_rc = store.clone();
+        let statuses_qc = ctx.tab_statuses.clone();
         let weak = window.as_weak();
         window.on_delete_quick_command(move |index: i32| {
+            let Some(w) = weak.upgrade() else { return };
+            let Some(session_id) = session_id_for_active_tab(&w, &statuses_qc) else {
+                return;
+            };
             {
                 let mut s = store_rc.borrow_mut();
-                let mut v = s.quick_commands().to_vec();
+                let mut v = s.quick_commands_for(&session_id).to_vec();
                 let i = index as usize;
                 if i < v.len() {
                     v.remove(i);
                 }
-                s.set_quick_commands(v);
+                s.set_quick_commands_for(&session_id, v);
                 let _ = s.save();
             }
-            if let Some(w) = weak.upgrade() {
-                w.set_quick_commands(quick_cmd_model(&store_rc.borrow()));
-            }
+            refresh_quick_commands(&w, &store_rc, &statuses_qc);
         });
     }
 
@@ -10382,14 +10384,6 @@ mod key_tests {
         assert_eq!(
             key_to_pty_bytes("a", false, true, false, false),
             vec![0x1b, b'a']
-        );
-    }
-
-    #[test]
-    fn history_preview_collapses_multiline_commands() {
-        assert_eq!(
-            history_preview("query:{\n  \"source\": \"x\",\r\n  \"params\": {}}\n"),
-            "query:{ \"source\": \"x\", \"params\": {}}"
         );
     }
 

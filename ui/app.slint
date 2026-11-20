@@ -21,11 +21,11 @@ import { Welcome, SessionBrowser, SessionInfo } from "welcome.slint";
 import { SessionDialog, SessionDraft, PortFwd } from "session_dialog.slint";
 import { ConfirmDialog } from "confirm_dialog.slint";
 import { LabeledInput, PrimaryButton, GhostButton } from "widgets.slint";
-import { TerminalView, TermSpan, TermMatch, QuickCmd, CommandHistoryEntry } from "terminal_view.slint";
+import { TerminalView, TermSpan, TermMatch, QuickCmd } from "terminal_view.slint";
 import { SftpEntry, SftpTreeNode } from "sftp_panel.slint";
 import { ComboBox, SpinBox, LineEdit, Button, ScrollView, CheckBox, Palette } from "std-widgets.slint";
 
-export { SessionInfo, SessionDraft, TabInfo, SftpEntry, SftpTreeNode, QuickCmd, CommandHistoryEntry, PortFwd }
+export { SessionInfo, SessionDraft, TabInfo, SftpEntry, SftpTreeNode, QuickCmd, PortFwd }
 
 // --- ThinScrollBar ---------------------------------------------------------
 // Flat 6px scrollbar for the settings dialog. Slint's stock ScrollView bar is
@@ -369,12 +369,13 @@ export component AppWindow inherits Window {
     in-out property <bool> sidebar-collapsed: false; // left panel hidden
     in-out property <bool> about-open: false;     // centered About dialog
     in property <string> download-dir;      // preset SFTP download folder ("" = ask)
-    // Command bar (#55): quick commands + history, fed from Rust.
+    // Command bar (#55): quick commands are per-account, fed from Rust.
     in property <[QuickCmd]> quick-commands;
-    in property <[CommandHistoryEntry]> command-history;          // oldest first (newest last, #113)
+    // Display name of the session the current quick-command list belongs to
+    // (empty on the welcome page / info tabs).
+    in property <string> quick-cmd-scope;
     callback run-command(string /* tab-id */, string /* cmd */, bool /* to-all */);
-    callback copy-text(string);                 // copy a history command (#96)
-    callback delete-history(int /* index */);   // remove a history entry (#96)
+    callback copy-text(string);                 // copy text to the clipboard (info tab)
     in-out property <bool> quick-cmd-manage-open: false;  // manage dialog
     property <string> qcm-name;                       // manage form: name field
     property <string> qcm-command;                    // manage form: command field
@@ -665,7 +666,9 @@ export component AppWindow inherits Window {
     // Asks Rust to recompute the sidebar (status + resources) for whatever tab
     // is now active.  Fired on every active-tab change, UI- or code-driven.
     callback refresh-sidebar();
-    changed active-tab-id => { root.refresh-sidebar(); }
+    // Re-push the active session's quick commands (per-account lists, #55).
+    callback refresh-quick-commands();
+    changed active-tab-id => { root.refresh-sidebar(); root.refresh-quick-commands(); }
 
     Timer {
         interval: root.session-flash-ms * 1ms;
@@ -1053,10 +1056,7 @@ export component AppWindow inherits Window {
                             sftp-sudo-active: term.sftp-sudo-active;
                             sftp-sudo-available: term.sftp-sudo-available;
                             quick-commands: root.quick-commands;
-                            command-history: root.command-history;
                             run-command(cmd, all) => { root.run-command(term.id, cmd, all); }
-                            copy-text(t) => { root.copy-text(t); }
-                            delete-history(i) => { root.delete-history(i); }
                             manage-quick-commands() => {
                                 root.qcm-name = "";
                                 root.qcm-command = "";
@@ -2298,32 +2298,54 @@ export component AppWindow inherits Window {
         width: parent.width;
         height: parent.height;
         background: #00000080;
-        TouchArea { clicked => { root.quick-cmd-manage-open = false; } }
+        TouchArea {
+            clicked => { root.quick-cmd-manage-open = false; }
+            // Keep the wheel from scrolling the terminal / session list behind
+            // the dialog (same fix as the settings panel).
+            scroll-event(ev) => { accept }
+        }
 
         Rectangle {
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
-            width: 460px;
-            height: 420px;
+            width: 500px;
+            height: 550px;
             background: Theme.bg-panel;
             border-radius: Theme.radius-md;
             border-width: 1px;
             border-color: Theme.border-strong;
             drop-shadow-blur: 24px;
             drop-shadow-color: #000000a0;
-            TouchArea {}   // swallow inside clicks
+            TouchArea {
+                // swallow inside clicks and the wheel
+                scroll-event(ev) => { accept }
+            }
 
             VerticalLayout {
                 padding: 18px;
                 spacing: 10px;
                 HorizontalLayout {
-                    Text {
-                        text: @tr("Quick commands");
-                        color: Theme.text-primary;
-                        font-size: Theme.fs-lg;
-                        font-weight: 700;
+                    // Title + the session this list belongs to (lists are
+                    // per-account now, so say which account is being edited).
+                    VerticalLayout {
                         horizontal-stretch: 1;
-                        vertical-alignment: center;
+                        alignment: center;
+                        spacing: 2px;
+                        Text {
+                            text: @tr("Quick commands");
+                            color: Theme.text-primary;
+                            font-size: Theme.fs-lg;
+                            font-weight: 700;
+                            font-family: Theme.ui-font-family;
+                        }
+                        Text {
+                            visible: root.quick-cmd-scope != "";
+                            text: root.quick-cmd-scope;
+                            color: Theme.text-muted;
+                            font-size: Theme.fs-xs;
+                            font-family: Theme.ui-font-family;
+                            overflow: elide;
+                        }
                     }
                     Rectangle {
                         width: 22px; height: 22px;
@@ -2373,48 +2395,66 @@ export component AppWindow inherits Window {
 
                 Rectangle { height: 1px; background: Theme.border-subtle; }
 
-                // Existing commands list with delete buttons.
-                Flickable {
+                // Existing commands list with delete buttons. The Flickable only
+                // learns its content height from a layout child, so qcm-list
+                // must stay a VerticalLayout; the thin bar mirrors the settings
+                // dialog and appears only when the list overflows.
+                HorizontalLayout {
                     vertical-stretch: 1;
-                    viewport-width: self.width;
-                    viewport-height: max(self.height, qcm-list.preferred-height);
-                    qcm-list := VerticalLayout {
-                        alignment: start;
-                        spacing: 2px;
-                        if root.quick-commands.length == 0 : Text {
-                            text: @tr("No quick commands yet");
-                            color: Theme.text-muted; font-size: Theme.fs-xs;
-                        }
-                        for q[i] in root.quick-commands : Rectangle {
-                            height: 38px;
-                            border-radius: Theme.radius-sm;
-                            background: Theme.bg-root;
-                            HorizontalLayout {
-                                padding-left: 8px; padding-right: 6px; spacing: 6px;
-                                VerticalLayout {
-                                    horizontal-stretch: 1;
-                                    alignment: center;
-                                    Text { text: q.name; color: Theme.text-primary; font-size: Theme.fs-sm;
-                                           overflow: elide; }
-                                    Text { text: q.command; color: Theme.text-muted; font-size: Theme.fs-xs;
-                                           overflow: elide; font-family: Theme.ui-font-family; }
-                                }
-                                Rectangle {
-                                    width: 28px;
-                                    y: (parent.height - self.height) / 2;
-                                    height: 28px;
-                                    border-radius: Theme.radius-sm;
-                                    background: del-ta.has-hover ? Theme.danger.with-alpha(0.18) : transparent;
-                                    del-ta := TouchArea {
-                                        mouse-cursor: pointer;
-                                        clicked => { root.delete-quick-command(i); }
+                    spacing: 6px;
+
+                    qcm-flick := Flickable {
+                        horizontal-stretch: 1;
+                        vertical-stretch: 1;
+                        viewport-width: self.width;
+                        viewport-height: max(self.height, qcm-list.preferred-height);
+                        qcm-list := VerticalLayout {
+                            alignment: start;
+                            spacing: 2px;
+                            if root.quick-commands.length == 0 : Text {
+                                text: @tr("No quick commands yet");
+                                color: Theme.text-muted; font-size: Theme.fs-xs;
+                            }
+                            for q[i] in root.quick-commands : Rectangle {
+                                height: 38px;
+                                border-radius: Theme.radius-sm;
+                                background: Theme.bg-root;
+                                HorizontalLayout {
+                                    padding-left: 8px; padding-right: 6px; spacing: 6px;
+                                    VerticalLayout {
+                                        horizontal-stretch: 1;
+                                        alignment: center;
+                                        Text { text: q.name; color: Theme.text-primary; font-size: Theme.fs-sm;
+                                               overflow: elide; }
+                                        Text { text: q.command; color: Theme.text-muted; font-size: Theme.fs-xs;
+                                               overflow: elide; font-family: Theme.ui-font-family; }
                                     }
-                                    Text { text: "\u{E872}"; font-family: "Material Icons";
-                                           color: Theme.danger; font-size: Theme.fs-md;
-                                           horizontal-alignment: center; vertical-alignment: center; }
+                                    Rectangle {
+                                        width: 28px;
+                                        y: (parent.height - self.height) / 2;
+                                        height: 28px;
+                                        border-radius: Theme.radius-sm;
+                                        background: del-ta.has-hover ? Theme.danger.with-alpha(0.18) : transparent;
+                                        del-ta := TouchArea {
+                                            mouse-cursor: pointer;
+                                            clicked => { root.delete-quick-command(i); }
+                                        }
+                                        Text { text: "\u{E872}"; font-family: "Material Icons";
+                                               color: Theme.danger; font-size: Theme.fs-md;
+                                               horizontal-alignment: center; vertical-alignment: center; }
+                                    }
                                 }
                             }
                         }
+                    }
+
+                    ThinScrollBar {
+                        width: 6px;
+                        vertical-stretch: 1;
+                        content-height: qcm-list.preferred-height;
+                        visible-height: qcm-flick.height;
+                        scroll-y: 0px - qcm-flick.viewport-y;
+                        scroll-to(v) => { qcm-flick.viewport-y = 0px - v; }
                     }
                 }
             }
