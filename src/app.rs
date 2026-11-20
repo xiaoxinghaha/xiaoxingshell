@@ -3916,6 +3916,7 @@ fn quick_cmd_model(store: &ConfigStore, session_id: &str) -> ModelRc<QuickCmd> {
         .map(|q| QuickCmd {
             name: q.name.clone().into(),
             command: q.command.clone().into(),
+            submit: q.submit,
         })
         .collect();
     ModelRc::from(Rc::new(VecModel::from(rows)))
@@ -6230,13 +6231,21 @@ fn wire_key_input(
     {
         let handles_rc = handles.clone();
         window.on_run_command(
-            move |tab_id: SharedString, cmd: SharedString, to_all: bool| {
+            move |tab_id: SharedString, cmd: SharedString, to_all: bool, submit: bool| {
                 let line = cmd.trim_end().to_string();
                 if line.is_empty() {
                     return;
                 }
-                let mut bytes = line.clone().into_bytes();
-                bytes.push(b'\n');
+                let mut bytes = Vec::with_capacity(line.len() + 2);
+                // Type-only commands must not be appended to whatever the user
+                // already typed: clear the current input line first (Ctrl+U).
+                if !submit {
+                    bytes.push(0x15);
+                }
+                bytes.extend_from_slice(line.as_bytes());
+                if submit {
+                    bytes.push(b'\n');
+                }
                 {
                     let h = handles_rc.borrow();
                     if to_all {
@@ -6261,26 +6270,32 @@ fn wire_key_input(
         let store_rc = store.clone();
         let statuses_qc = ctx.tab_statuses.clone();
         let weak = window.as_weak();
-        window.on_add_quick_command(move |name: SharedString, command: SharedString| {
-            let name = name.trim().to_string();
-            let command = command.to_string();
-            if name.is_empty() || command.trim().is_empty() {
-                return;
-            }
-            let Some(w) = weak.upgrade() else { return };
-            // Quick commands belong to the session behind the active tab.
-            let Some(session_id) = session_id_for_active_tab(&w, &statuses_qc) else {
-                return;
-            };
-            {
-                let mut s = store_rc.borrow_mut();
-                let mut v = s.quick_commands_for(&session_id).to_vec();
-                v.push(crate::config::QuickCommand { name, command });
-                s.set_quick_commands_for(&session_id, v);
-                let _ = s.save();
-            }
-            refresh_quick_commands(&w, &store_rc, &statuses_qc);
-        });
+        window.on_add_quick_command(
+            move |name: SharedString, command: SharedString, submit: bool| {
+                let name = name.trim().to_string();
+                let command = command.to_string();
+                if name.is_empty() || command.trim().is_empty() {
+                    return;
+                }
+                let Some(w) = weak.upgrade() else { return };
+                // Quick commands belong to the session behind the active tab.
+                let Some(session_id) = session_id_for_active_tab(&w, &statuses_qc) else {
+                    return;
+                };
+                {
+                    let mut s = store_rc.borrow_mut();
+                    let mut v = s.quick_commands_for(&session_id).to_vec();
+                    v.push(crate::config::QuickCommand {
+                        name,
+                        command,
+                        submit,
+                    });
+                    s.set_quick_commands_for(&session_id, v);
+                    let _ = s.save();
+                }
+                refresh_quick_commands(&w, &store_rc, &statuses_qc);
+            },
+        );
     }
     {
         let store_rc = store.clone();
@@ -6302,6 +6317,69 @@ fn wire_key_input(
                 let _ = s.save();
             }
             refresh_quick_commands(&w, &store_rc, &statuses_qc);
+        });
+    }
+    // Inline edit: replace one entry's name/command/submit flag in place.
+    {
+        let store_rc = store.clone();
+        let statuses_qc = ctx.tab_statuses.clone();
+        let weak = window.as_weak();
+        window.on_update_quick_command(
+            move |index: i32, name: SharedString, command: SharedString, submit: bool| {
+                let name = name.trim().to_string();
+                let command = command.to_string();
+                if name.is_empty() || command.trim().is_empty() {
+                    return;
+                }
+                let Some(w) = weak.upgrade() else { return };
+                let Some(session_id) = session_id_for_active_tab(&w, &statuses_qc) else {
+                    return;
+                };
+                {
+                    let mut s = store_rc.borrow_mut();
+                    let mut v = s.quick_commands_for(&session_id).to_vec();
+                    let i = index as usize;
+                    if i < v.len() {
+                        v[i].name = name;
+                        v[i].command = command;
+                        v[i].submit = submit;
+                        s.set_quick_commands_for(&session_id, v);
+                        let _ = s.save();
+                    }
+                }
+                refresh_quick_commands(&w, &store_rc, &statuses_qc);
+            },
+        );
+    }
+    // Drag-reorder: move the entry at `from` to index `to`.
+    {
+        let store_rc = store.clone();
+        let statuses_qc = ctx.tab_statuses.clone();
+        let weak = window.as_weak();
+        window.on_move_quick_command(move |from: i32, to: i32| {
+            let Some(w) = weak.upgrade() else { return };
+            let Some(session_id) = session_id_for_active_tab(&w, &statuses_qc) else {
+                return;
+            };
+            let mut changed = false;
+            {
+                let mut s = store_rc.borrow_mut();
+                let mut v = s.quick_commands_for(&session_id).to_vec();
+                let f = from.max(0) as usize;
+                if f < v.len() {
+                    let t = (to.max(0) as usize).min(v.len() - 1);
+                    if f != t {
+                        let item = v.remove(f);
+                        v.insert(t, item);
+                        s.set_quick_commands_for(&session_id, v);
+                        let _ = s.save();
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                refresh_quick_commands(&w, &store_rc, &statuses_qc);
+            }
         });
     }
 

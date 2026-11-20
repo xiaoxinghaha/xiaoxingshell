@@ -374,12 +374,26 @@ export component AppWindow inherits Window {
     // Display name of the session the current quick-command list belongs to
     // (empty on the welcome page / info tabs).
     in property <string> quick-cmd-scope;
-    callback run-command(string /* tab-id */, string /* cmd */, bool /* to-all */);
+    callback run-command(string /* tab-id */, string /* cmd */, bool /* to-all */, bool /* submit */);
     callback copy-text(string);                 // copy text to the clipboard (info tab)
     in-out property <bool> quick-cmd-manage-open: false;  // manage dialog
     property <string> qcm-name;                       // manage form: name field
     property <string> qcm-command;                    // manage form: command field
-    callback add-quick-command(string /* name */, string /* command */);
+    in-out property <bool> qcm-add-submit: true;      // add form: press-Enter toggle
+    // Inline edit state (one row at a time; -1 = none).
+    in-out property <int> qcm-editing-index: -1;
+    property <string> qcm-edit-name;
+    property <string> qcm-edit-command;
+    property <bool> qcm-edit-submit: true;
+    // Delete confirmation (index of the row awaiting confirmation).
+    in-out property <int> qcm-delete-index: -1;
+    in-out property <bool> qcm-delete-open: false;
+    // Drag-reorder state: which row is being dragged + press position.
+    property <int> qcm-drag-index: -1;
+    property <length> qcm-drag-press-y: 0px;
+    callback add-quick-command(string /* name */, string /* command */, bool /* submit */);
+    callback update-quick-command(int /* index */, string /* name */, string /* command */, bool /* submit */);
+    callback move-quick-command(int /* from */, int /* to */);
     callback delete-quick-command(int /* index */);
     in property <[EditorRuleItem]> external-editor-rules;
     in-out property <string> default-external-editor;
@@ -1056,7 +1070,7 @@ export component AppWindow inherits Window {
                             sftp-sudo-active: term.sftp-sudo-active;
                             sftp-sudo-available: term.sftp-sudo-available;
                             quick-commands: root.quick-commands;
-                            run-command(cmd, all) => { root.run-command(term.id, cmd, all); }
+                            run-command(cmd, all, submit) => { root.run-command(term.id, cmd, all, submit); }
                             manage-quick-commands() => {
                                 root.qcm-name = "";
                                 root.qcm-command = "";
@@ -2377,7 +2391,7 @@ export component AppWindow inherits Window {
                         placeholder-text: "tail -f /var/log/syslog";
                         accepted => {
                             if (root.qcm-name != "" && root.qcm-command != "") {
-                                root.add-quick-command(root.qcm-name, root.qcm-command);
+                                root.add-quick-command(root.qcm-name, root.qcm-command, root.qcm-add-submit);
                                 root.qcm-name = ""; root.qcm-command = "";
                             }
                         }
@@ -2387,10 +2401,18 @@ export component AppWindow inherits Window {
                         primary: true;
                         enabled: root.qcm-name != "" && root.qcm-command != "";
                         clicked => {
-                            root.add-quick-command(root.qcm-name, root.qcm-command);
+                            root.add-quick-command(root.qcm-name, root.qcm-command, root.qcm-add-submit);
                             root.qcm-name = ""; root.qcm-command = "";
                         }
                     }
+                }
+                // Execute vs. type-only. Unchecked entries are typed into the
+                // terminal (current input line cleared) and wait for the user.
+                CheckBox {
+                    text: root.lang-en
+                        ? "Press Enter after inserting (uncheck = only type it in)"
+                        : "插入后按回车执行（取消勾选 = 只输入到终端，不执行）";
+                    checked <=> root.qcm-add-submit;
                 }
 
                 Rectangle { height: 1px; background: Theme.border-subtle; }
@@ -2411,37 +2433,154 @@ export component AppWindow inherits Window {
                         qcm-list := VerticalLayout {
                             alignment: start;
                             spacing: 2px;
-                            if root.quick-commands.length == 0 : Text {
-                                text: @tr("No quick commands yet");
-                                color: Theme.text-muted; font-size: Theme.fs-xs;
+                            if root.quick-commands.length == 0 : VerticalLayout {
+                                spacing: 2px;
+                                Text {
+                                    text: @tr("No quick commands yet");
+                                    color: Theme.text-muted; font-size: Theme.fs-xs;
+                                }
+                                Text {
+                                    text: @tr("Fill in a name and a command above, then press Add.");
+                                    color: Theme.text-muted; font-size: Theme.fs-xs;
+                                }
                             }
                             for q[i] in root.quick-commands : Rectangle {
-                                height: 38px;
+                                height: root.qcm-editing-index == i ? 84px : 38px;
                                 border-radius: Theme.radius-sm;
                                 background: Theme.bg-root;
-                                HorizontalLayout {
-                                    padding-left: 8px; padding-right: 6px; spacing: 6px;
-                                    VerticalLayout {
-                                        horizontal-stretch: 1;
-                                        alignment: center;
-                                        Text { text: q.name; color: Theme.text-primary; font-size: Theme.fs-sm;
-                                               overflow: elide; }
-                                        Text { text: q.command; color: Theme.text-muted; font-size: Theme.fs-xs;
-                                               overflow: elide; font-family: Theme.ui-font-family; }
+                                opacity: root.qcm-drag-index == i ? 0.55 : 1.0;
+
+                                // ---- read mode ----
+                                if root.qcm-editing-index != i : HorizontalLayout {
+                                    padding-left: 2px; padding-right: 6px; spacing: 4px;
+
+                                    // Drag handle: only this strip starts a
+                                    // reorder, so the row body stays clickable.
+                                    drag-ta := TouchArea {
+                                        width: 18px;
+                                        mouse-cursor: move;
+                                        pointer-event(ev) => {
+                                            if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
+                                                root.qcm-drag-index = i;
+                                                root.qcm-drag-press-y = self.mouse-y;
+                                            } else if (ev.kind == PointerEventKind.up && ev.button == PointerEventButton.left) {
+                                                if (root.qcm-drag-index == i) {
+                                                    let steps = Math.round((self.mouse-y - root.qcm-drag-press-y) / 38px);
+                                                    let target = max(0, min(root.quick-commands.length - 1, i + steps));
+                                                    if (target != i) { root.move-quick-command(i, target); }
+                                                }
+                                                root.qcm-drag-index = -1;
+                                            }
+                                        }
+                                        Text { text: "\u{E945}"; font-family: "Material Icons";
+                                               color: Theme.text-muted; font-size: Theme.fs-md;
+                                               horizontal-alignment: center; vertical-alignment: center; }
                                     }
+
+                                    // Double-click the body to edit inline.
+                                    edit-ta := TouchArea {
+                                        horizontal-stretch: 1;
+                                        double-clicked => {
+                                            root.qcm-editing-index = i;
+                                            root.qcm-edit-name = q.name;
+                                            root.qcm-edit-command = q.command;
+                                            root.qcm-edit-submit = q.submit;
+                                        }
+                                        VerticalLayout {
+                                            alignment: center;
+                                            spacing: 0px;
+                                            Text { text: q.name; color: Theme.text-primary; font-size: Theme.fs-sm;
+                                                   overflow: elide; }
+                                            Text { text: q.command; color: Theme.text-muted; font-size: Theme.fs-xs;
+                                                   overflow: elide; font-family: Theme.ui-font-family; }
+                                        }
+                                    }
+
+                                    // Execute vs. type-only badge.
+                                    Text {
+                                        text: q.submit ? @tr("Run") : @tr("Type");
+                                        color: q.submit ? Theme.accent : Theme.text-muted;
+                                        font-size: Theme.fs-xs;
+                                        vertical-alignment: center;
+                                    }
+
+                                    // Copy the command without running it.
                                     Rectangle {
-                                        width: 28px;
+                                        width: 24px; height: 24px;
                                         y: (parent.height - self.height) / 2;
-                                        height: 28px;
+                                        border-radius: Theme.radius-sm;
+                                        background: copy-ta.has-hover ? Theme.bg-hover : transparent;
+                                        copy-ta := TouchArea {
+                                            mouse-cursor: pointer;
+                                            clicked => { root.copy-text(q.command); }
+                                        }
+                                        Text { text: "\u{E14D}"; font-family: "Material Icons";
+                                               color: Theme.text-secondary; font-size: Theme.fs-sm;
+                                               horizontal-alignment: center; vertical-alignment: center; }
+                                    }
+
+                                    // Delete → confirmation dialog.
+                                    Rectangle {
+                                        width: 24px; height: 24px;
+                                        y: (parent.height - self.height) / 2;
                                         border-radius: Theme.radius-sm;
                                         background: del-ta.has-hover ? Theme.danger.with-alpha(0.18) : transparent;
                                         del-ta := TouchArea {
                                             mouse-cursor: pointer;
-                                            clicked => { root.delete-quick-command(i); }
+                                            clicked => {
+                                                root.qcm-delete-index = i;
+                                                root.qcm-delete-open = true;
+                                            }
                                         }
                                         Text { text: "\u{E872}"; font-family: "Material Icons";
                                                color: Theme.danger; font-size: Theme.fs-md;
                                                horizontal-alignment: center; vertical-alignment: center; }
+                                    }
+                                }
+
+                                // ---- inline edit mode ----
+                                if root.qcm-editing-index == i : VerticalLayout {
+                                    padding: 6px;
+                                    spacing: 4px;
+                                    HorizontalLayout {
+                                        spacing: 6px;
+                                        LineEdit {
+                                            horizontal-stretch: 1;
+                                            text <=> root.qcm-edit-name;
+                                            font-family: Theme.ui-font-family;
+                                            placeholder-text: @tr("Name");
+                                            // Focus the name as soon as the row
+                                            // switches to edit mode.
+                                            init => { self.focus(); }
+                                        }
+                                        CheckBox {
+                                            text: @tr("Enter");
+                                            checked <=> root.qcm-edit-submit;
+                                        }
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 6px;
+                                        LineEdit {
+                                            horizontal-stretch: 1;
+                                            text <=> root.qcm-edit-command;
+                                            font-family: Theme.ui-font-family;
+                                            accepted => {
+                                                root.update-quick-command(i, root.qcm-edit-name, root.qcm-edit-command, root.qcm-edit-submit);
+                                                root.qcm-editing-index = -1;
+                                            }
+                                        }
+                                        Button {
+                                            text: root.lang-en ? "Save" : "保存";
+                                            primary: true;
+                                            clicked => {
+                                                root.update-quick-command(i, root.qcm-edit-name, root.qcm-edit-command, root.qcm-edit-submit);
+                                                root.qcm-editing-index = -1;
+                                            }
+                                        }
+                                        GhostButton {
+                                            text: root.lang-en ? "Cancel" : "取消";
+                                            clicked => { root.qcm-editing-index = -1; }
+                                        }
                                     }
                                 }
                             }
@@ -2458,6 +2597,30 @@ export component AppWindow inherits Window {
                     }
                 }
             }
+        }
+    }
+
+    // Quick-command delete confirmation. Declared after the manage dialog so it
+    // stays on top of it.
+    ConfirmDialog {
+        is-open: root.qcm-delete-open;
+        title: root.lang-en ? "Delete quick command?" : "删除快捷命令？";
+        message: root.lang-en
+            ? "This only removes the saved snippet; nothing is sent to the server."
+            : "仅删除这条保存的快捷命令，不会对服务器执行任何操作。";
+        detail: (root.qcm-delete-index >= 0 && root.qcm-delete-index < root.quick-commands.length)
+            ? root.quick-commands[root.qcm-delete-index].name + "  ·  " + root.quick-commands[root.qcm-delete-index].command
+            : "";
+        confirm-label: root.lang-en ? "Delete" : "删除";
+        confirm => {
+            root.delete-quick-command(root.qcm-delete-index);
+            if (root.qcm-editing-index == root.qcm-delete-index) { root.qcm-editing-index = -1; }
+            root.qcm-delete-open = false;
+            root.qcm-delete-index = -1;
+        }
+        cancel => {
+            root.qcm-delete-open = false;
+            root.qcm-delete-index = -1;
         }
     }
 

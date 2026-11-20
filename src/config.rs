@@ -288,10 +288,30 @@ impl Session {
 
 /// A saved quick command (#55): a named snippet the user clicks to send to the
 /// active terminal.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuickCommand {
     pub name: String,
     pub command: String,
+    /// Append a newline and execute immediately. `false` types the command into
+    /// the terminal without pressing Enter (the current input line is cleared
+    /// first). Old config files have no field → defaults to `true`, keeping the
+    /// previous behaviour.
+    #[serde(default = "default_quick_submit")]
+    pub submit: bool,
+}
+
+fn default_quick_submit() -> bool {
+    true
+}
+
+impl Default for QuickCommand {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            command: String::new(),
+            submit: true,
+        }
+    }
 }
 
 /// One suffix -> editor executable rule for "Edit externally".
@@ -1499,6 +1519,16 @@ mod tests {
         assert_eq!(store.ui_scale_percent(), 150);
         store.set_ui_scale_percent(9_999);
         assert_eq!(store.ui_scale_percent(), 400);
+    }
+
+    #[test]
+    fn quick_command_submit_defaults_to_true() {
+        // Configs written before the flag existed must keep executing on click.
+        let old: QuickCommand = serde_json::from_str(r#"{"name":"a","command":"b"}"#).unwrap();
+        assert!(old.submit);
+        let typed: QuickCommand =
+            serde_json::from_str(r#"{"name":"a","command":"b","submit":false}"#).unwrap();
+        assert!(!typed.submit);
     }
 
     #[test]

@@ -2,6 +2,29 @@
 
 ## 2026-11-20
 
+### 快捷命令增强：内联编辑 / 删除确认 / 拖拽排序 / 是否回车执行
+
+#### 背景/改动
+- 管理弹窗只能"添加 + 删除"，改一条要删了重建；删除没有确认；顺序无法调整；也无法只把命令填进终端而不执行。
+- 数据：`QuickCommand` 新增 `submit`（`#[serde(default = "default_quick_submit")]`，旧配置默认 `true`，行为不变）。
+- 执行链路：`run-command` 增加 `submit` 参数。`submit = false` 时先发 `Ctrl+U`（`0x15`）清空当前输入行，再发送命令文本、**不追加换行**，由用户自己按回车。
+- 快捷命令固定只发当前会话：不再受命令栏「发送到所有」影响；弹窗底部注明「Current session only」。
+- 管理弹窗：
+  - 添加表单增加「插入后按回车执行（取消勾选 = 只输入到终端，不执行）」勾选；
+  - 列表行显示 `Run` / `Type` 徽标、复制按钮（复制命令文本，不执行）；
+  - 左侧拖拽手柄（`drag_indicator`）排序，拖动行半透明，按 `round(dy / 38px)` 计算目标位置；
+  - 双击行内联编辑：名称 + 命令 + 回车勾选 + 保存/取消，进入编辑时自动聚焦名称框；
+  - 删除改为 `ConfirmDialog` 确认（显示命令名与内容，不做"不再提示"）；
+  - 空状态补一句「在上方填写名称和命令后点添加」。
+- 新增 Rust 回调 `update_quick_command` / `move_quick_command`，改完即持久化到当前会话并刷新模型。
+
+#### 验证
+- `cargo check` 通过；全量 **130** 个单测通过（新增 `quick_command_submit_defaults_to_true`，覆盖旧配置默认 true 与显式 false）。
+- 未做真机验证：需确认双击编辑的聚焦、拖拽排序手感、删除确认、以及「仅输入」是否正确清行且不执行。
+
+#### 涉及文件
+- `src/config.rs`、`src/app.rs`、`ui/app.slint`、`ui/terminal_view.slint`、`ChangeLog.md`
+
 ### 快捷命令弹出面板：宽 450px、最高 350px
 
 #### 背景/改动

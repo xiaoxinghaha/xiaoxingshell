@@ -36,6 +36,7 @@ export struct TermMatch {
 export struct QuickCmd {
     name: string,
     command: string,
+    submit: bool,     // true = press Enter (execute); false = only type it in
 }
 
 // --- MenuItem --------------------------------------------------------------
@@ -211,7 +212,7 @@ export component TerminalView inherits Rectangle {
     in property <[QuickCmd]> quick-commands;
     property <bool> send-to-all: false;
     property <bool> quick-open: false;         // quick-command popup visibility
-    callback run-command(string /* cmd */, bool /* to-all */);
+    callback run-command(string /* cmd */, bool /* to-all */, bool /* submit */);
     callback manage-quick-commands();          // open the add/edit/delete dialog
 
     callback send-key(string, bool, bool, bool);
@@ -924,7 +925,7 @@ export component TerminalView inherits Rectangle {
                         single-line: true;
                         // Enter sends.
                         accepted => {
-                            root.run-command(self.text, root.send-to-all);
+                            root.run-command(self.text, root.send-to-all, true);
                             self.text = "";
                         }
                     }
@@ -964,7 +965,7 @@ export component TerminalView inherits Rectangle {
                     send-ta := TouchArea {
                         mouse-cursor: pointer;
                         clicked => {
-                            root.run-command(cmd-input.text, root.send-to-all);
+                            root.run-command(cmd-input.text, root.send-to-all, true);
                             cmd-input.text = "";
                         }
                     }
@@ -1015,7 +1016,10 @@ export component TerminalView inherits Rectangle {
                             q-item-ta := TouchArea {
                                 mouse-cursor: pointer;
                                 clicked => {
-                                    root.run-command(q.command, root.send-to-all);
+                                    // Quick commands always target the current
+                                    // session only, and honour their own
+                                    // submit flag (Enter vs. type-only).
+                                    root.run-command(q.command, false, q.submit);
                                     root.quick-open = false;
                                 }
                             }
@@ -1026,6 +1030,14 @@ export component TerminalView inherits Rectangle {
                                 Text { text: q.command; color: Theme.text-muted; font-size: Theme.fs-xs;
                                        overflow: elide; font-family: Theme.ui-font-family; }
                             }
+                        }
+                        // Target hint: quick commands never broadcast, even when
+                        // "send to all" is on.
+                        Text {
+                            text: @tr("Current session only");
+                            color: Theme.text-muted; font-size: Theme.fs-xs;
+                            height: 18px; vertical-alignment: center;
+                            horizontal-alignment: center;
                         }
                         // Manage entry.
                         Rectangle {
