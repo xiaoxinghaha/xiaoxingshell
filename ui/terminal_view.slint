@@ -980,8 +980,10 @@ export component TerminalView inherits Rectangle {
             // --- Quick-command popup (opens upward) --------------------------
             if root.quick-open : Rectangle {
                 x: 8px;
-                width: 300px;
-                height: min(260px, qc-col.preferred-height + 8px);
+                // 450px as requested, but never wider than the terminal.
+                width: min(450px, parent.width - 16px);
+                // Grow with the content, cap at 350px and scroll inside.
+                height: min(350px, qc-col.preferred-height + 8px);
                 y: -self.height - 2px;
                 background: Theme.bg-panel;
                 border-radius: Theme.radius-md;
@@ -989,7 +991,11 @@ export component TerminalView inherits Rectangle {
                 border-color: Theme.border-strong;
                 drop-shadow-blur: 16px;
                 drop-shadow-color: #00000070;
-                TouchArea {}  // swallow clicks
+                TouchArea {
+                    // swallow clicks; the wheel too, so the terminal behind the
+                    // popup doesn't scroll while browsing the list
+                    scroll-event(ev) => { accept }
+                }
                 Flickable {
                     viewport-width: self.width;
                     viewport-height: max(self.height, qc-col.preferred-height);
@@ -1036,8 +1042,6 @@ export component TerminalView inherits Rectangle {
                     }
                 }
             }
-
-            // --- History popup (opens upward) -------------------------------
         }
 
         // --- Drag handle ----------------------------------------------------
