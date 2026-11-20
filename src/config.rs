@@ -376,12 +376,13 @@ pub struct ConfigFile {
     /// more intermediate frames); higher = more output kept (more memory).
     #[serde(default)]
     pub terminal_max_ingest_kib: u32,
-    /// Forced UI scale in percent. 0 = follow the OS DPI scaling (default),
-    /// 100 = always render at the design size, ignoring Windows 125%/150%
-    /// zoom. Applied once at startup through `SLINT_SCALE_FACTOR`, so a change
-    /// only takes effect after a restart.
-    #[serde(default)]
-    pub ui_scale_percent: u32,
+    /// Forced UI scale in percent. `None` = never configured, which behaves like
+    /// 100 (render at the design size instead of following the OS DPI);
+    /// `Some(0)` explicitly means "follow the system scaling"; `Some(n)` pins n%.
+    /// A plain `0` cannot express both "never set" and "follow the system", so
+    /// this one is an Option while the rest of the cache uses 0-as-default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_scale_percent: Option<u32>,
     /// Duration for the short session-row flash after create/edit/connect. 0 =
     /// built-in default.
     #[serde(default)]
@@ -899,13 +900,18 @@ impl ConfigStore {
         self.cache.terminal_max_ingest_kib = kib.clamp(8, 256);
     }
 
-    /// Forced UI scale in percent (0 = follow the OS DPI, up to 400 = 4x).
+    /// Forced UI scale in percent. Never configured (None) behaves like 100:
+    /// the UI renders at its design size instead of following the OS DPI.
+    /// An explicit `0` still means "follow the system scaling".
     pub fn ui_scale_percent(&self) -> u32 {
-        self.cache.ui_scale_percent.min(400)
+        match self.cache.ui_scale_percent {
+            None => 100,
+            Some(percent) => percent.min(400),
+        }
     }
 
     pub fn set_ui_scale_percent(&mut self, percent: u32) {
-        self.cache.ui_scale_percent = percent.min(400);
+        self.cache.ui_scale_percent = Some(percent.min(400));
     }
 
     /// Session row flash duration in milliseconds (default 1000).
@@ -1503,7 +1509,10 @@ mod tests {
     #[test]
     fn ui_scale_percent_defaults_and_clamps() {
         let mut store = temp_store();
-        // 0 = follow the OS DPI scaling, the historical behaviour.
+        // Never configured → render at 100% (design size), not the OS DPI.
+        assert_eq!(store.ui_scale_percent(), 100);
+        // An explicit 0 still means "follow the system scaling".
+        store.set_ui_scale_percent(0);
         assert_eq!(store.ui_scale_percent(), 0);
         store.set_ui_scale_percent(150);
         assert_eq!(store.ui_scale_percent(), 150);

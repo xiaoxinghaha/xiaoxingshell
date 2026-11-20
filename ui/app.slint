@@ -417,7 +417,7 @@ export component AppWindow inherits Window {
     // app (see set-notepad-file / pick-notepad-file in the editor settings).
     callback open-notepad();
     out property <length> ifd-width: 700px;
-    out property <length> ifd-height: 600px;
+    out property <length> ifd-height: 500px;
     // Interface dialog position (draggable by its title bar); init centered.
     property <length> ifd-x: (root.width - root.ifd-width) / 2;
     property <length> ifd-y: (root.height - root.ifd-height) / 2;
@@ -439,8 +439,9 @@ export component AppWindow inherits Window {
     in-out property <int> terminal-max-ingest-kib: 32;
     callback set-terminal-max-ingest-kib(int);     // apply + persist per-tick ingest cap
     // Forced UI scale in percent: 0 = follow the OS DPI scaling, 100 = render at
-    // the design size even on a 125%/150% desktop. Applied at startup only.
-    in-out property <int> ui-scale-percent: 0;
+    // the design size even on a 125%/150% desktop (the default). Applied at
+    // startup only.
+    in-out property <int> ui-scale-percent: 100;
     callback set-ui-scale-percent(int);            // persist; needs a restart
     in-out property <int> session-flash-ms: 1000;
     callback set-session-flash-ms(int);             // apply + persist session-row flash duration
@@ -2963,7 +2964,12 @@ export component AppWindow inherits Window {
                             height: parent.height;
                             viewport-width: self.width;
 
-                            Rectangle {
+                            // A ScrollView derives its viewport height from a
+                            // LAYOUT child. A bare Rectangle has no preferred
+                            // height, so the viewport stayed equal to the
+                            // visible height: content got clipped, nothing
+                            // scrolled, and the bar hid itself (max-scroll 0).
+                            settings-body := VerticalLayout {
                                 width: settings-scroll.visible-width - 16px;
 
                                 if root.ifd-page == "font" : VerticalLayout {

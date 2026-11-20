@@ -2,6 +2,27 @@
 
 ## 2026-11-20
 
+### 设置面板滚动条仍不出现（第三次修复：内容容器必须是布局）+ 弹窗高度 500 + 缩放默认 100%
+
+#### 背景/现象/根因
+- 上一版给 `ScrollView` 设了固定高度，但内容仍是一个裸 `Rectangle`。`ScrollView` 的 `viewport-height` 是从**布局子元素**的 preferred-height 推导的；`Rectangle` 没有内容高度概念，viewport 高度退化成可见高度 → `max-scroll == 0` → 滚动条按设计隐藏，内容只是被 `clip` 掉。这正是「设了高度、也写了滚动条，但两者都没生效」的原因。
+- 需求变更：弹窗高度由 600px 改为 500px；界面缩放默认改为 100%。
+
+#### 改动/新增
+- `ui/app.slint`：设置内容容器由 `Rectangle` 改为 `VerticalLayout`（只有布局元素才会把内容高度传给 ScrollView 的 viewport）；整条链路 `viewport-height → ThinScrollBar.max-scroll → visible` 才真正成立。
+- `ui/app.slint`：`ifd-height` 600px → 500px。
+- `src/config.rs`：`ui_scale_percent` 改为 `Option<u32>` —— `None`（从未配置）按 100 处理，`Some(0)` 才是「跟随系统」。用 `Option` 是因为 0 需要同时表达「未设置」和「跟随系统」两件事。
+- `ui/app.slint`：`ui-scale-percent` 属性默认值 0 → 100。
+
+#### 修复/效果
+- 字体页内容超出 500px 弹窗时，右侧出现 6px 细滚动条并可滚动到底部说明文字；其它选项卡同理。
+- 新装/旧配置升级后界面按 100% 渲染（不再跟随系统放大）；想要回跟随系统可在设置里选 0。
+- 全量 **130** 个单测通过（新增断言：默认 100、显式 0 保留 0）。
+- 未做真机验证：需打开设置确认滚动条出现且能拖动到底。
+
+#### 涉及文件
+- `ui/app.slint`、`src/config.rs`、`ChangeLog.md`
+
 ### 设置对话框：内容区改为内部滚动 + 自绘细滚动条，滚轮不再穿透到主页
 
 #### 背景/现象/根因
