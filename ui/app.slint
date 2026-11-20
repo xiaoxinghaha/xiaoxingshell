@@ -27,6 +27,80 @@ import { ComboBox, SpinBox, LineEdit, Button, ScrollView, CheckBox, Palette } fr
 
 export { SessionInfo, SessionDraft, TabInfo, SftpEntry, SftpTreeNode, QuickCmd, CommandHistoryEntry, PortFwd }
 
+// --- ThinScrollBar ---------------------------------------------------------
+// Flat 6px scrollbar for the settings dialog. Slint's stock ScrollView bar is
+// 2px, grows to 6px on hover and draws paging buttons — visually noisy next to
+// this dialog's flat panels. This one is a quiet capsule that only appears when
+// the content actually overflows, and it swallows wheel events so they can't
+// reach the page behind the modal.
+component ThinScrollBar inherits Rectangle {
+    in property <length> content-height: 0px;
+    in property <length> visible-height: 0px;
+    in property <length> scroll-y: 0px;      // 0 = top of the content
+    callback scroll-to(length);
+
+    property <length> max-scroll: max(0px, self.content-height - self.visible-height);
+    property <float> ratio: self.content-height > 1px
+        ? 1.0 * self.visible-height / (1.0 * self.content-height)
+        : 1.0;
+    property <length> thumb-h: max(30px, self.height * min(1.0, self.ratio));
+    property <float> pos: self.max-scroll > 1px
+        ? 1.0 * self.scroll-y / (1.0 * self.max-scroll)
+        : 0.0;
+    property <length> thumb-y: self.pos * (self.height - self.thumb-h);
+    property <bool> dragging: false;
+    property <length> grab-offset: 0px;
+
+    width: 6px;
+    background: transparent;
+    visible: self.max-scroll > 1px;
+
+    track := Rectangle {
+        width: parent.width;
+        height: parent.height;
+        border-radius: 3px;
+        background: transparent;
+
+        ta := TouchArea {
+            pointer-event(ev) => {
+                if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
+                    if (self.mouse-y >= root.thumb-y && self.mouse-y <= root.thumb-y + root.thumb-h) {
+                        root.dragging = true;
+                        root.grab-offset = self.mouse-y - root.thumb-y;
+                    } else if (self.mouse-y < root.thumb-y) {
+                        root.scroll-to(max(0px, root.scroll-y - root.visible-height));
+                    } else {
+                        root.scroll-to(min(root.max-scroll, root.scroll-y + root.visible-height));
+                    }
+                } else if (ev.kind == PointerEventKind.up && ev.button == PointerEventButton.left) {
+                    root.dragging = false;
+                }
+            }
+            moved => {
+                if (root.dragging) {
+                    let trackInner = max(1px, self.height - root.thumb-h);
+                    let thumbTop = clamp(self.mouse-y - root.grab-offset, 0px, trackInner);
+                    root.scroll-to(thumbTop / trackInner * root.max-scroll);
+                }
+            }
+            scroll-event(ev) => {
+                // Wheel over the bar scrolls the content (and is consumed, so it
+                // can never leak to the page behind the dialog).
+                root.scroll-to(clamp(root.scroll-y - ev.delta-y, 0px, root.max-scroll));
+                accept
+            }
+        }
+
+        thumb := Rectangle {
+            y: root.thumb-y;
+            width: parent.width;
+            height: root.thumb-h;
+            border-radius: 3px;
+            background: ta.has-hover || root.dragging ? Theme.text-muted : Theme.border-strong;
+        }
+    }
+}
+
 // --- TerminalState ---------------------------------------------------------
 // Per-terminal view-model exposed to Rust. A TabInfo has the metadata; the
 // TerminalState carries the streaming log + status line. Kept as a parallel
@@ -2636,7 +2710,11 @@ export component AppWindow inherits Window {
         background: #00000080;            // dim backdrop
         // Modal: clicking the dim backdrop does nothing (only the title-bar ✕
         // closes it). The card is draggable by its title bar (root.ifd-*).
-        TouchArea {}
+        TouchArea {
+            // Swallow wheel events: without this the session list / terminal
+            // behind the dialog keeps scrolling while the user scrolls here.
+            scroll-event(ev) => { accept }
+        }
 
         Rectangle {
             x: root.ifd-x;
@@ -2650,7 +2728,11 @@ export component AppWindow inherits Window {
             drop-shadow-blur: 24px;
             drop-shadow-color: #000000a0;
             clip: true;
-            TouchArea {}   // swallow inside clicks
+            TouchArea {
+                // swallow inside clicks; the wheel too, so it can't leak to the
+                // page behind the dialog when the content fits without scrolling
+                scroll-event(ev) => { accept }
+            }
 
             VerticalLayout {
                 // Title bar — drag to move the dialog; the ✕ button stays on top.
@@ -2867,13 +2949,22 @@ export component AppWindow inherits Window {
                     Rectangle {
                         horizontal-stretch: 73;
                         background: Theme.bg-panel;
+                        // Explicit height: this Rectangle is not a layout, so the
+                        // ScrollView's `vertical-stretch` did nothing and the
+                        // content pushed the view past the card (which then
+                        // clipped it). A fixed height turns that into internal
+                        // scrolling.
+                        // The width also reserves 16px on the right for our own
+                        // scrollbar; the stock one is covered by the overlay in
+                        // the next element (Slint has no "always off" policy).
                         settings-scroll := ScrollView {
-                            horizontal-stretch: 1;
-                            vertical-stretch: 1;
+                            x: 0;
+                            width: parent.width;
+                            height: parent.height;
                             viewport-width: self.width;
 
                             Rectangle {
-                                width: settings-scroll.visible-width;
+                                width: settings-scroll.visible-width - 16px;
 
                                 if root.ifd-page == "font" : VerticalLayout {
                                     width: parent.width;
@@ -3760,6 +3851,37 @@ export component AppWindow inherits Window {
                                         wrap: word-wrap;
                                     }
                                 }
+                            }
+                        }
+
+                        // Covers the stock ScrollView bar (2px, hover-grows,
+                        // paging buttons) and hosts our own thin one. Slint has
+                        // no "always off" policy, so covering it is the only way
+                        // to keep the scroll logic without the stock visuals.
+                        Rectangle {
+                            x: parent.width - 16px;
+                            y: 0;
+                            width: 16px;
+                            height: parent.height;
+                            background: Theme.bg-panel;
+
+                            // Swallow clicks so they can't reach the covered
+                            // stock bar (its paging buttons sit right here). The
+                            // wheel is left alone so it still scrolls the view.
+                            TouchArea {}
+
+                            // `viewport-y` is negative while scrolled down, so
+                            // the exposed position is `-viewport-y` and dragging
+                            // maps back the same way.
+                            ThinScrollBar {
+                                x: parent.width - 9px;
+                                y: 4px;
+                                width: 6px;
+                                height: parent.height - 8px;
+                                content-height: settings-scroll.viewport-height;
+                                visible-height: settings-scroll.height;
+                                scroll-y: 0px - settings-scroll.viewport-y;
+                                scroll-to(v) => { settings-scroll.viewport-y = 0px - v; }
                             }
                         }
                     }
