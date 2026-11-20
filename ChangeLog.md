@@ -2,6 +2,27 @@
 
 ## 2026-11-20
 
+### 修复打包后 exe 丢失图标 + 设置面板文字发虚
+
+#### 背景/现象/根因
+- 打包日志里一直有 `failed to embed Windows icon: 系统找不到指定的路径 (os error 3)`，产物没有图标。
+  - 根因：`winresource` 默认通过注册表（`HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots`，实际是拉起 `reg.exe`）定位 Windows SDK 的 `rc.exe`。当前构建环境的程序黑名单禁止 `reg.exe`，查询失败 → `rc.exe` 找不到 → 图标被**静默跳过**。SDK 本身是装好的（`10.0.22621.0\x64\rc.exe` 存在）。
+- 设置面板文字比主页面明显发虚/有毛边。
+  - 根因：面板内 69 个 `Text` 中约 50 个没有指定 `font-family`，走 Slint 平台的默认字体；12px 中文在默认字体下会 fallback 到非 UI 优化的字体，灰度抗锯齿边缘发灰。主页面中文少、字号大，对比之下更明显。
+
+#### 改动/新增
+- `build.rs`：新增 `windows_sdk_bin_dir()`，扫描 `C:\Program Files (x86)\Windows Kits\10\bin\<version>\x64\rc.exe` 取最高版本，用 `set_toolkit_path()` 直接指定，绕过注册表查询；未找到 SDK 时保持原行为（仅告警，不中断构建）。
+- `ui/app.slint`：设置对话框内补齐 59 处 `font-family: Theme.ui-font-family`（Rust 侧已设为 `Microsoft YaHei`）；`Material Icons` 图标的 `Text` 保持不动。
+
+#### 修复/效果
+- `cargo check` 不再出现 icon 警告，产物恢复图标与版本资源。
+- 设置面板文字改用与 UI 主题一致的字体族，避免小字号中文 fallback。
+- 全量 **130** 个单测通过。
+- 未做真机验证：需确认任务栏/资源管理器图标已恢复，并对比设置面板与主页面的字形是否一致。
+
+#### 涉及文件
+- `build.rs`、`ui/app.slint`、`ChangeLog.md`
+
 ### 设置面板滚动条仍不出现（第三次修复：内容容器必须是布局）+ 弹窗高度 500 + 缩放默认 100%
 
 #### 背景/现象/根因

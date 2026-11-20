@@ -27,8 +27,39 @@ fn main() {
         res.set("OriginalFilename", "xiaoxingshell.exe");
         res.set("CompanyName", "xiaoxing");
         res.set("LegalCopyright", "Copyright © 2026 xiaoxing");
+        // winresource looks the Windows SDK up in the registry (spawning
+        // reg.exe). Sandboxed / locked-down build environments block that, the
+        // lookup fails, and the icon is silently dropped with
+        // "系统找不到指定的路径 (os error 3)" — the exe then ships without an
+        // icon. Point it straight at the newest installed SDK bin dir.
+        if let Some(bin) = windows_sdk_bin_dir() {
+            res.set_toolkit_path(&bin);
+        }
         if let Err(e) = res.compile() {
             println!("cargo:warning=failed to embed Windows icon: {e}");
         }
     }
+}
+
+/// Newest `…\Windows Kits\10\bin\<version>\x64` directory that contains `rc.exe`,
+/// or `None` when the SDK is not installed (the icon is then skipped).
+#[cfg(windows)]
+fn windows_sdk_bin_dir() -> Option<String> {
+    let root = std::path::Path::new(r"C:\Program Files (x86)\Windows Kits\10\bin");
+    let mut best: Option<(Vec<u32>, std::path::PathBuf)> = None;
+    for entry in std::fs::read_dir(root).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let version: Vec<u32> = name.split('.').filter_map(|p| p.parse().ok()).collect();
+        if version.len() != 4 {
+            continue;
+        }
+        let bin = entry.path().join("x64");
+        if !bin.join("rc.exe").exists() {
+            continue;
+        }
+        if best.as_ref().map(|(v, _)| version > *v).unwrap_or(true) {
+            best = Some((version, bin));
+        }
+    }
+    best.map(|(_, p)| p.to_string_lossy().into_owned())
 }

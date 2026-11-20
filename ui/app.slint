@@ -2775,6 +2775,7 @@ export component AppWindow inherits Window {
                             font-weight: 700;
                             horizontal-stretch: 1;
                             vertical-alignment: center;
+                            font-family: Theme.ui-font-family;
                         }
                         Rectangle {
                             width: 22px; height: 22px;
@@ -2819,7 +2820,7 @@ export component AppWindow inherits Window {
                                     Text { text: root.lang-en ? "Font" : "字体";
                                            color: Theme.text-primary; font-size: Theme.fs-md;
                                            font-weight: 600;
-                                           vertical-alignment: center; horizontal-stretch: 1; }
+                                           vertical-alignment: center; horizontal-stretch: 1; font-family: Theme.ui-font-family; }
                                 }
                             }
                             Rectangle {
@@ -2839,7 +2840,7 @@ export component AppWindow inherits Window {
                                     Text { text: root.lang-en ? "Colors" : "颜色";
                                            color: Theme.text-primary; font-size: Theme.fs-md;
                                            font-weight: 600;
-                                           vertical-alignment: center; horizontal-stretch: 1; }
+                                           vertical-alignment: center; horizontal-stretch: 1; font-family: Theme.ui-font-family; }
                                 }
                             }
                             Rectangle {
@@ -2859,7 +2860,7 @@ export component AppWindow inherits Window {
                                     Text { text: root.lang-en ? "Editors" : "编辑器";
                                            color: Theme.text-primary; font-size: Theme.fs-md;
                                            font-weight: 600;
-                                           vertical-alignment: center; horizontal-stretch: 1; }
+                                           vertical-alignment: center; horizontal-stretch: 1; font-family: Theme.ui-font-family; }
                                 }
                             }
                             Rectangle {
@@ -2880,7 +2881,7 @@ export component AppWindow inherits Window {
                                     Text { text: "SFTP";
                                            color: Theme.text-primary; font-size: Theme.fs-md;
                                            font-weight: 600;
-                                           vertical-alignment: center; horizontal-stretch: 1; }
+                                           vertical-alignment: center; horizontal-stretch: 1; font-family: Theme.ui-font-family; }
                                 }
                             }
                             // Sidebar page nav (#78).
@@ -2901,7 +2902,7 @@ export component AppWindow inherits Window {
                                     Text { text: root.lang-en ? "Sidebars" : "侧栏";
                                            color: Theme.text-primary; font-size: Theme.fs-md;
                                            font-weight: 600;
-                                           vertical-alignment: center; horizontal-stretch: 1; }
+                                           vertical-alignment: center; horizontal-stretch: 1; font-family: Theme.ui-font-family; }
                                 }
                             }
                             // Session sync page nav (#sync).
@@ -2922,7 +2923,7 @@ export component AppWindow inherits Window {
                                     Text { text: root.lang-en ? "Session sync" : "会话同步";
                                            color: Theme.text-primary; font-size: Theme.fs-md;
                                            font-weight: 600;
-                                           vertical-alignment: center; horizontal-stretch: 1; }
+                                           vertical-alignment: center; horizontal-stretch: 1; font-family: Theme.ui-font-family; }
                                 }
                             }
                             Rectangle {
@@ -2942,7 +2943,7 @@ export component AppWindow inherits Window {
                                     Text { text: root.lang-en ? "Download" : "下载";
                                            color: Theme.text-primary; font-size: Theme.fs-md;
                                            font-weight: 600;
-                                           vertical-alignment: center; horizontal-stretch: 1; }
+                                           vertical-alignment: center; horizontal-stretch: 1; font-family: Theme.ui-font-family; }
                                 }
                             }
                         }
@@ -2981,7 +2982,7 @@ export component AppWindow inherits Window {
                                     VerticalLayout {
                                         spacing: 6px;
                                         Text { text: root.lang-en ? "Font family" : "字体";
-                                               color: Theme.text-secondary; font-size: Theme.fs-sm; }
+                                               color: Theme.text-secondary; font-size: Theme.fs-sm; font-family: Theme.ui-font-family; }
                                         HorizontalLayout {
                                             ComboBox {
                                                 width: 260px;
@@ -2996,7 +2997,7 @@ export component AppWindow inherits Window {
                                     VerticalLayout {
                                         spacing: 6px;
                                         Text { text: root.lang-en ? "Font size" : "字体大小";
-                                               color: Theme.text-secondary; font-size: Theme.fs-sm; }
+                                               color: Theme.text-secondary; font-size: Theme.fs-sm; font-family: Theme.ui-font-family; }
                                         HorizontalLayout {
                                             spacing: 10px;
                                             SpinBox {
@@ -3011,6 +3012,7 @@ export component AppWindow inherits Window {
                                                 color: Theme.text-muted;
                                                 font-size: Theme.fs-sm;
                                                 vertical-alignment: center;
+                                                font-family: Theme.ui-font-family;
                                             }
                                             Rectangle { horizontal-stretch: 1; }
                                         }
@@ -3019,7 +3021,7 @@ export component AppWindow inherits Window {
                                     VerticalLayout {
                                         spacing: 6px;
                                         Text { text: root.lang-en ? "Max cached lines" : "最大缓存行数";
-                                               color: Theme.text-secondary; font-size: Theme.fs-sm; }
+                                               color: Theme.text-secondary; font-size: Theme.fs-sm; font-family: Theme.ui-font-family; }
                                         HorizontalLayout {
                                             spacing: 10px;
                                             SpinBox {
@@ -3034,6 +3036,7 @@ export component AppWindow inherits Window {
                                                 color: Theme.text-muted;
                                                 font-size: Theme.fs-sm;
                                                 vertical-alignment: center;
+                                                font-family: Theme.ui-font-family;
                                             }
                                             Rectangle { horizontal-stretch: 1; }
                                         }
@@ -3045,12 +3048,13 @@ export component AppWindow inherits Window {
                                         color: Theme.text-muted;
                                         font-size: Theme.fs-sm;
                                         wrap: word-wrap;
+                                        font-family: Theme.ui-font-family;
                                     }
 
                                     VerticalLayout {
                                         spacing: 6px;
                                         Text { text: root.lang-en ? "Render tick (ms)" : "渲染节拍 (ms)";
-                                               color: Theme.text-secondary; font-size: Theme.fs-sm; }
+                                               color: Theme.text-secondary; font-size: Theme.fs-sm; font-family: Theme.ui-font-family; }
                                         HorizontalLayout {
                                             spacing: 10px;
                                             SpinBox {
@@ -3065,6 +3069,7 @@ export component AppWindow inherits Window {
                                                 color: Theme.text-muted;
                                                 font-size: Theme.fs-sm;
                                                 vertical-alignment: center;
+                                                font-family: Theme.ui-font-family;
                                             }
                                             Rectangle { horizontal-stretch: 1; }
                                         }
@@ -3076,12 +3081,13 @@ export component AppWindow inherits Window {
                                         color: Theme.text-muted;
                                         font-size: Theme.fs-sm;
                                         wrap: word-wrap;
+                                        font-family: Theme.ui-font-family;
                                     }
 
                                     VerticalLayout {
                                         spacing: 6px;
                                         Text { text: root.lang-en ? "Max output per tick (KiB)" : "每帧最大输出 (KiB)";
-                                               color: Theme.text-secondary; font-size: Theme.fs-sm; }
+                                               color: Theme.text-secondary; font-size: Theme.fs-sm; font-family: Theme.ui-font-family; }
                                         HorizontalLayout {
                                             spacing: 10px;
                                             SpinBox {
@@ -3096,6 +3102,7 @@ export component AppWindow inherits Window {
                                                 color: Theme.text-muted;
                                                 font-size: Theme.fs-sm;
                                                 vertical-alignment: center;
+                                                font-family: Theme.ui-font-family;
                                             }
                                             Rectangle { horizontal-stretch: 1; }
                                         }
@@ -3107,6 +3114,7 @@ export component AppWindow inherits Window {
                                         color: Theme.text-muted;
                                         font-size: Theme.fs-sm;
                                         wrap: word-wrap;
+                                        font-family: Theme.ui-font-family;
                                     }
 
                                     // UI scale override: 0 keeps the OS DPI scaling,
@@ -3114,7 +3122,7 @@ export component AppWindow inherits Window {
                                     VerticalLayout {
                                         spacing: 6px;
                                         Text { text: root.lang-en ? "UI scale (%)" : "界面缩放 (%)";
-                                               color: Theme.text-secondary; font-size: Theme.fs-sm; }
+                                               color: Theme.text-secondary; font-size: Theme.fs-sm; font-family: Theme.ui-font-family; }
                                         HorizontalLayout {
                                             spacing: 10px;
                                             SpinBox {
@@ -3131,6 +3139,7 @@ export component AppWindow inherits Window {
                                                 color: Theme.text-muted;
                                                 font-size: Theme.fs-sm;
                                                 vertical-alignment: center;
+                                                font-family: Theme.ui-font-family;
                                             }
                                             Rectangle { horizontal-stretch: 1; }
                                         }
@@ -3142,12 +3151,13 @@ export component AppWindow inherits Window {
                                         color: Theme.text-muted;
                                         font-size: Theme.fs-sm;
                                         wrap: word-wrap;
+                                        font-family: Theme.ui-font-family;
                                     }
 
                                     VerticalLayout {
                                         spacing: 6px;
                                         Text { text: root.lang-en ? "Session row flash" : "会话条目闪烁时间";
-                                               color: Theme.text-secondary; font-size: Theme.fs-sm; }
+                                               color: Theme.text-secondary; font-size: Theme.fs-sm; font-family: Theme.ui-font-family; }
                                         HorizontalLayout {
                                             spacing: 10px;
                                             SpinBox {
@@ -3162,6 +3172,7 @@ export component AppWindow inherits Window {
                                                 color: Theme.text-muted;
                                                 font-size: Theme.fs-sm;
                                                 vertical-alignment: center;
+                                                font-family: Theme.ui-font-family;
                                             }
                                             Rectangle { horizontal-stretch: 1; }
                                         }
@@ -3173,6 +3184,7 @@ export component AppWindow inherits Window {
                                         color: Theme.text-muted;
                                         font-size: Theme.fs-sm;
                                         wrap: word-wrap;
+                                        font-family: Theme.ui-font-family;
                                     }
 
                                     Rectangle {
@@ -3215,6 +3227,7 @@ export component AppWindow inherits Window {
                                                 text: root.lang-en ? "Terminal background image" : "终端背景图片";
                                                 color: Theme.text-primary;
                                                 font-size: Theme.fs-md;
+                                                font-family: Theme.ui-font-family;
                                             }
 
                                             HorizontalLayout {
@@ -3247,6 +3260,7 @@ export component AppWindow inherits Window {
                                                     font-size: Theme.fs-sm;
                                                     vertical-alignment: center;
                                                     overflow: elide;
+                                                    font-family: Theme.ui-font-family;
                                                 }
                                             }
 
@@ -3258,6 +3272,7 @@ export component AppWindow inherits Window {
                                                     font-size: Theme.fs-sm;
                                                     vertical-alignment: center;
                                                     width: 52px;
+                                                    font-family: Theme.ui-font-family;
                                                 }
                                                 op-dec := Button {
                                                     text: "-";
@@ -3273,6 +3288,7 @@ export component AppWindow inherits Window {
                                                     font-size: Theme.fs-sm;
                                                     vertical-alignment: center;
                                                     width: 52px;
+                                                    font-family: Theme.ui-font-family;
                                                 }
                                                 op-inc := Button {
                                                     text: "+";
@@ -3293,6 +3309,7 @@ export component AppWindow inherits Window {
                                                     font-size: Theme.fs-sm;
                                                     vertical-alignment: center;
                                                     width: 52px;
+                                                    font-family: Theme.ui-font-family;
                                                 }
                                                 ComboBox {
                                                     horizontal-stretch: 1;
@@ -3345,12 +3362,13 @@ export component AppWindow inherits Window {
                                                 text: root.lang-en ? "Top title bar background" : "顶部标题栏背景";
                                                 color: Theme.text-primary;
                                                 font-size: Theme.fs-md;
+                                                font-family: Theme.ui-font-family;
                                             }
 
                                             HorizontalLayout {
                                                 spacing: 8px;
                                                 Rectangle { width: 54px; height: 26px; border-radius: Theme.radius-sm; border-width: 1px; border-color: Theme.border-strong; background: Theme.bg-panel-alt;
-                                                    Text { text: root.lang-en ? "Default" : "默认色"; color: Theme.text-primary; font-size: Theme.fs-xs; horizontal-alignment: center; vertical-alignment: center; width: parent.width; height: parent.height; }
+                                                    Text { text: root.lang-en ? "Default" : "默认色"; color: Theme.text-primary; font-size: Theme.fs-xs; horizontal-alignment: center; vertical-alignment: center; width: parent.width; height: parent.height; font-family: Theme.ui-font-family; }
                                                     TouchArea { mouse-cursor: pointer; clicked => { root.top-bar-color-text = ""; root.set-top-bar-bg(""); } }
                                                 }
                                                 Rectangle { width: 26px; height: 26px; border-radius: Theme.radius-sm; border-width: 1px; border-color: Theme.border-strong; background: #2a2d35;
@@ -3386,6 +3404,7 @@ export component AppWindow inherits Window {
                                                     font-size: Theme.fs-sm;
                                                     vertical-alignment: center;
                                                     width: 28px;
+                                                    font-family: Theme.ui-font-family;
                                                 }
                                                 top-color-input := LineEdit {
                                                     width: 220px;
@@ -3413,12 +3432,13 @@ export component AppWindow inherits Window {
                                                 text: root.lang-en ? "Terminal background" : "终端区域背景";
                                                 color: Theme.text-primary;
                                                 font-size: Theme.fs-md;
+                                                font-family: Theme.ui-font-family;
                                             }
 
                                             HorizontalLayout {
                                                 spacing: 8px;
                                                 Rectangle { width: 54px; height: 26px; border-radius: Theme.radius-sm; border-width: 1px; border-color: Theme.border-strong; background: Theme.bg-panel-alt;
-                                                    Text { text: root.lang-en ? "Default" : "默认色"; color: Theme.text-primary; font-size: Theme.fs-xs; horizontal-alignment: center; vertical-alignment: center; width: parent.width; height: parent.height; }
+                                                    Text { text: root.lang-en ? "Default" : "默认色"; color: Theme.text-primary; font-size: Theme.fs-xs; horizontal-alignment: center; vertical-alignment: center; width: parent.width; height: parent.height; font-family: Theme.ui-font-family; }
                                                     TouchArea { mouse-cursor: pointer; clicked => { root.term-bg-color-text = ""; root.set-term-bg(""); } }
                                                 }
                                                 Rectangle { width: 26px; height: 26px; border-radius: Theme.radius-sm; border-width: 1px; border-color: Theme.border-strong; background: #0e0f13;
@@ -3454,6 +3474,7 @@ export component AppWindow inherits Window {
                                                     font-size: Theme.fs-sm;
                                                     vertical-alignment: center;
                                                     width: 28px;
+                                                    font-family: Theme.ui-font-family;
                                                 }
                                                 term-bg-input := LineEdit {
                                                     width: 220px;
@@ -3478,6 +3499,7 @@ export component AppWindow inherits Window {
                                             text: root.lang-en ? "Default editor (used when no suffix rule matches)" : "默认编辑器（没有匹配后缀时使用）";
                                             color: Theme.text-secondary;
                                             font-size: Theme.fs-sm;
+                                            font-family: Theme.ui-font-family;
                                         }
                                         HorizontalLayout {
                                             spacing: 8px;
@@ -3506,6 +3528,7 @@ export component AppWindow inherits Window {
                                             text: root.lang-en ? "Notepad file (nav rail #3 opens it with the system default app)" : "记事本文件（导航栏 #3 用系统默认程序打开）";
                                             color: Theme.text-secondary;
                                             font-size: Theme.fs-sm;
+                                            font-family: Theme.ui-font-family;
                                         }
                                         HorizontalLayout {
                                             spacing: 8px;
@@ -3531,6 +3554,7 @@ export component AppWindow inherits Window {
                                             color: Theme.text-muted;
                                             font-size: Theme.fs-sm;
                                             wrap: word-wrap;
+                                            font-family: Theme.ui-font-family;
                                         }
                                     }
 
@@ -3542,6 +3566,7 @@ export component AppWindow inherits Window {
                                             text: root.lang-en ? "Suffix rule" : "后缀规则";
                                             color: Theme.text-secondary;
                                             font-size: Theme.fs-sm;
+                                            font-family: Theme.ui-font-family;
                                         }
                                         HorizontalLayout {
                                             spacing: 8px;
@@ -3585,6 +3610,7 @@ export component AppWindow inherits Window {
                                         color: Theme.text-muted;
                                         font-size: Theme.fs-sm;
                                         wrap: word-wrap;
+                                        font-family: Theme.ui-font-family;
                                     }
 
                                     Rectangle { height: 1px; background: Theme.border-subtle; }
@@ -3600,6 +3626,7 @@ export component AppWindow inherits Window {
                                                 text: root.lang-en ? "No suffix rules yet" : "还没有后缀规则";
                                                 color: Theme.text-muted;
                                                 font-size: Theme.fs-xs;
+                                                font-family: Theme.ui-font-family;
                                             }
                                             for rule[i] in root.external-editor-rules : Rectangle {
                                                 height: 40px;
@@ -3615,6 +3642,7 @@ export component AppWindow inherits Window {
                                                         color: Theme.accent;
                                                         font-size: Theme.fs-sm;
                                                         vertical-alignment: center;
+                                                        font-family: Theme.ui-font-family;
                                                     }
                                                     Text {
                                                         horizontal-stretch: 1;
@@ -3623,6 +3651,7 @@ export component AppWindow inherits Window {
                                                         font-size: Theme.fs-sm;
                                                         vertical-alignment: center;
                                                         overflow: elide;
+                                                        font-family: Theme.ui-font-family;
                                                     }
                                                     Rectangle {
                                                         width: 28px;
@@ -3669,6 +3698,7 @@ export component AppWindow inherits Window {
                                         color: Theme.text-muted;
                                         font-size: Theme.fs-sm;
                                         wrap: word-wrap;
+                                        font-family: Theme.ui-font-family;
                                     }
 
                                     VerticalLayout {
@@ -3677,6 +3707,7 @@ export component AppWindow inherits Window {
                                             text: root.lang-en ? "Keepalive interval" : "保持连接间隔";
                                             color: Theme.text-secondary;
                                             font-size: Theme.fs-sm;
+                                            font-family: Theme.ui-font-family;
                                         }
                                         HorizontalLayout {
                                             spacing: 10px;
@@ -3692,6 +3723,7 @@ export component AppWindow inherits Window {
                                                 color: Theme.text-muted;
                                                 font-size: Theme.fs-sm;
                                                 vertical-alignment: center;
+                                                font-family: Theme.ui-font-family;
                                             }
                                             Rectangle { horizontal-stretch: 1; }
                                         }
@@ -3703,6 +3735,7 @@ export component AppWindow inherits Window {
                                         color: Theme.text-muted;
                                         font-size: Theme.fs-sm;
                                         wrap: word-wrap;
+                                        font-family: Theme.ui-font-family;
                                     }
 
                                     VerticalLayout {
@@ -3711,6 +3744,7 @@ export component AppWindow inherits Window {
                                             text: root.lang-en ? "SFTP auto refresh interval" : "SFTP 定时刷新间隔";
                                             color: Theme.text-secondary;
                                             font-size: Theme.fs-sm;
+                                            font-family: Theme.ui-font-family;
                                         }
                                         HorizontalLayout {
                                             spacing: 10px;
@@ -3726,6 +3760,7 @@ export component AppWindow inherits Window {
                                                 color: Theme.text-muted;
                                                 font-size: Theme.fs-sm;
                                                 vertical-alignment: center;
+                                                font-family: Theme.ui-font-family;
                                             }
                                             Rectangle { horizontal-stretch: 1; }
                                         }
@@ -3737,6 +3772,7 @@ export component AppWindow inherits Window {
                                         color: Theme.text-muted;
                                         font-size: Theme.fs-sm;
                                         wrap: word-wrap;
+                                        font-family: Theme.ui-font-family;
                                     }
 
                                     VerticalLayout {
@@ -3745,6 +3781,7 @@ export component AppWindow inherits Window {
                                             text: root.lang-en ? "Disconnect retry count" : "断线重试次数";
                                             color: Theme.text-secondary;
                                             font-size: Theme.fs-sm;
+                                            font-family: Theme.ui-font-family;
                                         }
                                         HorizontalLayout {
                                             spacing: 10px;
@@ -3760,6 +3797,7 @@ export component AppWindow inherits Window {
                                                 color: Theme.text-muted;
                                                 font-size: Theme.fs-sm;
                                                 vertical-alignment: center;
+                                                font-family: Theme.ui-font-family;
                                             }
                                             Rectangle { horizontal-stretch: 1; }
                                         }
@@ -3771,6 +3809,7 @@ export component AppWindow inherits Window {
                                         color: Theme.text-muted;
                                         font-size: Theme.fs-sm;
                                         wrap: word-wrap;
+                                        font-family: Theme.ui-font-family;
                                     }
                                 }
 
@@ -3801,6 +3840,7 @@ export component AppWindow inherits Window {
                                         color: Theme.text-muted;
                                         font-size: Theme.fs-sm;
                                         wrap: word-wrap;
+                                        font-family: Theme.ui-font-family;
                                     }
                                 }
 
@@ -3817,6 +3857,7 @@ export component AppWindow inherits Window {
                                         color: Theme.text-muted;
                                         font-size: Theme.fs-sm;
                                         wrap: word-wrap;
+                                        font-family: Theme.ui-font-family;
                                     }
                                     CheckBox {
                                         text: root.lang-en
@@ -3832,6 +3873,7 @@ export component AppWindow inherits Window {
                                         color: Theme.text-muted;
                                         font-size: Theme.fs-sm;
                                         wrap: word-wrap;
+                                        font-family: Theme.ui-font-family;
                                     }
                                 }
 
@@ -3855,6 +3897,7 @@ export component AppWindow inherits Window {
                                         color: Theme.text-muted;
                                         font-size: Theme.fs-sm;
                                         wrap: word-wrap;
+                                        font-family: Theme.ui-font-family;
                                     }
                                 }
                             }
