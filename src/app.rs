@@ -265,6 +265,9 @@ struct TabStatus {
     disks: Vec<(String, u64, u64)>,
 }
 type TabStatuses = Arc<Mutex<HashMap<String, TabStatus>>>;
+/// Info tab id -> the terminal tab it was opened from. Closing the info tab
+/// returns to that terminal instead of the home page.
+type InfoTabParents = Rc<RefCell<HashMap<String, String>>>;
 /// Last local-machine sample (shown on the welcome tab).
 type LocalSnap = Arc<Mutex<SystemSnapshot>>;
 type SftpEntryCache = Arc<Mutex<HashMap<String, Vec<RemoteEntry>>>>;
@@ -1085,6 +1088,8 @@ pub fn run() -> Result<()> {
     let terminals_model: Rc<VecModel<TerminalState>> = Rc::new(VecModel::default());
     window.set_terminals(ModelRc::from(terminals_model.clone()));
     let info_tabs_model: Rc<VecModel<InfoState>> = Rc::new(VecModel::default());
+    // Remembers which terminal each info tab was opened from (see close logic).
+    let info_tab_parents: InfoTabParents = Rc::new(RefCell::new(HashMap::new()));
     window.set_info_tabs(ModelRc::from(info_tabs_model.clone()));
 
     // Per-tab connection status + remote resources, the latest local sample,
@@ -1791,6 +1796,7 @@ pub fn run() -> Result<()> {
         sudo_states.clone(),
         sftp_pending_follow.clone(),
         suppress_cwd_follow.clone(),
+        info_tab_parents.clone(),
     );
     wire_system_info_callbacks(
         &window,
@@ -1799,6 +1805,7 @@ pub fn run() -> Result<()> {
         tabs_model.clone(),
         info_tabs_model.clone(),
         handles.clone(),
+        info_tab_parents.clone(),
     );
     wire_sftp_callbacks(
         &window,
@@ -4979,6 +4986,7 @@ fn wire_system_info_callbacks(
     tabs_model: Rc<VecModel<TabInfo>>,
     info_tabs_model: Rc<VecModel<InfoState>>,
     handles: Rc<RefCell<HashMap<String, SessionHandle>>>,
+    info_tab_parents: InfoTabParents,
 ) {
     let weak = window.as_weak();
     window.on_show_system_info(move || {
@@ -4989,6 +4997,11 @@ fn wire_system_info_callbacks(
         }
         let title = system_info_title(&store.borrow(), &tab_statuses, &source_tab);
         let info_id = format!("info-{}", uuid::Uuid::new_v4());
+        // Remember where it came from: closing the info tab must land back on
+        // that terminal, not on the home page.
+        info_tab_parents
+            .borrow_mut()
+            .insert(info_id.clone(), source_tab.clone());
         tabs_model.push(TabInfo {
             id: info_id.clone().into(),
             title: title.clone().into(),
@@ -5046,6 +5059,7 @@ fn wire_tab_callbacks(
     sudo_states: SudoStates,
     sftp_pending_follow: Arc<Mutex<HashMap<String, String>>>,
     suppress_cwd_follow: Arc<Mutex<HashSet<String>>>,
+    info_tab_parents: InfoTabParents,
 ) {
     // Selecting a tab is already applied inside the Slint callback; we just
     // need to keep the C++/Rust state in sync if needed.
@@ -5213,10 +5227,26 @@ fn wire_tab_callbacks(
                 info_tabs_model.remove(i);
             }
 
-            // If we closed the active tab, fall back to the welcome page.
+            // Closing an info tab returns to the terminal it was opened from;
+            // every other tab falls back to the home page. The parent may have
+            // been closed in the meantime, so check it still exists.
+            let parent = info_tab_parents.borrow_mut().remove(&id);
+            // Drop mappings pointing at a tab that is going away, so a later
+            // close can't select a dead id.
+            info_tab_parents.borrow_mut().retain(|_, p| p != &id);
             if let Some(w) = weak.upgrade() {
                 if w.get_active_tab_id().as_str() == id {
-                    w.set_active_tab_id("welcome".into());
+                    let fallback = parent
+                        .filter(|p| {
+                            (0..tabs_model.row_count()).any(|i| {
+                                tabs_model
+                                    .row_data(i)
+                                    .map(|r| r.id.as_str() == p.as_str())
+                                    .unwrap_or(false)
+                            })
+                        })
+                        .unwrap_or_else(|| "welcome".to_string());
+                    w.set_active_tab_id(fallback.into());
                 }
             }
         });
