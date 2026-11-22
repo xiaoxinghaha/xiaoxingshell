@@ -6986,9 +6986,20 @@ fn wire_key_input(
         // probe Text) and passes whole column/row counts directly, so there is
         // no pixel→cell guesswork here.  This keeps full-screen programs like
         // nano from over-counting rows and clipping their bottom shortcut bar.
-        window.on_terminal_resize(move |tab_id: SharedString, cols_f: f32, rows_f: f32| {
-            let cols = (cols_f as u32).max(10);
-            let rows = (rows_f as u32).max(5);
+        // Coalesce bursts of resize events. Dragging the SFTP splitter (or a
+        // window edge) fires one `terminal_resize` per frame, and each one
+        // sends SIGWINCH. apt redraws its progress block on every SIGWINCH;
+        // with the local grid changing size underneath it, those redraws land
+        // on shifted rows and leave many duplicated `Progress:` lines on
+        // screen. Apply only the last size per tab once the drag goes quiet.
+        let pending_resize: Rc<RefCell<HashMap<String, (u32, u32)>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+        let resize_timer: Rc<RefCell<slint::Timer>> =
+            Rc::new(RefCell::new(slint::Timer::default()));
+        Box::leak(Box::new(resize_timer.clone()));
+
+        let do_resize: Rc<dyn Fn(String, u32, u32)> =
+            Rc::new(move |tab_id: String, cols: u32, rows: u32| {
             tracing::debug!("terminal_resize tab={} cols={} rows={}", tab_id, cols, rows);
             let previous_size = *last_term_size.lock().unwrap();
             let minimize_guard_active = {
@@ -7115,6 +7126,33 @@ fn wire_key_input(
                 }
             }
             pending_ui_refresh.lock().unwrap().push(tab_id.to_string());
+            });
+
+        // Debounced entry point: keep only the newest size per tab, restart the
+        // single-shot timer on every event, apply once the drag goes quiet.
+        window.on_terminal_resize({
+            let pending = pending_resize.clone();
+            let timer = resize_timer.clone();
+            let do_resize = do_resize.clone();
+            move |tab_id: SharedString, cols_f: f32, rows_f: f32| {
+                let cols = (cols_f as u32).max(10);
+                let rows = (rows_f as u32).max(5);
+                pending.borrow_mut().insert(tab_id.to_string(), (cols, rows));
+                let pending = pending.clone();
+                let do_resize = do_resize.clone();
+                timer.borrow_mut().stop();
+                timer.borrow_mut().start(
+                    slint::TimerMode::SingleShot,
+                    Duration::from_millis(140),
+                    move || {
+                        let sizes: Vec<(String, (u32, u32))> =
+                            pending.borrow_mut().drain().collect();
+                        for (tab, (cols, rows)) in sizes {
+                            do_resize(tab, cols, rows);
+                        }
+                    },
+                );
+            }
         });
     }
 
