@@ -347,6 +347,7 @@ pub fn spawn_sftp(
     keepalive_interval_secs: u32,
     disconnect_retry_count: u32,
     auto_refresh_secs: u32,
+    edit_policy: std::sync::Arc<EditUploadPolicy>,
 ) -> SftpHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let self_tx = cmd_tx.clone();
@@ -364,6 +365,7 @@ pub fn spawn_sftp(
             keepalive_interval_secs,
             disconnect_retry_count,
             auto_refresh_secs,
+            edit_policy,
         )
         .await
         {
@@ -424,6 +426,39 @@ fn build_tree_nodes(
 // Worker
 // ---------------------------------------------------------------------------
 
+/// Open (or re-open) the SFTP subsystem on an existing SSH connection.
+///
+/// Used both for the initial connect and for the self-heal path: when a long
+/// idle period makes the server drop the channel, the SSH connection itself may
+/// still be alive, so a fresh channel is all that's needed.
+async fn open_sftp_session(
+    handle: &client::Handle<SftpClientHandler>,
+) -> Result<SftpSession> {
+    let channel = handle
+        .channel_open_session()
+        .await
+        .context("open sftp channel")?;
+    channel
+        .request_subsystem(true, "sftp")
+        .await
+        .context("request sftp subsystem")?;
+    SftpSession::new(channel.into_stream())
+        .await
+        .context("sftp handshake")
+}
+
+/// Errors that mean "this SFTP channel is gone" rather than "this operation
+/// failed" — used to decide whether re-opening the channel is worth a retry.
+fn is_channel_error(e: &(impl std::fmt::Display + ?Sized)) -> bool {
+    let msg = e.to_string().to_lowercase();
+    msg.contains("channel")
+        || msg.contains("broken pipe")
+        || msg.contains("connection reset")
+        || msg.contains("not connected")
+        || msg.contains("closed")
+        || msg.contains("eof")
+}
+
 async fn run_sftp(
     ui_tab_id: String,
     session: Session,
@@ -434,6 +469,7 @@ async fn run_sftp(
     keepalive_interval_secs: u32,
     disconnect_retry_count: u32,
     auto_refresh_secs: u32,
+    edit_policy: std::sync::Arc<EditUploadPolicy>,
 ) -> Result<()> {
     let _ = events.send(SessionEvent::SftpStatus(
         t("SFTP 连接中...", "SFTP connecting...").into(),
@@ -526,18 +562,11 @@ async fn run_sftp(
     let owner_spec_cache: Arc<tokio::sync::OnceCell<String>> = Arc::default();
 
     // --- Open the sftp subsystem channel -----------------------------------
-    let channel = handle
-        .channel_open_session()
-        .await
-        .context("open sftp channel")?;
-    channel
-        .request_subsystem(true, "sftp")
-        .await
-        .context("request sftp subsystem")?;
-    let sftp = SftpSession::new(channel.into_stream())
-        .await
-        .context("sftp handshake")?;
+    let mut sftp = open_sftp_session(&handle).await?;
     let mut owner_maps = OwnerMaps::default();
+    // Set when a command fails with a channel-level error: the next command
+    // re-opens the subsystem on the existing SSH connection before running.
+    let mut sftp_dead = false;
 
     // --- Directory tree state -----------------------------------------------
     // tree_dirs: path -> [(child_name, child_full_path)] for directories only
@@ -637,6 +666,24 @@ async fn run_sftp(
     // --- Command loop -------------------------------------------------------
     // Shared by command handlers that open auxiliary exec channels.
     while let Some(cmd) = commands.recv().await {
+        // Self-heal a dead SFTP channel before handling the command: after a
+        // long idle the server may drop the subsystem while the SSH connection
+        // stays alive, and re-opening the channel is all that's needed.
+        if sftp_dead {
+            match open_sftp_session(&handle).await {
+                Ok(fresh) => {
+                    sftp = fresh;
+                    owner_maps = OwnerMaps::default();
+                    sftp_dead = false;
+                }
+                Err(e) => {
+                    let _ = events.send(SessionEvent::SftpError(format!(
+                        "{}: {e}",
+                        t("SFTP 连接已断开", "SFTP connection lost")
+                    )));
+                }
+            }
+        }
         match cmd {
             SftpCommand::Close => break,
 
@@ -646,7 +693,23 @@ async fn run_sftp(
                     t("加载", "Loading"),
                     path
                 )));
-                match list_dir_impl(&sftp, &path, &owner_maps).await {
+                let mut result = list_dir_impl(&sftp, &path, &owner_maps).await;
+                // One transparent retry on a dead channel → a single refresh
+                // press recovers the panel.
+                if let Err(e) = &result {
+                    if is_channel_error(e) {
+                        match open_sftp_session(&handle).await {
+                            Ok(fresh) => {
+                                sftp = fresh;
+                                owner_maps = OwnerMaps::default();
+                                sftp_dead = false;
+                                result = list_dir_impl(&sftp, &path, &owner_maps).await;
+                            }
+                            Err(_) => sftp_dead = true,
+                        }
+                    }
+                }
+                match result {
                     Ok(entries) => {
                         let _ = events.send(SessionEvent::SftpEntries {
                             path: path.clone(),
@@ -708,7 +771,21 @@ async fn run_sftp(
                         }
                     }
                 } else {
-                    match list_dir_impl(&sftp, &current_dir, &owner_maps).await {
+                    let mut result = list_dir_impl(&sftp, &current_dir, &owner_maps).await;
+                    if let Err(e) = &result {
+                        if is_channel_error(e) {
+                            match open_sftp_session(&handle).await {
+                                Ok(fresh) => {
+                                    sftp = fresh;
+                                    owner_maps = OwnerMaps::default();
+                                    sftp_dead = false;
+                                    result = list_dir_impl(&sftp, &current_dir, &owner_maps).await;
+                                }
+                                Err(_) => sftp_dead = true,
+                            }
+                        }
+                    }
+                    match result {
                         Ok(entries) => {
                             let _ = events.send(SessionEvent::SftpEntries {
                                 path: current_dir.clone(),
@@ -1202,6 +1279,11 @@ async fn run_sftp(
                         });
                     }
                     Err(e) => {
+                        // A dead channel makes every later command fail too;
+                        // mark it so the next one re-opens the subsystem.
+                        if is_channel_error(&e) {
+                            sftp_dead = true;
+                        }
                         emit_transfer(
                             &events,
                             &id,
@@ -1750,6 +1832,7 @@ async fn run_sftp(
                                                 key.unwrap_or_default(),
                                                 events.clone(),
                                                 child,
+                                                edit_policy.clone(),
                                             );
                                         }
                                     }
@@ -1887,6 +1970,7 @@ async fn run_sftp(
                                                 password,
                                                 events.clone(),
                                                 child,
+                                                edit_policy.clone(),
                                             );
                                         }
                                     }
@@ -2464,17 +2548,64 @@ async fn local_bytes(path: String) -> Option<Vec<u8>> {
 
 /// Auto-upload policy for files opened in an external editor.
 ///
-/// `EDIT_QUIET_PERIOD` is the debounce: a change only uploads once the file has
-/// been untouched for this long, so a burst of VS Code `afterDelay` saves
-/// collapses into one transfer. `EDIT_MIN_UPLOAD_GAP` is a hard floor between
-/// two consecutive uploads of the same edit, so continuous typing can't keep
-/// pushing the file to the server. Files above `EDIT_MAX_AUTO_UPLOAD_BYTES` are
-/// never uploaded mid-edit — they go up once the editor closes.
-const EDIT_QUIET_PERIOD: std::time::Duration = std::time::Duration::from_secs(3);
-const EDIT_MIN_UPLOAD_GAP: std::time::Duration = std::time::Duration::from_secs(5);
+/// The poll interval, quiet period and minimum upload gap are user settings
+/// (see [`EditUploadPolicy`]); the constants below are the parts that are not
+/// configurable. Files above `EDIT_MAX_AUTO_UPLOAD_BYTES` are never uploaded
+/// mid-edit — they go up once the editor closes.
 const EDIT_MAX_AUTO_UPLOAD_BYTES: usize = 3 * 1024 * 1024;
-const EDIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
-const EDIT_WATCH_TICKS: usize = 4800; // ≈40 min at 500 ms
+/// After this long without any edit, polling degrades to at least 3 s so a
+/// file left open overnight doesn't stat every 500 ms. The first new change
+/// restores the configured cadence.
+const EDIT_DEGRADE_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+const EDIT_DEGRADED_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Live auto-upload settings, shared (via `Arc`) with every edit watcher so a
+/// change in Settings → Editors applies to already-open files immediately.
+#[derive(Debug)]
+pub struct EditUploadPolicy {
+    poll_ms: std::sync::atomic::AtomicU32,
+    quiet_secs: std::sync::atomic::AtomicU32,
+    min_gap_secs: std::sync::atomic::AtomicU32,
+}
+
+impl Default for EditUploadPolicy {
+    fn default() -> Self {
+        use std::sync::atomic::AtomicU32;
+        Self {
+            poll_ms: AtomicU32::new(500),
+            quiet_secs: AtomicU32::new(3),
+            min_gap_secs: AtomicU32::new(5),
+        }
+    }
+}
+
+impl EditUploadPolicy {
+    /// Push new values from the settings page (each is clamped to its range).
+    pub fn apply(&self, poll_ms: u32, quiet_secs: u32, min_gap_secs: u32) {
+        use std::sync::atomic::Ordering;
+        self.poll_ms
+            .store(poll_ms.clamp(500, 5000), Ordering::Relaxed);
+        self.quiet_secs
+            .store(quiet_secs.clamp(2, 10), Ordering::Relaxed);
+        self.min_gap_secs
+            .store(min_gap_secs.clamp(3, 20), Ordering::Relaxed);
+    }
+
+    fn poll_interval(&self) -> std::time::Duration {
+        use std::sync::atomic::Ordering;
+        std::time::Duration::from_millis(self.poll_ms.load(Ordering::Relaxed).clamp(500, 5000) as u64)
+    }
+
+    fn quiet(&self) -> std::time::Duration {
+        use std::sync::atomic::Ordering;
+        std::time::Duration::from_secs(self.quiet_secs.load(Ordering::Relaxed).clamp(2, 10) as u64)
+    }
+
+    fn min_gap(&self) -> std::time::Duration {
+        use std::sync::atomic::Ordering;
+        std::time::Duration::from_secs(self.min_gap_secs.load(Ordering::Relaxed).clamp(3, 20) as u64)
+    }
+}
 
 fn spawn_edit_watcher(
     self_tx: UnboundedSender<SftpCommand>,
@@ -2484,6 +2615,7 @@ fn spawn_edit_watcher(
     edit_key: String,
     events: UnboundedSender<SessionEvent>,
     child: Option<std::process::Child>,
+    policy: std::sync::Arc<EditUploadPolicy>,
 ) {
     tokio::spawn(async move {
         // Removes this edit from ACTIVE_EDITS on every exit path below.
@@ -2503,9 +2635,21 @@ fn spawn_edit_watcher(
         let mut pending_since: Option<Instant> = None;
         let mut last_upload: Option<Instant> = None;
         let mut large_notice_sent = false;
-        // ~40 min of polls; also exits early once the worker is gone.
-        for _ in 0..EDIT_WATCH_TICKS {
-            tokio::time::sleep(EDIT_POLL_INTERVAL).await;
+        // Cadence degrades after a long quiet spell; the first new change
+        // restores the configured interval.
+        let mut degraded = false;
+        // Runs until the tab's SFTP worker goes away (no fixed time limit).
+        loop {
+            let base = policy.poll_interval();
+            let interval = if degraded {
+                base.max(EDIT_DEGRADED_INTERVAL)
+            } else {
+                base
+            };
+            tokio::time::sleep(interval).await;
+            if started.elapsed() > EDIT_DEGRADE_AFTER {
+                degraded = true;
+            }
             if self_tx.is_closed() {
                 break;
             }
@@ -2520,6 +2664,8 @@ fn spawn_edit_watcher(
                     let changed = Some(cur_content.clone()) != last_content;
                     last = cur;
                     if changed {
+                        // New activity: back to the configured cadence.
+                        degraded = false;
                         if cur_content.len() > EDIT_MAX_AUTO_UPLOAD_BYTES {
                             // Large file: never push mid-edit; the exit branch
                             // uploads once. Keep `last_content` stale so that
@@ -2551,9 +2697,9 @@ fn spawn_edit_watcher(
             // handler as a toast — never from here, so a failed upload can't
             // show a "success" message.
             if let Some(since) = pending_since {
-                let quiet = since.elapsed() >= EDIT_QUIET_PERIOD;
+                let quiet = since.elapsed() >= policy.quiet();
                 let gap_ok = last_upload
-                    .map(|t| t.elapsed() >= EDIT_MIN_UPLOAD_GAP)
+                    .map(|t| t.elapsed() >= policy.min_gap())
                     .unwrap_or(true);
                 if quiet && gap_ok {
                     pending_since = None;
@@ -2606,6 +2752,7 @@ fn spawn_sudo_edit_watcher(
     password: String,
     events: UnboundedSender<SessionEvent>,
     child: Option<std::process::Child>,
+    policy: std::sync::Arc<EditUploadPolicy>,
 ) {
     tokio::spawn(async move {
         // Removes this edit from ACTIVE_EDITS on every exit path below.
@@ -2620,8 +2767,18 @@ fn spawn_sudo_edit_watcher(
         let mut pending_since: Option<Instant> = None;
         let mut last_upload: Option<Instant> = None;
         let mut large_notice_sent = false;
-        for _ in 0..EDIT_WATCH_TICKS {
-            tokio::time::sleep(EDIT_POLL_INTERVAL).await;
+        let mut degraded = false;
+        loop {
+            let base = policy.poll_interval();
+            let interval = if degraded {
+                base.max(EDIT_DEGRADED_INTERVAL)
+            } else {
+                base
+            };
+            tokio::time::sleep(interval).await;
+            if started.elapsed() > EDIT_DEGRADE_AFTER {
+                degraded = true;
+            }
             if self_tx.is_closed() {
                 break;
             }
@@ -2632,6 +2789,7 @@ fn spawn_sudo_edit_watcher(
                     let changed = Some(cur_content.clone()) != last_content;
                     last = cur;
                     if changed {
+                        degraded = false;
                         if cur_content.len() > EDIT_MAX_AUTO_UPLOAD_BYTES {
                             if !large_notice_sent {
                                 large_notice_sent = true;
@@ -2655,9 +2813,9 @@ fn spawn_sudo_edit_watcher(
                 }
             }
             if let Some(since) = pending_since {
-                let quiet = since.elapsed() >= EDIT_QUIET_PERIOD;
+                let quiet = since.elapsed() >= policy.quiet();
                 let gap_ok = last_upload
-                    .map(|t| t.elapsed() >= EDIT_MIN_UPLOAD_GAP)
+                    .map(|t| t.elapsed() >= policy.min_gap())
                     .unwrap_or(true);
                 if quiet && gap_ok {
                     pending_since = None;

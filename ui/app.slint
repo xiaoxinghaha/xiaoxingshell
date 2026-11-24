@@ -413,6 +413,11 @@ export component AppWindow inherits Window {
     callback add-external-editor-rule(string /* suffix */, string /* program */);
     callback delete-external-editor-rule(int /* index */);
     callback pick-external-editor-rule-program();
+    // Auto-upload policy for external-editor saves (settings → Editors).
+    in-out property <int> edit-upload-poll-ms: 500;
+    in-out property <int> edit-upload-quiet-secs: 3;
+    in-out property <int> edit-upload-min-gap-secs: 5;
+    callback set-edit-upload-policy(int /* poll-ms */, int /* quiet-secs */, int /* min-gap-secs */);
     // Notepad md file (nav rail #3 opens it with the OS default app).
     in-out property <string> notepad-file;   // raw config value ("" = default)
     callback set-notepad-file(string);
@@ -3731,6 +3736,92 @@ export component AppWindow inherits Window {
                                                 text: root.lang-en ? "Choose" : "选择";
                                                 clicked => { root.pick-external-editor(); }
                                             }
+                                        }
+                                    }
+
+                                    Rectangle { height: 1px; background: Theme.border-subtle; }
+
+                                    // Auto-upload policy for external-editor saves.
+                                    VerticalLayout {
+                                        spacing: 8px;
+                                        Text {
+                                            text: root.lang-en ? "Auto-upload after external edits" : "外部编辑自动上传";
+                                            color: Theme.text-primary;
+                                            font-size: Theme.fs-md;
+                                            font-weight: 600;
+                                            font-family: Theme.ui-font-family;
+                                        }
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            Text {
+                                                text: root.lang-en ? "Poll interval" : "轮询间隔";
+                                                color: Theme.text-secondary;
+                                                font-size: Theme.fs-sm;
+                                                font-family: Theme.ui-font-family;
+                                                width: 90px;
+                                                vertical-alignment: center;
+                                            }
+                                            SpinBox {
+                                                width: 110px;
+                                                value: root.edit-upload-poll-ms;
+                                                minimum: 500;
+                                                maximum: 5000;
+                                                edited => {
+                                                    root.set-edit-upload-policy(self.value, root.edit-upload-quiet-secs, root.edit-upload-min-gap-secs);
+                                                }
+                                            }
+                                            Text { text: "ms"; color: Theme.text-muted; font-size: Theme.fs-sm; vertical-alignment: center; }
+                                        }
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            Text {
+                                                text: root.lang-en ? "Quiet period" : "静默期";
+                                                color: Theme.text-secondary;
+                                                font-size: Theme.fs-sm;
+                                                font-family: Theme.ui-font-family;
+                                                width: 90px;
+                                                vertical-alignment: center;
+                                            }
+                                            SpinBox {
+                                                width: 110px;
+                                                value: root.edit-upload-quiet-secs;
+                                                minimum: 2;
+                                                maximum: 10;
+                                                edited => {
+                                                    root.set-edit-upload-policy(root.edit-upload-poll-ms, self.value, root.edit-upload-min-gap-secs);
+                                                }
+                                            }
+                                            Text { text: root.lang-en ? "s" : "秒"; color: Theme.text-muted; font-size: Theme.fs-sm; vertical-alignment: center; }
+                                        }
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            Text {
+                                                text: root.lang-en ? "Min gap" : "最小间隔";
+                                                color: Theme.text-secondary;
+                                                font-size: Theme.fs-sm;
+                                                font-family: Theme.ui-font-family;
+                                                width: 90px;
+                                                vertical-alignment: center;
+                                            }
+                                            SpinBox {
+                                                width: 110px;
+                                                value: root.edit-upload-min-gap-secs;
+                                                minimum: 3;
+                                                maximum: 20;
+                                                edited => {
+                                                    root.set-edit-upload-policy(root.edit-upload-poll-ms, root.edit-upload-quiet-secs, self.value);
+                                                }
+                                            }
+                                            Text { text: root.lang-en ? "s" : "秒"; color: Theme.text-muted; font-size: Theme.fs-sm; vertical-alignment: center; }
+                                        }
+                                        Text {
+                                            text: root.lang-en
+                                                ? "Uploads once the file stays untouched for the quiet period; two uploads are at least the min gap apart. Closing the editor uploads immediately. After 10 min idle, polling degrades to 3 s until the next change."
+                                                : "文件停止修改达到「静默期」后上传；两次上传至少间隔「最小间隔」。关闭编辑器时会立即上传。空闲超过 10 分钟后轮询退化为 3 秒，下次发现修改时恢复。";
+                                            color: Theme.text-muted;
+                                            font-size: Theme.fs-xs;
+                                            wrap: word-wrap;
+                                            font-family: Theme.ui-font-family;
                                         }
                                     }
 

@@ -435,6 +435,18 @@ pub struct ConfigFile {
     /// default (60s). Stored globally because it applies to every SFTP panel.
     #[serde(default)]
     pub sftp_auto_refresh_secs: u32,
+    /// External-editor auto-upload: file poll interval in ms.
+    /// 0 = built-in default (500), clamped to 500..5000.
+    #[serde(default)]
+    pub edit_upload_poll_ms: u32,
+    /// Quiet period (seconds) before an edited file is uploaded.
+    /// 0 = default 3, clamped to 2..10.
+    #[serde(default)]
+    pub edit_upload_quiet_secs: u32,
+    /// Minimum gap (seconds) between two auto-uploads of the same edit.
+    /// 0 = default 5, clamped to 3..20.
+    #[serde(default)]
+    pub edit_upload_min_gap_secs: u32,
     /// Always prompt for the save location on each download instead of using the
     /// preset download dir. Defaults to false (#87).
     #[serde(default)]
@@ -1001,6 +1013,45 @@ impl ConfigStore {
         self.cache.sftp_auto_refresh_secs = secs.clamp(10, 3600);
     }
 
+    /// Auto-upload poll interval in ms (default 500, clamped 500..5000).
+    pub fn edit_upload_poll_ms(&self) -> u32 {
+        if self.cache.edit_upload_poll_ms == 0 {
+            500
+        } else {
+            self.cache.edit_upload_poll_ms.clamp(500, 5000)
+        }
+    }
+
+    pub fn set_edit_upload_poll_ms(&mut self, ms: u32) {
+        self.cache.edit_upload_poll_ms = ms.clamp(500, 5000);
+    }
+
+    /// Quiet period before uploading an edited file (default 3 s, clamped 2..10).
+    pub fn edit_upload_quiet_secs(&self) -> u32 {
+        if self.cache.edit_upload_quiet_secs == 0 {
+            3
+        } else {
+            self.cache.edit_upload_quiet_secs.clamp(2, 10)
+        }
+    }
+
+    pub fn set_edit_upload_quiet_secs(&mut self, secs: u32) {
+        self.cache.edit_upload_quiet_secs = secs.clamp(2, 10);
+    }
+
+    /// Minimum gap between two auto-uploads (default 5 s, clamped 3..20).
+    pub fn edit_upload_min_gap_secs(&self) -> u32 {
+        if self.cache.edit_upload_min_gap_secs == 0 {
+            5
+        } else {
+            self.cache.edit_upload_min_gap_secs.clamp(3, 20)
+        }
+    }
+
+    pub fn set_edit_upload_min_gap_secs(&mut self, secs: u32) {
+        self.cache.edit_upload_min_gap_secs = secs.clamp(3, 20);
+    }
+
     /// Quick commands bound to one saved session. Unknown ids return an empty
     /// slice (welcome page, info tabs, sessions not saved yet).
     pub fn quick_commands_for(&self, session_id: &str) -> &[QuickCommand] {
@@ -1529,6 +1580,22 @@ mod tests {
         let typed: QuickCommand =
             serde_json::from_str(r#"{"name":"a","command":"b","submit":false}"#).unwrap();
         assert!(!typed.submit);
+    }
+
+    #[test]
+    fn edit_upload_settings_default_and_clamp() {
+        let mut store = temp_store();
+        assert_eq!(store.edit_upload_poll_ms(), 500);
+        assert_eq!(store.edit_upload_quiet_secs(), 3);
+        assert_eq!(store.edit_upload_min_gap_secs(), 5);
+        store.set_edit_upload_poll_ms(100);
+        assert_eq!(store.edit_upload_poll_ms(), 500);
+        store.set_edit_upload_poll_ms(9_999);
+        assert_eq!(store.edit_upload_poll_ms(), 5_000);
+        store.set_edit_upload_quiet_secs(1);
+        assert_eq!(store.edit_upload_quiet_secs(), 2);
+        store.set_edit_upload_min_gap_secs(99);
+        assert_eq!(store.edit_upload_min_gap_secs(), 20);
     }
 
     #[test]

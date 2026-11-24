@@ -730,6 +730,42 @@ pub fn run() -> Result<()> {
     window.set_default_external_editor(store.borrow().external_editor().into());
     window.set_external_editor_rules(editor_rule_model(&store.borrow()));
 
+    // Auto-upload policy shared with every SFTP edit watcher: changing it in
+    // Settings → Editors applies to already-open files immediately.
+    let edit_policy = std::sync::Arc::new(crate::sftp::EditUploadPolicy::default());
+    edit_policy.apply(
+        store.borrow().edit_upload_poll_ms(),
+        store.borrow().edit_upload_quiet_secs(),
+        store.borrow().edit_upload_min_gap_secs(),
+    );
+    window.set_edit_upload_poll_ms(store.borrow().edit_upload_poll_ms() as i32);
+    window.set_edit_upload_quiet_secs(store.borrow().edit_upload_quiet_secs() as i32);
+    window.set_edit_upload_min_gap_secs(store.borrow().edit_upload_min_gap_secs() as i32);
+    {
+        let store_policy = store.clone();
+        let policy = edit_policy.clone();
+        let weak = window.as_weak();
+        window.on_set_edit_upload_policy(move |poll_ms: i32, quiet_secs: i32, min_gap_secs: i32| {
+            let poll_ms = (poll_ms.max(0) as u32).clamp(500, 5000);
+            let quiet_secs = (quiet_secs.max(0) as u32).clamp(2, 10);
+            let min_gap_secs = (min_gap_secs.max(0) as u32).clamp(3, 20);
+            {
+                let mut s = store_policy.borrow_mut();
+                s.set_edit_upload_poll_ms(poll_ms);
+                s.set_edit_upload_quiet_secs(quiet_secs);
+                s.set_edit_upload_min_gap_secs(min_gap_secs);
+                let _ = s.save();
+            }
+            // Live-apply to every open edit watcher.
+            policy.apply(poll_ms, quiet_secs, min_gap_secs);
+            if let Some(w) = weak.upgrade() {
+                w.set_edit_upload_poll_ms(poll_ms as i32);
+                w.set_edit_upload_quiet_secs(quiet_secs as i32);
+                w.set_edit_upload_min_gap_secs(min_gap_secs as i32);
+            }
+        });
+    }
+
     // Interface setting: SFTP follows the terminal's cd. The shell event pumps
     // read this AtomicBool on every CwdChanged, so toggling applies live to
     // already-open sessions too.
@@ -1125,6 +1161,7 @@ pub fn run() -> Result<()> {
         pending_ui_refresh.clone(),
         sftp_pending_follow.clone(),
         suppress_cwd_follow.clone(),
+        edit_policy.clone(),
     );
 
     {
@@ -1848,6 +1885,7 @@ pub fn run() -> Result<()> {
             hidden_transfer_ids: hidden_transfer_ids.clone(),
             bufs: bufs.clone(),
             tab_statuses: tab_statuses.clone(),
+            edit_policy: edit_policy.clone(),
             local_snap: local_snap.clone(),
             local_net_hist: local_net_hist.clone(),
             last_term_size: last_term_size.clone(),
@@ -2581,6 +2619,7 @@ fn wire_session_callbacks(
     pending_ui_refresh: PendingUiRefresh,
     sftp_pending_follow: Arc<Mutex<HashMap<String, String>>>,
     suppress_cwd_follow: Arc<Mutex<HashSet<String>>>,
+    edit_policy: Arc<crate::sftp::EditUploadPolicy>,
 ) {
     let group_options_model = |store: &ConfigStore| -> ModelRc<SharedString> {
         ModelRc::from(Rc::new(VecModel::from(
@@ -3311,6 +3350,7 @@ fn wire_session_callbacks(
                 hidden_transfer_ids: hidden_transfer_ids.clone(),
                 bufs: bufs.clone(),
                 tab_statuses: tab_statuses.clone(),
+                edit_policy: edit_policy.clone(),
                 local_snap: local_snap.clone(),
                 local_net_hist: local_net_hist.clone(),
                 last_term_size: last_term_size.clone(),
@@ -3344,6 +3384,8 @@ struct ConnectCtx {
     hidden_transfer_ids: Arc<Mutex<HashSet<String>>>,
     bufs: TermBuffers,
     tab_statuses: TabStatuses,
+    /// Live auto-upload policy for external-editor watchers.
+    edit_policy: Arc<crate::sftp::EditUploadPolicy>,
     local_snap: LocalSnap,
     local_net_hist: NetHist,
     last_term_size: Arc<Mutex<(u32, u32)>>,
@@ -3422,6 +3464,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
             ctx.keepalive_interval_secs,
             ctx.disconnect_retry_count,
             ctx.sftp_auto_refresh_secs,
+            ctx.edit_policy.clone(),
         );
         ctx.sftp_handles
             .lock()

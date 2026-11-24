@@ -2,6 +2,26 @@
 
 ## 2026-11-24
 
+### 自动上传参数可配置 + watcher 常驻/退化 + SFTP 断线自愈
+
+#### 背景/改动
+- **三个参数可配**（设置 → 编辑器 → 外部编辑自动上传）：
+  - 轮询间隔 `edit_upload_poll_ms`：默认 500，范围 500–5000；
+  - 静默期 `edit_upload_quiet_secs`：默认 3，范围 2–10；
+  - 最小上传间隔 `edit_upload_min_gap_secs`：默认 5，范围 3–20。
+  值放在 `EditUploadPolicy`（`Arc` + `AtomicU32`）里，由 `ConnectCtx` 传给每个 SFTP worker → watcher，**改设置立即对已打开的文件生效**，不需要重新双击。
+- **watcher 常驻**：去掉原来的 40 分钟上限（`EDIT_WATCH_TICKS`），改为 `loop`，只在标签页关闭（`self_tx.is_closed()`）或编辑器子进程退出时结束。
+- **轮询退化/恢复**：存活超过 10 分钟后间隔退化为 `max(配置值, 3 s)`；一旦重新检测到文件变化，立即恢复成配置的间隔。
+- 关闭编辑器仍是**立即上传**，不受最小间隔限制（避免丢改动）。
+- **SFTP 断线自愈**：抽出 `open_sftp_session()`；`ListDir` / `RefreshCurrent` 遇到 channel 级错误（`is_channel_error`：channel closed / broken pipe / connection reset / EOF）时**重建 channel 并重试一次**，所以点一次刷新就能恢复面板；上传失败也会标记 `sftp_dead`，下一条命令前自动重建。SSH 连接本身断开时仍无法自愈，需终端按 Enter 重连（本次未做）。
+
+#### 验证
+- `cargo check` 通过；全量 **131** 个单测通过（新增 `edit_upload_settings_default_and_clamp`）。
+- 未做真机验证：需确认设置页三个 SpinBox 拖改后立即生效、长时间放置后轮询退化、以及 SFTP 超时后点刷新能恢复。
+
+#### 涉及文件
+- `src/config.rs`、`src/sftp.rs`、`src/app.rs`、`ui/app.slint`、`ChangeLog.md`
+
 ### 外部编辑器保存上传：Toast + 状态栏变色 + 合并上传 + 大文件保护
 
 #### 背景/现象/根因
