@@ -184,6 +184,18 @@ export component TerminalView inherits Rectangle {
     in property <string>  sftp-path: "/";
     in property <[SftpEntry]> sftp-entries;
     in property <string>  sftp-status: "";
+    // Colour hint + short highlight window after an auto-upload result.
+    in property <bool>    sftp-status-ok: false;
+    in property <int>     sftp-status-seq: 0;
+    property <bool>       sftp-status-flash: false;
+    changed sftp-status-seq => {
+        if (root.sftp-status-seq > 0) { root.sftp-status-flash = true; }
+    }
+    Timer {
+        interval: 3s;
+        running: root.sftp-status-flash;
+        triggered => { root.sftp-status-flash = false; }
+    }
     in property <bool>    sftp-loading: false;
     in property <[SftpTreeNode]> sftp-tree-nodes: [];
     in property <string> sftp-current-user: "";
@@ -1109,6 +1121,8 @@ export component TerminalView inherits Rectangle {
             current-path:  root.sftp-path;
             entries:       root.sftp-entries;
             status:        root.sftp-status;
+            status-ok:     root.sftp-status-ok;
+            status-flash:  root.sftp-status-flash;
             loading:       root.sftp-loading;
             tree-nodes:    root.sftp-tree-nodes;
             current-user:   root.sftp-current-user;

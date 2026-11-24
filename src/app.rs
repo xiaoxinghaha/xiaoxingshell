@@ -3238,6 +3238,8 @@ fn wire_session_callbacks(
                     .into()
                 },
                 sftp_loading: has_sftp,
+                sftp_status_ok: false,
+                sftp_status_seq: 0,
                 sftp_tree_nodes: ModelRc::from(std::rc::Rc::new(
                     VecModel::<SftpTreeNode>::default(),
                 )),
@@ -4448,6 +4450,17 @@ fn apply_session_event_to_window(
         }
         SessionEvent::SftpStatus(msg) => {
             update_terminal(&|t| t.sftp_status = msg.clone().into());
+        }
+        // Real result of an external-editor upload: toast + status-bar flash.
+        SessionEvent::SftpToast { text, ok } => {
+            update_terminal(&|t| {
+                t.sftp_status = text.clone().into();
+                t.sftp_status_ok = ok;
+                t.sftp_status_seq = t.sftp_status_seq.wrapping_add(1);
+            });
+            win.set_toast_text(text.into());
+            win.set_toast_ok(ok);
+            win.set_toast_visible(true);
         }
         SessionEvent::SftpError(msg) => {
             // Show the reason and stop the spinner; leave the current listing in

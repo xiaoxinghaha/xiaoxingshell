@@ -125,6 +125,9 @@ export component SftpPanel inherits Rectangle {
     in property <string>  current-path: "/";
     in property <[SftpEntry]>    entries;
     in property <string>  status: @tr("SFTP not connected");
+    // Upload-result hint: green/red flash for ~3 s (wave #2: auto-upload UX).
+    in property <bool>    status-ok: false;
+    in property <bool>    status-flash: false;
     in property <bool>    loading: false;
     in property <[SftpTreeNode]> tree-nodes: [];
     in property <string> current-user: "";
@@ -1391,11 +1394,19 @@ export component SftpPanel inherits Rectangle {
         // --- Status bar (full width) --------------------------------------
         Rectangle {
             height: 18px;
-            background: Theme.bg-panel-alt;
+            // Green/red wash for a few seconds after an auto-upload result, so
+            // "did my save actually land?" is answerable at a glance.
+            background: root.status-flash
+                ? (root.status-ok
+                    ? Theme.success.with-alpha(0.22)
+                    : Theme.danger.with-alpha(0.22))
+                : Theme.bg-panel-alt;
             Text {
                 x: 8px;
                 text: root.status;
-                color: Theme.text-muted;
+                color: root.status-flash
+                    ? (root.status-ok ? Theme.success : Theme.danger)
+                    : Theme.text-muted;
                 font-size: Theme.fs-xs;
                 vertical-alignment: center;
                 height: parent.height;

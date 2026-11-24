@@ -1,5 +1,31 @@
 # ChangeLog
 
+## 2026-11-24
+
+### 外部编辑器保存上传：Toast + 状态栏变色 + 合并上传 + 大文件保护
+
+#### 背景/现象/根因
+- 原来的提醒是**假阳性**：`spawn_edit_watcher` 在上传命令**入队**时就发「已上传修改」，而真正的结果由 `UploadTo` 分支另行发出。上传失败时会先后看到「已上传修改」和「上传失败」，自相矛盾；成功提示也会被后续状态覆盖，一闪就没。
+- VSCode `files.autoSave: afterDelay`（默认 1 s）会不断保存，watcher 每 2 s 轮询一次就上传一次 —— 长时间编辑等于持续向服务器整文件覆盖，大文件（10 MB+）明显卡顿，远端的 inotify 监听（vite/webpack/systemd path）也会被反复触发。
+- 编辑器关闭时的兜底只看内容差异，若修改还在静默期等待、watcher 就退出了，这次修改会**丢失**。
+
+#### 改动/新增
+- 新增 `SessionEvent::SftpToast { text, ok }`，**只在** `UploadTo` / `SudoUploadTo` 拿到真实结果后发出；watcher 不再发任何「已上传」文案。
+- UI：右上角结果 Toast（成功绿勾 / 失败红叉，含文件名，3 s 自动消失，点击关闭）；SFTP 状态栏同时绿/红高亮 3 s（`sftp-status-ok` + `sftp-status-seq` 计数驱动，重复失败也能再次高亮）。
+- 上传策略（`src/sftp.rs` 顶部常量）：
+  - 轮询间隔 2 s → **500 ms**；
+  - **静默 3 s** 才上传，期间任何新保存都会重置计时（afterDelay 的一串保存合并为一次）；
+  - 两次上传之间至少间隔 **5 s**；
+  - 关闭编辑器时若还有 pending 修改，立即补一次上传（修掉丢改动的路径）。
+- 大文件保护：本地文件 > **3 MB** 不再自动上传，状态栏提示「关闭编辑器后上传」，等编辑器退出时传一次。
+
+#### 验证
+- `cargo check` 通过；全量 **130** 个单测通过。
+- 未做真机验证：需用 VSCode 开 `afterDelay` 连续修改一个小文件，确认 3 s 静默后才上传一次、Toast 与状态栏变色出现；再用 >3 MB 文件确认不会中途上传。
+
+#### 涉及文件
+- `src/sftp.rs`、`src/ssh.rs`、`src/app.rs`、`ui/app.slint`、`ui/terminal_view.slint`、`ui/sftp_panel.slint`、`ChangeLog.md`
+
 ## 2026-11-22
 
 ### 修复拖动 SFTP 面板改变终端高度时 apt 进度条重复显示

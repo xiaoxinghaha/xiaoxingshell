@@ -588,6 +588,10 @@ pub enum SessionEvent {
     SftpUser { user: String },
     /// Free-form SFTP status message (progress, errors, etc.).
     SftpStatus(String),
+    /// A finished auto-upload from an external editor. Drives the toast popup
+    /// and the status-bar colour flash; only emitted after the real result is
+    /// known (never when the command is merely queued).
+    SftpToast { text: String, ok: bool },
     /// A directory listing failed (e.g. permission denied): show the message and
     /// stop the panel's loading spinner without disturbing the current view (#112).
     SftpError(String),

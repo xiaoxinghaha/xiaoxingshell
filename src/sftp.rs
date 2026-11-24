@@ -1192,14 +1192,14 @@ async fn run_sftp(
                                 "Saved and replaced the server file",
                             ),
                         );
-                        let _ = events.send(SessionEvent::SftpStatus(format!(
-                            "{}: {}",
-                            t(
-                                "保存后已覆盖服务器文件",
-                                "Saved and replaced the server file"
+                        let _ = events.send(SessionEvent::SftpToast {
+                            text: format!(
+                                "{}: {}",
+                                t("已上传并替换", "Uploaded and replaced"),
+                                filename
                             ),
-                            filename
-                        )));
+                            ok: true,
+                        });
                     }
                     Err(e) => {
                         emit_transfer(
@@ -1215,10 +1215,10 @@ async fn run_sftp(
                             2,
                             &e.to_string(),
                         );
-                        let _ = events.send(SessionEvent::SftpStatus(format!(
-                            "{}: {e}",
-                            t("上传失败", "Upload failed")
-                        )));
+                        let _ = events.send(SessionEvent::SftpToast {
+                            text: format!("{}: {e}", t("上传失败", "Upload failed")),
+                            ok: false,
+                        });
                     }
                 }
             }
@@ -1292,11 +1292,14 @@ async fn run_sftp(
                             1,
                             &t("root 保存已上传", "Root save uploaded"),
                         );
-                        let _ = events.send(SessionEvent::SftpStatus(format!(
-                            "{}: {}",
-                            t("root 保存已上传", "Root save uploaded"),
-                            filename
-                        )));
+                        let _ = events.send(SessionEvent::SftpToast {
+                            text: format!(
+                                "{}: {}",
+                                t("root 已上传并替换", "Root uploaded and replaced"),
+                                filename
+                            ),
+                            ok: true,
+                        });
                     }
                     Err(e) => {
                         let _ = remove_remote_temp(&handle, &tmp_path).await;
@@ -1313,10 +1316,10 @@ async fn run_sftp(
                             2,
                             &e.to_string(),
                         );
-                        let _ = events.send(SessionEvent::SftpStatus(format!(
-                            "{}: {e}",
-                            t("root 上传失败", "Root upload failed")
-                        )));
+                        let _ = events.send(SessionEvent::SftpToast {
+                            text: format!("{}: {e}", t("root 上传失败", "Root upload failed")),
+                            ok: false,
+                        });
                     }
                 }
             }
@@ -2459,6 +2462,20 @@ async fn local_bytes(path: String) -> Option<Vec<u8>> {
         .flatten()
 }
 
+/// Auto-upload policy for files opened in an external editor.
+///
+/// `EDIT_QUIET_PERIOD` is the debounce: a change only uploads once the file has
+/// been untouched for this long, so a burst of VS Code `afterDelay` saves
+/// collapses into one transfer. `EDIT_MIN_UPLOAD_GAP` is a hard floor between
+/// two consecutive uploads of the same edit, so continuous typing can't keep
+/// pushing the file to the server. Files above `EDIT_MAX_AUTO_UPLOAD_BYTES` are
+/// never uploaded mid-edit — they go up once the editor closes.
+const EDIT_QUIET_PERIOD: std::time::Duration = std::time::Duration::from_secs(3);
+const EDIT_MIN_UPLOAD_GAP: std::time::Duration = std::time::Duration::from_secs(5);
+const EDIT_MAX_AUTO_UPLOAD_BYTES: usize = 3 * 1024 * 1024;
+const EDIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+const EDIT_WATCH_TICKS: usize = 4800; // ≈40 min at 500 ms
+
 fn spawn_edit_watcher(
     self_tx: UnboundedSender<SftpCommand>,
     local: String,
@@ -2482,9 +2499,13 @@ fn spawn_edit_watcher(
         // child exit as a detached-launch hint instead of "editing is over",
         // otherwise save -> re-upload silently stops working.
         let detached_launch_grace = Duration::from_secs(10);
-        // ~40 min of 2s polls; also exits early once the worker is gone.
-        for _ in 0..1200 {
-            tokio::time::sleep(Duration::from_secs(2)).await;
+        // Pending change waiting for the file to go quiet.
+        let mut pending_since: Option<Instant> = None;
+        let mut last_upload: Option<Instant> = None;
+        let mut large_notice_sent = false;
+        // ~40 min of polls; also exits early once the worker is gone.
+        for _ in 0..EDIT_WATCH_TICKS {
+            tokio::time::sleep(EDIT_POLL_INTERVAL).await;
             if self_tx.is_closed() {
                 break;
             }
@@ -2499,19 +2520,48 @@ fn spawn_edit_watcher(
                     let changed = Some(cur_content.clone()) != last_content;
                     last = cur;
                     if changed {
-                        last_content = Some(cur_content);
-                        let _ = self_tx.send(SftpCommand::UploadTo {
-                            local: local.clone(),
-                            remote_path: remote.clone(),
-                        });
-                        let _ = events.send(SessionEvent::SftpStatus(format!(
-                            "{}: {}",
-                            t("已上传修改", "Re-uploaded changes"),
-                            filename
-                        )));
+                        if cur_content.len() > EDIT_MAX_AUTO_UPLOAD_BYTES {
+                            // Large file: never push mid-edit; the exit branch
+                            // uploads once. Keep `last_content` stale so that
+                            // branch still sees a difference.
+                            if !large_notice_sent {
+                                large_notice_sent = true;
+                                let _ = events.send(SessionEvent::SftpStatus(format!(
+                                    "{}: {}",
+                                    t(
+                                        "文件超过 3MB，关闭编辑器后上传",
+                                        "Over 3 MB — uploads when the editor closes"
+                                    ),
+                                    filename
+                                )));
+                            }
+                        } else {
+                            last_content = Some(cur_content);
+                            // Every further save restarts the quiet window.
+                            pending_since = Some(Instant::now());
+                        }
                     } else {
                         last_content = Some(cur_content);
                     }
+                }
+            }
+
+            // Upload once the file has been quiet long enough AND the previous
+            // upload is old enough. The result is reported by the UploadTo
+            // handler as a toast — never from here, so a failed upload can't
+            // show a "success" message.
+            if let Some(since) = pending_since {
+                let quiet = since.elapsed() >= EDIT_QUIET_PERIOD;
+                let gap_ok = last_upload
+                    .map(|t| t.elapsed() >= EDIT_MIN_UPLOAD_GAP)
+                    .unwrap_or(true);
+                if quiet && gap_ok {
+                    pending_since = None;
+                    last_upload = Some(Instant::now());
+                    let _ = self_tx.send(SftpCommand::UploadTo {
+                        local: local.clone(),
+                        remote_path: remote.clone(),
+                    });
                 }
             }
             let exited = if let Some(proc) = child.as_mut() {
@@ -2527,16 +2577,17 @@ fn spawn_edit_watcher(
                     continue;
                 }
                 let final_content = local_bytes(local.clone()).await;
-                if final_content.is_some() && final_content != last_content {
+                // `last_content` already tracks the newest bytes while a change
+                // waits out the quiet period, so a pending change must be
+                // flushed too — closing the editor right after Ctrl+S would
+                // otherwise drop it.
+                if (final_content.is_some() && final_content != last_content)
+                    || pending_since.is_some()
+                {
                     let _ = self_tx.send(SftpCommand::UploadTo {
                         local: local.clone(),
                         remote_path: remote.clone(),
                     });
-                    let _ = events.send(SessionEvent::SftpStatus(format!(
-                        "{}: {}",
-                        t("编辑器关闭后已上传", "Uploaded after editor closed"),
-                        filename
-                    )));
                 }
                 break;
             }
@@ -2566,8 +2617,11 @@ fn spawn_sudo_edit_watcher(
         let mut child = child;
         let started = Instant::now();
         let detached_launch_grace = Duration::from_secs(10);
-        for _ in 0..1200 {
-            tokio::time::sleep(Duration::from_secs(2)).await;
+        let mut pending_since: Option<Instant> = None;
+        let mut last_upload: Option<Instant> = None;
+        let mut large_notice_sent = false;
+        for _ in 0..EDIT_WATCH_TICKS {
+            tokio::time::sleep(EDIT_POLL_INTERVAL).await;
             if self_tx.is_closed() {
                 break;
             }
@@ -2578,22 +2632,43 @@ fn spawn_sudo_edit_watcher(
                     let changed = Some(cur_content.clone()) != last_content;
                     last = cur;
                     if changed {
-                        last_content = Some(cur_content);
-                        let _ = self_tx.send(SftpCommand::SudoUploadTo {
-                            local: local.clone(),
-                            remote_path: remote.clone(),
-                            target_user: target_user.clone(),
-                            owner_spec: owner_spec.clone(),
-                            password: password.clone(),
-                        });
-                        let _ = events.send(SessionEvent::SftpStatus(format!(
-                            "{}: {}",
-                            t("root 已上传修改", "Root re-uploaded changes"),
-                            filename
-                        )));
+                        if cur_content.len() > EDIT_MAX_AUTO_UPLOAD_BYTES {
+                            if !large_notice_sent {
+                                large_notice_sent = true;
+                                let _ = events.send(SessionEvent::SftpStatus(format!(
+                                    "{}: {}",
+                                    t(
+                                        "文件超过 3MB，关闭编辑器后上传",
+                                        "Over 3 MB — uploads when the editor closes"
+                                    ),
+                                    filename
+                                )));
+                            }
+                            // Keep `last_content` stale for the exit branch.
+                        } else {
+                            last_content = Some(cur_content);
+                            pending_since = Some(Instant::now());
+                        }
                     } else {
                         last_content = Some(cur_content);
                     }
+                }
+            }
+            if let Some(since) = pending_since {
+                let quiet = since.elapsed() >= EDIT_QUIET_PERIOD;
+                let gap_ok = last_upload
+                    .map(|t| t.elapsed() >= EDIT_MIN_UPLOAD_GAP)
+                    .unwrap_or(true);
+                if quiet && gap_ok {
+                    pending_since = None;
+                    last_upload = Some(Instant::now());
+                    let _ = self_tx.send(SftpCommand::SudoUploadTo {
+                        local: local.clone(),
+                        remote_path: remote.clone(),
+                        target_user: target_user.clone(),
+                        owner_spec: owner_spec.clone(),
+                        password: password.clone(),
+                    });
                 }
             }
             let exited = if let Some(proc) = child.as_mut() {
@@ -2607,7 +2682,9 @@ fn spawn_sudo_edit_watcher(
                     continue;
                 }
                 let final_content = local_bytes(local.clone()).await;
-                if final_content.is_some() && final_content != last_content {
+                if (final_content.is_some() && final_content != last_content)
+                    || pending_since.is_some()
+                {
                     let _ = self_tx.send(SftpCommand::SudoUploadTo {
                         local: local.clone(),
                         remote_path: remote.clone(),
@@ -2615,14 +2692,6 @@ fn spawn_sudo_edit_watcher(
                         owner_spec: owner_spec.clone(),
                         password: password.clone(),
                     });
-                    let _ = events.send(SessionEvent::SftpStatus(format!(
-                        "{}: {}",
-                        t(
-                            "root 编辑器关闭后已上传",
-                            "Root uploaded after editor closed"
-                        ),
-                        filename
-                    )));
                 }
                 break;
             }

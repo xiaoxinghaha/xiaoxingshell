@@ -144,6 +144,11 @@ export struct TerminalState {
     sftp-path: string,
     sftp-entries: [SftpEntry],
     sftp-status: string,
+    // True/false = colour hint for the status bar after an auto-upload.
+    sftp-status-ok: bool,
+    // Bumped on every upload result so the panel can flash even when the
+    // ok/fail value repeats (e.g. two failures in a row).
+    sftp-status-seq: int,
     sftp-loading: bool,
     sftp-tree-nodes: [SftpTreeNode],
     sftp-current-user: string,
@@ -369,6 +374,10 @@ export component AppWindow inherits Window {
     in-out property <bool> sidebar-collapsed: false; // left panel hidden
     in-out property <bool> about-open: false;     // centered About dialog
     in property <string> download-dir;      // preset SFTP download folder ("" = ask)
+    // Result toast for auto-uploaded edits (top-right, fades after 3 s).
+    in-out property <bool> toast-visible: false;
+    in-out property <string> toast-text;
+    in-out property <bool> toast-ok: true;
     // Command bar (#55): quick commands are per-account, fed from Rust.
     in property <[QuickCmd]> quick-commands;
     // Display name of the session the current quick-command list belongs to
@@ -1063,6 +1072,8 @@ export component AppWindow inherits Window {
                             sftp-path: term.sftp-path;
                             sftp-entries: term.sftp-entries;
                             sftp-status: term.sftp-status;
+                            sftp-status-ok: term.sftp-status-ok;
+                            sftp-status-seq: term.sftp-status-seq;
                             sftp-loading: term.sftp-loading;
                             sftp-tree-nodes: term.sftp-tree-nodes;
                             sftp-current-user: term.sftp-current-user;
@@ -4511,5 +4522,52 @@ export component AppWindow inherits Window {
                 }
             }
         }
+    }
+
+    // --- Result toast (top-right) -----------------------------------------
+    // Shown only after a real upload result comes back from the SFTP worker,
+    // never when the command is merely queued. Click to dismiss.
+    if root.toast-visible : Rectangle {
+        x: parent.width - self.width - 20px;
+        y: root.custom-titlebar ? 54px : 38px;
+        width: min(380px, parent.width - 40px);
+        height: 46px;
+        background: Theme.bg-elevated;
+        border-radius: Theme.radius-md;
+        border-width: 1px;
+        border-color: root.toast-ok ? Theme.success : Theme.danger;
+        drop-shadow-blur: 18px;
+        drop-shadow-color: #00000090;
+
+        TouchArea { clicked => { root.toast-visible = false; } }
+
+        HorizontalLayout {
+            padding-left: 12px;
+            padding-right: 12px;
+            spacing: 8px;
+            Text {
+                text: root.toast-ok ? "\u{E5CA}" : "\u{E5C9}";
+                font-family: "Material Icons";
+                color: root.toast-ok ? Theme.success : Theme.danger;
+                font-size: Theme.fs-lg;
+                vertical-alignment: center;
+            }
+            Text {
+                text: root.toast-text;
+                color: Theme.text-primary;
+                font-size: Theme.fs-sm;
+                font-family: Theme.ui-font-family;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
+                wrap: no-wrap;
+            }
+        }
+    }
+
+    Timer {
+        interval: 3s;
+        running: root.toast-visible;
+        triggered => { root.toast-visible = false; }
     }
 }
