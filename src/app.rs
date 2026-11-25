@@ -5862,20 +5862,37 @@ fn wire_sftp_callbacks(
         }
     });
 
-    // Refresh the current directory listing.
+    // Refresh the current directory listing. When the worker is already gone
+    // there is nothing to refresh: say so instead of failing silently (the
+    // channel-level self-heal happens inside the worker's ListDir handler).
     {
         let sftp_handles = sftp_handles.clone();
         let sudo_states = sudo_states.clone();
+        let weak = window.as_weak();
         window.on_sftp_refresh(move |tab_id: SharedString, path: SharedString| {
             let tab_id = tab_id.to_string();
             let path = path.to_string();
+            let mut queued = false;
             if let Ok(handles) = sftp_handles.lock() {
                 if let Some(h) = handles.get(&tab_id) {
                     if let Some(state) = active_sudo_state(&sudo_states, &tab_id) {
                         h.sudo_list_dir(path, state.target_user, state.password);
+                        queued = true;
                     } else {
-                        h.list_dir(path);
+                        queued = h.list_dir(path);
                     }
+                }
+            }
+            if !queued {
+                if let Some(w) = weak.upgrade() {
+                    set_terminal_row(&w, &tab_id, |row| {
+                        row.sftp_status = t(
+                            "SFTP 已断开，请在终端按 Enter 重连",
+                            "SFTP is disconnected — press Enter in the terminal to reconnect",
+                        )
+                        .into();
+                        row.sftp_status_ok = false;
+                    });
                 }
             }
         });

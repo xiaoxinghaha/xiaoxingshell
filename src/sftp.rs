@@ -163,8 +163,11 @@ pub struct SftpHandle {
 }
 
 impl SftpHandle {
-    pub fn list_dir(&self, path: String) {
-        let _ = self.commands.send(SftpCommand::ListDir(path));
+    /// Ask the worker for a listing. Returns false when the worker is already
+    /// gone (channel closed / task ended), so the caller can tell the user to
+    /// reconnect instead of leaving the click without any feedback.
+    pub fn list_dir(&self, path: String) -> bool {
+        self.commands.send(SftpCommand::ListDir(path)).is_ok()
     }
     pub fn sudo_list_dir(&self, path: String, target_user: String, password: String) {
         let _ = self.commands.send(SftpCommand::SudoListDir {
@@ -1271,9 +1274,10 @@ async fn run_sftp(
                         );
                         let _ = events.send(SessionEvent::SftpToast {
                             text: format!(
-                                "{}: {}",
+                                "{}: {} · {}",
                                 t("已上传并替换", "Uploaded and replaced"),
-                                filename
+                                filename,
+                                chrono::Local::now().format("%H:%M:%S")
                             ),
                             ok: true,
                         });
@@ -1376,9 +1380,10 @@ async fn run_sftp(
                         );
                         let _ = events.send(SessionEvent::SftpToast {
                             text: format!(
-                                "{}: {}",
+                                "{}: {} · {}",
                                 t("root 已上传并替换", "Root uploaded and replaced"),
-                                filename
+                                filename,
+                                chrono::Local::now().format("%H:%M:%S")
                             ),
                             ok: true,
                         });

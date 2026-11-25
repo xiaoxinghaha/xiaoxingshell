@@ -1372,6 +1372,12 @@ export component SftpPanel inherits Rectangle {
                                     }
                                 }
                                 Rectangle { height: 1px; background: Theme.border-subtle; }
+                                // Refresh first: it doubles as the "re-attach the
+                                // SFTP channel" action when the link timed out.
+                                SftpMenuItem {
+                                    label: @tr("Refresh");
+                                    clicked => { root.refresh(root.current-path == "" ? "/" : root.current-path); }
+                                }
                                 SftpMenuItem {
                                     label: @tr("New folder");
                                     clicked => { root.new-folder(root.current-path); }
@@ -1379,10 +1385,6 @@ export component SftpPanel inherits Rectangle {
                                 SftpMenuItem {
                                     label: @tr("New file");
                                     clicked => { root.new-file(root.current-path); }
-                                }
-                                SftpMenuItem {
-                                    label: @tr("Refresh");
-                                    clicked => { root.refresh(root.current-path); }
                                 }
                             }
                         }
