@@ -88,6 +88,10 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+# No debug info in the binary (strip already removes it; keep this explicit).
+# build.ps1 additionally passes /DEBUG:NONE so the linker stops emitting a
+# 5.8 MB xiaoxingshell.pdb next to the exe on every rebuild.
+debug = false
 # Unwinding (not abort) so a panic in one task/thread is contained by the
 # surrounding catch_unwind and the app keeps running; the global panic hook
 # (main.rs → app::init_panic_hook) records every panic to error.log and shows

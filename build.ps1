@@ -18,6 +18,14 @@ $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' |
 $commit = git rev-parse --short HEAD
 
 Write-Host "==> 开始构建 release（版本 $version，commit $commit）..."
+# 关闭链接器的 PDB 输出。release 已经 strip = "symbols"，pdb 只是链接副产物：
+# 每次构建都会留下 ~5.8 MB 的 xiaoxingshell.pdb，在带"删除拦截"的终端里还会被
+# 搬进回收站。这里只对本次构建生效，不改全局 rustflags。
+if ($env:RUSTFLAGS) {
+    $env:RUSTFLAGS = "$env:RUSTFLAGS -C link-arg=/DEBUG:NONE"
+} else {
+    $env:RUSTFLAGS = "-C link-arg=/DEBUG:NONE"
+}
 cargo build --release --bin xiaoxingshell
 if ($LASTEXITCODE -ne 0) { throw "cargo build 失败，退出码 $LASTEXITCODE" }
 
