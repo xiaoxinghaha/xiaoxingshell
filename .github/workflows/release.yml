@@ -42,13 +42,13 @@ jobs:
             target: aarch64-unknown-linux-gnu  # builds the Linux ARM64 .tar.gz (#82)
             name: linux-aarch64
             bin: xiaoxingshell
-          - os: macos-14               # Apple Silicon
+          - os: macos-15               # Apple Silicon (arm64)
             target: aarch64-apple-darwin
             name: macos-aarch64
             bin: xiaoxingshell
-          - os: macos-14               # Apple Silicon runner — cross-compiles the
-            target: x86_64-apple-darwin # x86_64 Mac binary. (Dedicated Intel
-            name: macos-x86_64          # macos-13 runners queue for ages / time out.)
+          - os: macos-15               # Apple Silicon runner — cross-compiles the
+            target: x86_64-apple-darwin # x86_64 Mac binary. (macos-13 / macos-14
+            name: macos-x86_64          # are retired; macos-15 is arm64 GA.)
             bin: xiaoxingshell
 
     steps:
